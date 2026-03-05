@@ -238,6 +238,14 @@ struct RunnerState {
     #[serde(default)]
     task_loops_started: u64,
     #[serde(default)]
+    waiting_last_summary: Option<String>,
+    #[serde(default)]
+    waiting_last_reason: Option<String>,
+    #[serde(default)]
+    waiting_unchanged_ticks: u64,
+    #[serde(default)]
+    waiting_last_notified_ticks: u64,
+    #[serde(default)]
     paused: bool,
     #[serde(default)]
     pause_reason: Option<String>,
@@ -380,6 +388,14 @@ fn default_max_task_loops() -> u64 {
 
 fn default_auto_check_on_success() -> bool {
     true
+}
+
+fn stuck_wait_ticks_threshold() -> u64 {
+    std::env::var("CLAW_LOOPD_STUCK_WAIT_TICKS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(30)
 }
 
 fn default_task_file() -> PathBuf {
@@ -792,6 +808,54 @@ fn clip_text(input: &str, max_chars: usize) -> String {
     }
     let clipped: String = input.chars().take(max_chars).collect();
     format!("{clipped}…")
+}
+
+fn update_waiting_stuck_tracker(
+    runner_state: &mut RunnerState,
+    status: &LoopStatus,
+    summary: &str,
+    waiting_reason: &str,
+    threshold: u64,
+) -> Option<u64> {
+    if threshold == 0 {
+        return None;
+    }
+
+    if status != &LoopStatus::Waiting {
+        runner_state.waiting_last_summary = None;
+        runner_state.waiting_last_reason = None;
+        runner_state.waiting_unchanged_ticks = 0;
+        runner_state.waiting_last_notified_ticks = 0;
+        return None;
+    }
+
+    let unchanged = runner_state.waiting_last_summary.as_deref() == Some(summary)
+        && runner_state.waiting_last_reason.as_deref() == Some(waiting_reason);
+
+    if unchanged {
+        runner_state.waiting_unchanged_ticks =
+            runner_state.waiting_unchanged_ticks.saturating_add(1);
+    } else {
+        runner_state.waiting_last_summary = Some(summary.to_string());
+        runner_state.waiting_last_reason = Some(waiting_reason.to_string());
+        runner_state.waiting_unchanged_ticks = 1;
+        runner_state.waiting_last_notified_ticks = 0;
+    }
+
+    if runner_state.waiting_unchanged_ticks < threshold {
+        return None;
+    }
+
+    if runner_state
+        .waiting_unchanged_ticks
+        .saturating_sub(runner_state.waiting_last_notified_ticks)
+        < threshold
+    {
+        return None;
+    }
+
+    runner_state.waiting_last_notified_ticks = runner_state.waiting_unchanged_ticks;
+    Some(runner_state.waiting_unchanged_ticks)
 }
 
 fn extract_pr_url(line: &str) -> Option<String> {
@@ -2253,7 +2317,51 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
             state.updated_at + chrono::Duration::seconds(lease_window_sec(tick_sec));
 
         let pr_changed = reduce_pr_tracking(&dir, &manifest, &mut state)?;
+        let mut stuck_notified_ticks = None;
+        let stuck_threshold = stuck_wait_ticks_threshold();
+        if manifest.task_runner_cmd.is_some() {
+            stuck_notified_ticks = update_waiting_stuck_tracker(
+                &mut runner_state,
+                &state.status,
+                &state.summary,
+                &state.waiting_reason,
+                stuck_threshold,
+            );
+        } else {
+            let _ = update_waiting_stuck_tracker(
+                &mut runner_state,
+                &LoopStatus::Running,
+                "",
+                "",
+                stuck_threshold,
+            );
+        }
+
+        write_runner_state(&dir, &runner_state)?;
         write_json(&dir.join("state.json"), &state)?;
+
+        if let Some(unchanged_ticks) = stuck_notified_ticks {
+            append_event(
+                &dir,
+                "task_waiting_stuck",
+                serde_json::json!({
+                    "task_id": runner_state.current_task_id,
+                    "summary": state.summary,
+                    "waiting_reason": state.waiting_reason,
+                    "unchanged_ticks": unchanged_ticks,
+                    "threshold": stuck_threshold,
+                }),
+            )?;
+            queue_notification(
+                &dir,
+                &manifest,
+                "task_waiting_stuck",
+                format!(
+                    "waiting state unchanged (ticks={}): {} ({})",
+                    unchanged_ticks, state.summary, state.waiting_reason
+                ),
+            )?;
+        }
 
         append_event(
             &dir,
@@ -2264,6 +2372,9 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                 "task_loops_completed": task_loops_completed,
                 "max_task_loops": manifest.max_task_loops,
                 "pr_changed": pr_changed,
+                "waiting_unchanged_ticks": runner_state.waiting_unchanged_ticks,
+                "waiting_stuck_threshold": stuck_threshold,
+                "waiting_stuck_notified": stuck_notified_ticks,
             }),
         )?;
 
@@ -2421,6 +2532,11 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
         "task_runner_cmd": manifest.task_runner_cmd,
         "auto_check_on_success": manifest.auto_check_on_success,
         "task_loops_started": runner_state.task_loops_started,
+        "waiting_stuck_threshold": stuck_wait_ticks_threshold(),
+        "waiting_unchanged_ticks": runner_state.waiting_unchanged_ticks,
+        "waiting_last_notified_ticks": runner_state.waiting_last_notified_ticks,
+        "waiting_last_summary": runner_state.waiting_last_summary.clone(),
+        "waiting_last_reason": runner_state.waiting_last_reason.clone(),
         "current_task_id": runner_state.current_task_id.clone(),
         "current_task_text": runner_state.current_task_text.clone(),
         "current_task_line": runner_state.current_task_line,
@@ -3227,11 +3343,12 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeadLetterEntry, DeliveryAck, DeliveryAttempt, DispatchedNotification, Manifest,
-        Notification, ack_retry_policy, append_jsonl, classify_ack_failure_category,
-        compute_auto_stop_reason, compute_backoff_sec, dead_letter_path, delivery_ack_path,
-        delivery_attempts_path, delivery_retry_backoff_sec, extract_pr_url, flush_notifications,
-        lease_window_sec, normalize_error_reason, parse_task_checklist_entry, read_jsonl,
+        DeadLetterEntry, DeliveryAck, DeliveryAttempt, DispatchedNotification, LoopStatus,
+        Manifest, Notification, RunnerState, ack_retry_policy, append_jsonl,
+        classify_ack_failure_category, compute_auto_stop_reason, compute_backoff_sec,
+        dead_letter_path, delivery_ack_path, delivery_attempts_path, delivery_retry_backoff_sec,
+        extract_pr_url, flush_notifications, lease_window_sec, normalize_error_reason,
+        parse_task_checklist_entry, read_jsonl, update_waiting_stuck_tracker,
         validate_task_done_contract_with,
     };
     use chrono::{Duration, Utc};
@@ -3620,5 +3737,106 @@ mod tests {
         let ok = validate_task_done_contract_with(line, |_| Ok(true))
             .expect("merged PR should satisfy completion guard");
         assert_eq!(ok, "https://github.com/n01e0/claw-loop/pull/123");
+    }
+
+    #[test]
+    fn waiting_stuck_tracker_notifies_on_threshold_and_interval() {
+        let mut runner = RunnerState::default();
+        let threshold = 3;
+
+        assert_eq!(
+            update_waiting_stuck_tracker(
+                &mut runner,
+                &LoopStatus::Waiting,
+                "task waiting_merge: S1",
+                "TASK_WAITING_MERGE PR_URL=https://example.invalid/pr/1",
+                threshold,
+            ),
+            None
+        );
+        assert_eq!(runner.waiting_unchanged_ticks, 1);
+
+        assert_eq!(
+            update_waiting_stuck_tracker(
+                &mut runner,
+                &LoopStatus::Waiting,
+                "task waiting_merge: S1",
+                "TASK_WAITING_MERGE PR_URL=https://example.invalid/pr/1",
+                threshold,
+            ),
+            None
+        );
+        assert_eq!(runner.waiting_unchanged_ticks, 2);
+
+        assert_eq!(
+            update_waiting_stuck_tracker(
+                &mut runner,
+                &LoopStatus::Waiting,
+                "task waiting_merge: S1",
+                "TASK_WAITING_MERGE PR_URL=https://example.invalid/pr/1",
+                threshold,
+            ),
+            Some(3)
+        );
+        assert_eq!(runner.waiting_last_notified_ticks, 3);
+
+        assert_eq!(
+            update_waiting_stuck_tracker(
+                &mut runner,
+                &LoopStatus::Waiting,
+                "task waiting_merge: S1",
+                "TASK_WAITING_MERGE PR_URL=https://example.invalid/pr/1",
+                threshold,
+            ),
+            None
+        );
+        assert_eq!(
+            update_waiting_stuck_tracker(
+                &mut runner,
+                &LoopStatus::Waiting,
+                "task waiting_merge: S1",
+                "TASK_WAITING_MERGE PR_URL=https://example.invalid/pr/1",
+                threshold,
+            ),
+            None
+        );
+        assert_eq!(
+            update_waiting_stuck_tracker(
+                &mut runner,
+                &LoopStatus::Waiting,
+                "task waiting_merge: S1",
+                "TASK_WAITING_MERGE PR_URL=https://example.invalid/pr/1",
+                threshold,
+            ),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn waiting_stuck_tracker_resets_on_non_waiting_status() {
+        let mut runner = RunnerState::default();
+        let _ = update_waiting_stuck_tracker(
+            &mut runner,
+            &LoopStatus::Waiting,
+            "task waiting_merge: S2",
+            "TASK_WAITING_MERGE PR_URL=https://example.invalid/pr/2",
+            3,
+        );
+        let _ = update_waiting_stuck_tracker(
+            &mut runner,
+            &LoopStatus::Waiting,
+            "task waiting_merge: S2",
+            "TASK_WAITING_MERGE PR_URL=https://example.invalid/pr/2",
+            3,
+        );
+        assert_eq!(runner.waiting_unchanged_ticks, 2);
+
+        assert_eq!(
+            update_waiting_stuck_tracker(&mut runner, &LoopStatus::Running, "", "", 3),
+            None
+        );
+        assert_eq!(runner.waiting_unchanged_ticks, 0);
+        assert!(runner.waiting_last_summary.is_none());
+        assert!(runner.waiting_last_reason.is_none());
     }
 }

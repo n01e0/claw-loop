@@ -31,7 +31,7 @@
 - [x] S1-2: スレ通知契約を固定（`task_started/task_waiting_merge/task_done/task_blocked` 必須）
 - [x] S1-3: `status` 可視化強化（current/last/blocked reason/last PR URL）
 - [x] S1-4: 完了判定ガードの回帰強化（`TASK_DONE + PR_URL + merged` 必須）
-- [ ] S1-5: stuck検知（状態変化なしの待機を通知）
+- [x] S1-5: stuck検知（状態変化なしの待機を通知）
 - [ ] S1-6: runbook更新（確認ポイント/復旧/手動介入）
 
 ## Dogfood TODO
