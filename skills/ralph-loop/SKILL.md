@@ -13,6 +13,7 @@ Collect all of these before start:
 - `thread_id` (current Discord thread id)
 - `tick_sec` (default 60)
 - delivery mode (`--deliver-openclaw` on/off)
+- safety guard (`--max-ticks` / `--max-runtime-sec`) ※運用ではどちらか必須推奨
 
 Never start without `thread_id` + `session_key`.
 
@@ -23,7 +24,7 @@ Never start without `thread_id` + `session_key`.
    - done_when
    - scope/constraints
 2. Start daemon:
-   - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --tick-sec 60 --deliver-openclaw`
+   - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --tick-sec 60 --deliver-openclaw --max-ticks 300 --max-runtime-sec 3600`
 3. Post `run_id` in-thread immediately.
 4. Record first planned loop item.
 
@@ -37,7 +38,6 @@ Never start without `thread_id` + `session_key`.
 - Tasklist helper:
   - `claw-loopd task-next`
   - `claw-loopd task-check --id <TASK_ID> --done true|false`
-  - `claw-loopd task-run-once --cmd '<command>'`
 - Orphan sweep (periodic):
   - `claw-loopd sweep --repo <repo>`
 - Stop:
@@ -51,6 +51,7 @@ Expect these kinds:
 - `pr_merged`: tracked PR merged
 - `pr_closed`: tracked PR closed without merge
 - `orphan_blocked`: sweep detected expired lease + missing daemon
+- `auto_stopped`: max-ticks / max-runtime に到達
 - `stopped`: stop request processed
 - `terminal`: daemon exits because state is `done|failed|stopped`
 
@@ -74,7 +75,7 @@ Always set explicit `waiting_reason` for `waiting` and `blocked`.
 - Daemon stops on next tick after seeing `control.stop`.
 - Stop latency target: `<= tick_sec + flush time`.
 
-`blocked` does not auto-stop by itself.
+`blocked` は即停止しない（ただし max-ticks / max-runtime 到達時は `auto_stopped`）。
 
 ## Per-loop reporting rules
 - Send one progress update per loop minimum.
