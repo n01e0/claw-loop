@@ -22,6 +22,8 @@ Collect all of these before start:
 
 Never start without `thread_id` + `session_key`.
 
+Legacy shell flow (`rl-run.sh`, `rl-pr-open.sh`, etc.) is disabled by default. Use `claw-loopd` flow only.
+
 ## Start flow
 1. Confirm preflight in-thread:
    - strategy
