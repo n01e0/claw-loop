@@ -14,9 +14,10 @@ Thread-bound monitored Ralph loop daemon (Rust).
   - `start --max-ticks <N>`: optional tick-based cap
   - `start --max-runtime-sec <SEC>`: optional wall-clock cap
 - Dogfood runner mode:
-  - `start --task-runner-cmd '<shell command>'` to execute one next task per tick
-  - `start --auto-check-on-success true|false` to control automatic checklist completion
-  - `status.runner_mode` reports `dogfood` or `monitor_only`
+  - `start --task-runner-cmd '<shell command>'` to execute/monitor one task loop at a time
+  - default (`--auto-check-on-success=false`): runner starts one task, then waits until checklistが完了になるまで次を開始しない
+  - optional (`--auto-check-on-success=true`): command success時に自動でチェックを付ける
+  - `status.runner.mode` reports `dogfood` or `monitor_only`
 - Per-run isolated state under `.ralph/runs/<run_id>/`.
 - Event log and lease heartbeat in place.
 - Notification queue + dispatcher log (`notify-queue.jsonl` -> `notify-dispatched.jsonl`) in place.
@@ -73,7 +74,7 @@ cargo build
 ```bash
 # 1) start daemon (OpenClaw delivery有効化するなら --deliver-openclaw を付ける)
 # max-task-loops はデフォルト10（task_fileのdone増分ベース）
-# task-runner-cmd を付けると dogfood 実行モード
+# task-runner-cmd を付けると dogfood 実行モード（defaultは完了確認待ち）
 cargo run -- start --repo . --session-key test --channel discord --thread-id thread-test --tick-sec 1 --deliver-openclaw --max-runtime-sec 3600 --task-runner-cmd 'echo "$CLAW_TASK_ID :: $CLAW_TASK_TEXT"'
 
 # 2) bind PR tracking (example)
@@ -104,6 +105,9 @@ cargo run -- task-check --id A1-5 --done true
 
 # 3.6) dogfood: 次の未完了タスクを1回実行（成功時は自動チェック）
 cargo run -- task-run-once --cmd 'echo "$CLAW_TASK_ID :: $CLAW_TASK_TEXT"'
+
+# 3.7) daemonのrunnerで成功時に即チェックしたい場合（任意）
+cargo run -- start --repo . --session-key test --channel discord --thread-id thread-test --tick-sec 1 --task-runner-cmd 'echo "$CLAW_TASK_ID"' --auto-check-on-success true
 
 # (任意) delivery bridge を送信せず検証
 CLAW_LOOPD_OPENCLAW_DRY_RUN=1 cargo run -- start --repo . --session-key test --channel discord --thread-id thread-test --tick-sec 1 --deliver-openclaw
