@@ -1,0 +1,59 @@
+# Ack Integration Tasklist
+
+このドキュメントは、`claw-loopd` の **OpenClaw delivery ack 連携**を進めるための実行用チェックリスト。
+「レポート拡張は一旦止める」方針で、ack連携を最優先で進める。
+
+## 方針
+- 優先度1: OpenClaw delivery ack 連携
+- 優先度2: 長時間 soak test
+- 優先度3: 全面CAS化
+- それ以外のレポート機能拡張は、ack連携完了まで原則凍結
+
+## 現在できていること（ベースライン）
+- [x] thread-bound run lifecycle (`start/daemon/stop/status/sweep`)
+- [x] single-writer lock (`daemon.lock`)
+- [x] PR tracking reducer + low-load polling
+- [x] notification queue + retry/backoff
+- [x] dead-letter + requeue (`--event-id` / `--dry-run`)
+- [x] failed reason normalization + histogram/trend
+- [x] CI (`fmt/clippy/test/e2e-smoke`)
+
+## Ack Integration TODO
+
+### Phase 0: 契約定義（先に仕様を固定）
+- [ ] A0-1: ack の「成功」定義を明文化
+  - 候補: `openclaw message send` 成功応答を ack とみなす
+- [ ] A0-2: ack の「失敗」分類を定義
+  - transport error / timeout / auth / permission / unknown
+- [ ] A0-3: 冪等キーを定義
+  - `event_id` を配信・ackの一意キーとして固定
+
+### Phase 1: 実装
+- [ ] A1-1: `notify-ack.jsonl` を追加（ackイベント履歴）
+- [ ] A1-2: `flush_notifications` に ack 記録を追加
+- [ ] A1-3: `delivery-report` に ack情報を統合
+  - `acked` / `ack_at` / `ack_error` を表示
+- [ ] A1-4: `status` に ack集計を追加
+  - `acked_total` / `unacked_total` / `last_acked_at`
+- [ ] A1-5: ack失敗の retry policy を明示化
+
+### Phase 2: 安全性
+- [ ] A2-1: ack記録の二重書き込み防止（event_id idempotency）
+- [ ] A2-2: daemon再起動跨ぎでのack整合性確認
+- [ ] A2-3: dead-letter と ack の状態遷移ルールを固定
+
+### Phase 3: テスト
+- [ ] A3-1: unit test（ack分類・遷移）
+- [ ] A3-2: e2e smoke拡張（配信成功/失敗/再送/ack）
+- [ ] A3-3: 24h soak test シナリオ追加
+
+## 進め方ルール
+- 1PRで1テーマ（小さく分割）
+- 各PRでこのファイルのチェックを更新
+- CI green + e2e pass で次へ進む
+- 迷ったら仕様（Phase 0）に戻って先に言語化
+
+## 次の1手（着手順）
+1. A0-1, A0-2, A0-3 を最小仕様として確定
+2. A1-1（`notify-ack.jsonl`）だけ先行実装
+3. A1-2/A1-4 で status 可視化まで接続
