@@ -114,8 +114,8 @@ if obj.get("status") != "waiting":
     raise SystemExit(f"expected waiting, got {obj.get('status')!r}")
 if int(runner.get("task_loops_started", 0)) != 1:
     raise SystemExit(f"expected loops_started=1, got {runner}")
-if runner.get("active_task_id") != "R1":
-    raise SystemExit(f"expected active_task_id=R1, got {runner}")
+if runner.get("current_task_id") != "R1":
+    raise SystemExit(f"expected current_task_id=R1, got {runner}")
 PY
 $BIN task-check --file "$TASKFILE" --id R1 --done true >/dev/null
 STATUS1E=""
@@ -125,7 +125,7 @@ for _ in {1..10}; do
 import json, sys
 obj = json.loads(sys.argv[1])
 runner = obj.get("runner") or {}
-ok = int(runner.get("task_loops_started", 0)) >= 2 and runner.get("active_task_id") == "R2"
+ok = int(runner.get("task_loops_started", 0)) >= 2 and runner.get("current_task_id") == "R2"
 raise SystemExit(0 if ok else 1)
 PY
   then
@@ -139,8 +139,8 @@ obj = json.loads(sys.argv[1])
 runner = obj.get("runner") or {}
 if int(runner.get("task_loops_started", 0)) < 2:
     raise SystemExit(f"expected loops_started>=2, got {runner}")
-if runner.get("active_task_id") != "R2":
-    raise SystemExit(f"expected active_task_id=R2, got {runner}")
+if runner.get("current_task_id") != "R2":
+    raise SystemExit(f"expected current_task_id=R2, got {runner}")
 PY
 $BIN stop --repo "$WORKDIR" --run-id "$RUN1C" --immediate >/dev/null || true
 sleep 1

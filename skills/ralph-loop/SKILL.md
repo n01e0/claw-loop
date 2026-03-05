@@ -59,9 +59,9 @@ Expect these kinds:
 - `pr_merged`: tracked PR merged
 - `pr_closed`: tracked PR closed without merge
 - `task_started`: runner started a task
-- `task_waiting`: runner is waiting (e.g., merge pending)
-- `task_completed`: task was marked done
-- `runner_failed`: runner command failed
+- `task_waiting_merge`: runner is waiting for merge
+- `task_done`: task was marked done
+- `task_blocked`: runner/task is blocked
 - `all_tasks_completed`: tasklist has no open item
 - `orphan_blocked`: sweep detected expired lease + missing daemon
 - `auto_stopped`: max-task-loops / max-ticks / max-runtime に到達
