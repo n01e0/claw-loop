@@ -55,6 +55,7 @@ Thread-bound monitored Ralph loop daemon (Rust).
 - Ack retry policy: `docs/specs/ack-retry-policy.md`
 - Ack state transitions: `docs/specs/ack-state-transitions.md`
 - 24h soak scenario: `docs/specs/ack-soak-24h.md` (`scripts/soak-24h.sh`)
+- Dogfood runbook: `docs/runbooks/dogfood-runbook.md`
 
 ## Build
 
