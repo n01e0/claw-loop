@@ -23,7 +23,9 @@
 - [x] D0-2: tasklist のチェック状態をCLIで更新 (`task-check`)
 - [x] D0-3: runaway guard を追加（`--max-ticks` / `--max-runtime-sec`）
 - [x] D0-4: taskループ数ベースの上限を追加（`--max-task-loops`, default 10）
-- [ ] D1-1: tasklistの「次の未完了」を自動実行する runner エントリ
+- [x] D1-1: tasklistの「次の未完了」を自動実行する runner エントリ
+  - `start --task-runner-cmd` で1tickあたり1タスクを実行
+  - `task-run-once` で単発実行も可能
 
 ## Ack Integration TODO
 
@@ -67,6 +69,5 @@
 
 ## 次の1手（着手順）
 1. A2-3: dead-letter と ack の状態遷移ルール固定
-2. D1-1: tasklist駆動 runner（dogfood自走入口）
-3. A3-1/A3-2: ack遷移テスト強化
-4. A3-3: 24h soak test
+2. A3-1/A3-2: ack遷移テスト強化
+3. A3-3: 24h soak test
