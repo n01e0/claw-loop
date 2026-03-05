@@ -97,4 +97,46 @@ fi
 $BIN stop --repo "$WORKDIR" --run-id "$RUN3" >/dev/null || true
 sleep 1
 
+echo "[e2e-smoke] case4 pr reducer with mock gh"
+MOCKDIR="$WORKDIR/mockbin"
+mkdir -p "$MOCKDIR"
+cat > "$MOCKDIR/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "pr" && "${2:-}" == "view" ]]; then
+  cat <<'JSON'
+{"state":"MERGED","url":"https://example.invalid/pr/123","mergeStateStatus":"CLEAN","autoMergeRequest":null}
+JSON
+  exit 0
+fi
+if [[ "${1:-}" == "pr" && "${2:-}" == "merge" ]]; then
+  exit 0
+fi
+echo "unsupported mock gh args: $*" >&2
+exit 1
+EOF
+chmod +x "$MOCKDIR/gh"
+
+OUT4="$(CLAW_LOOPD_GH_BIN="$MOCKDIR/gh" $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1)"
+RUN4="$(echo "$OUT4" | awk -F= '/^run_id=/{print $2}')"
+if [[ -z "$RUN4" ]]; then
+  echo "[e2e-smoke] failed to parse run4 id"
+  echo "$OUT4"
+  exit 1
+fi
+$BIN track-pr --repo "$WORKDIR" --run-id "$RUN4" --gh-repo demo/repo --pr 123 --merge-method merge >/dev/null
+sleep 2
+STATUS4="$($BIN status --repo "$WORKDIR" --run-id "$RUN4")"
+assert_json_field "$STATUS4" status waiting
+python3 - <<'PY' "$STATUS4"
+import json, sys
+obj = json.loads(sys.argv[1])
+if "merged" not in (obj.get("summary") or ""):
+    raise SystemExit(f"expected merged summary, got: {obj.get('summary')!r}")
+if obj.get("pr_tracking") is not None:
+    raise SystemExit("expected pr_tracking to be removed after merge")
+PY
+$BIN stop --repo "$WORKDIR" --run-id "$RUN4" >/dev/null || true
+sleep 1
+
 echo "[e2e-smoke] ok"

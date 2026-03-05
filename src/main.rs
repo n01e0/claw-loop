@@ -449,37 +449,22 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
     Ok(delivered)
 }
 
-fn with_timeout_or_fallback(args: &[&str]) -> Result<std::process::Output> {
-    let try_timeout = Command::new("timeout")
-        .arg("5s")
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
-
-    match try_timeout {
-        Ok(output) => Ok(output),
-        Err(_) => Command::new(args[0])
-            .args(&args[1..])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .with_context(|| format!("spawn {}", args[0])),
-    }
+fn gh_bin() -> String {
+    std::env::var("CLAW_LOOPD_GH_BIN").unwrap_or_else(|_| "gh".to_string())
 }
 
 fn gh_pr_view(gh_repo: &str, pr: u64) -> Result<GhPrView> {
-    let pr_str = pr.to_string();
-    let output = with_timeout_or_fallback(&[
-        "gh",
-        "pr",
-        "view",
-        &pr_str,
-        "--repo",
-        gh_repo,
-        "--json",
-        "state,url,mergeStateStatus,autoMergeRequest",
-    ])?;
+    let gh = gh_bin();
+    let args: Vec<String> = vec![
+        "pr".into(),
+        "view".into(),
+        pr.to_string(),
+        "--repo".into(),
+        gh_repo.into(),
+        "--json".into(),
+        "state,url,mergeStateStatus,autoMergeRequest".into(),
+    ];
+    let output = run_with_timeout_cmd(&gh, &args, 5)?;
 
     if !output.status.success() {
         bail!(
@@ -502,18 +487,18 @@ fn gh_pr_arm_auto_merge(gh_repo: &str, pr: u64, merge_method: &str) -> Result<()
         other => bail!("invalid merge method: {other}"),
     };
 
-    let pr_str = pr.to_string();
-    let output = with_timeout_or_fallback(&[
-        "gh",
-        "pr",
-        "merge",
-        &pr_str,
-        "--repo",
-        gh_repo,
-        "--auto",
-        method_flag,
-        "--delete-branch",
-    ])?;
+    let gh = gh_bin();
+    let args: Vec<String> = vec![
+        "pr".into(),
+        "merge".into(),
+        pr.to_string(),
+        "--repo".into(),
+        gh_repo.into(),
+        "--auto".into(),
+        method_flag.into(),
+        "--delete-branch".into(),
+    ];
+    let output = run_with_timeout_cmd(&gh, &args, 5)?;
 
     if !output.status.success() {
         bail!(

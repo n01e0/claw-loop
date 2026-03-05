@@ -15,6 +15,8 @@ Thread-bound monitored Ralph loop daemon (Rust).
 - Optional OpenClaw delivery bridge (`--deliver-openclaw`):
   - sends notifications via `openclaw message send`
   - keeps unsent events in queue for retry
+- Optional gh binary override for PR reducer tests:
+  - `CLAW_LOOPD_GH_BIN=/path/to/mock-gh`
 - PR tracking reducer in daemon tick:
   - polls only while `waiting`
   - backoff (60s -> 120s -> 240s -> 300s)
@@ -39,6 +41,7 @@ cargo build
   - lifecycle (start/notify/stop)
   - orphan sweep block
   - single-writer lock rejection
+  - PR reducer merge transition using mocked gh
 
 ## Quick test
 
