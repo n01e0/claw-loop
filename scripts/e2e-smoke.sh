@@ -68,6 +68,28 @@ sleep 2
 STATUS1B="$($BIN status --repo "$WORKDIR" --run-id "$RUN1")"
 assert_json_field "$STATUS1B" status stopped
 
+echo "[e2e-smoke] case1b auto-stop guard start"
+OUT1B="$($BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --max-ticks 1)"
+RUN1B="$(echo "$OUT1B" | awk -F= '/^run_id=/{print $2}')"
+if [[ -z "$RUN1B" ]]; then
+  echo "[e2e-smoke] failed to parse run1b id"
+  echo "$OUT1B"
+  exit 1
+fi
+sleep 3
+STATUS1C="$($BIN status --repo "$WORKDIR" --run-id "$RUN1B")"
+assert_json_field "$STATUS1C" status stopped
+python3 - <<'PY' "$STATUS1C"
+import json, sys
+obj = json.loads(sys.argv[1])
+summary = obj.get("summary") or ""
+if "auto-stopped" not in summary:
+    raise SystemExit(f"expected auto-stopped summary, got: {summary!r}")
+if int(obj.get("ticks", 0)) < 1:
+    raise SystemExit(f"expected ticks>=1, got: {obj.get('ticks')}")
+PY
+
+
 echo "[e2e-smoke] case2 orphan sweep start"
 IFS='|' read -r RUN2 PID2 <<<"$(run_start 60)"
 kill -9 "$PID2" >/dev/null 2>&1 || true

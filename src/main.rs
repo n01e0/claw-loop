@@ -34,6 +34,10 @@ enum Commands {
         tick_sec: u64,
         #[arg(long, default_value_t = false)]
         deliver_openclaw: bool,
+        #[arg(long)]
+        max_ticks: Option<u64>,
+        #[arg(long)]
+        max_runtime_sec: Option<u64>,
     },
     Daemon {
         #[arg(long)]
@@ -135,6 +139,10 @@ struct Manifest {
     daemon_pid: u32,
     #[serde(default)]
     deliver_openclaw: bool,
+    #[serde(default)]
+    max_ticks: Option<u64>,
+    #[serde(default)]
+    max_runtime_sec: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -157,6 +165,8 @@ struct State {
     waiting_reason: String,
     lease_expires_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    #[serde(default)]
+    ticks: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -272,6 +282,18 @@ struct TaskChecklistEntry {
     done: bool,
     id: String,
     text: String,
+}
+
+struct StartOptions {
+    repo: PathBuf,
+    session_key: String,
+    channel: String,
+    thread_id: String,
+    owner_message_id: Option<String>,
+    tick_sec: u64,
+    deliver_openclaw: bool,
+    max_ticks: Option<u64>,
+    max_runtime_sec: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1072,6 +1094,29 @@ fn classify_ack_failure_category(raw: Option<&str>) -> String {
     }
 }
 
+fn compute_auto_stop_reason(
+    ticks: u64,
+    max_ticks: Option<u64>,
+    started_at: DateTime<Utc>,
+    max_runtime_sec: Option<u64>,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    if let Some(limit) = max_ticks
+        && ticks >= limit
+    {
+        return Some(format!("max_ticks reached ({ticks}/{limit})"));
+    }
+
+    if let Some(limit) = max_runtime_sec {
+        let elapsed = (now - started_at).num_seconds().max(0) as u64;
+        if elapsed >= limit {
+            return Some(format!("max_runtime_sec reached ({elapsed}s/{limit}s)"));
+        }
+    }
+
+    None
+}
+
 fn lease_window_sec(tick_sec: u64) -> i64 {
     // Keep detection reasonably fast while allowing scheduler jitter.
     // tick=60s -> lease=90s.
@@ -1264,28 +1309,20 @@ fn reduce_pr_tracking(run_dir: &Path, manifest: &Manifest, state: &mut State) ->
     }
 }
 
-fn cmd_start(
-    repo: PathBuf,
-    session_key: String,
-    channel: String,
-    thread_id: String,
-    owner_message_id: Option<String>,
-    tick_sec: u64,
-    deliver_openclaw: bool,
-) -> Result<()> {
+fn cmd_start(opts: StartOptions) -> Result<()> {
     let run_id = Uuid::new_v4();
-    let dir = run_dir(&repo, run_id);
+    let dir = run_dir(&opts.repo, run_id);
     fs::create_dir_all(&dir)?;
 
     let exe = std::env::current_exe().context("resolve current executable")?;
     let child = Command::new(exe)
         .arg("daemon")
         .arg("--repo")
-        .arg(&repo)
+        .arg(&opts.repo)
         .arg("--run-id")
         .arg(run_id.to_string())
         .arg("--tick-sec")
-        .arg(tick_sec.to_string())
+        .arg(opts.tick_sec.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1295,22 +1332,25 @@ fn cmd_start(
     let now = Utc::now();
     let manifest = Manifest {
         run_id,
-        repo_path: repo.clone(),
-        session_key,
-        channel,
-        thread_id,
-        owner_message_id,
+        repo_path: opts.repo.clone(),
+        session_key: opts.session_key,
+        channel: opts.channel,
+        thread_id: opts.thread_id,
+        owner_message_id: opts.owner_message_id,
         started_at: now,
         daemon_pid: child.id(),
-        deliver_openclaw,
+        deliver_openclaw: opts.deliver_openclaw,
+        max_ticks: opts.max_ticks,
+        max_runtime_sec: opts.max_runtime_sec,
     };
     let state = State {
         version: 1,
         status: LoopStatus::Running,
         summary: "daemon started".into(),
         waiting_reason: String::new(),
-        lease_expires_at: now + chrono::Duration::seconds(lease_window_sec(tick_sec)),
+        lease_expires_at: now + chrono::Duration::seconds(lease_window_sec(opts.tick_sec)),
         updated_at: now,
+        ticks: 0,
     };
 
     write_json(&dir.join("manifest.json"), &manifest)?;
@@ -1379,6 +1419,42 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
         }
 
         let mut state: State = read_json(&dir.join("state.json"))?;
+        let now = Utc::now();
+
+        if let Some(reason) = compute_auto_stop_reason(
+            state.ticks,
+            manifest.max_ticks,
+            manifest.started_at,
+            manifest.max_runtime_sec,
+            now,
+        ) {
+            state.version += 1;
+            state.status = LoopStatus::Stopped;
+            state.summary = format!("auto-stopped: {reason}");
+            state.waiting_reason = reason.clone();
+            state.updated_at = now;
+            write_json(&dir.join("state.json"), &state)?;
+
+            append_event(
+                &dir,
+                "daemon_auto_stopped",
+                serde_json::json!({
+                    "reason": reason,
+                    "ticks": state.ticks,
+                    "max_ticks": manifest.max_ticks,
+                    "max_runtime_sec": manifest.max_runtime_sec,
+                }),
+            )?;
+            queue_notification(
+                &dir,
+                &manifest,
+                "auto_stopped",
+                format!("loop daemon auto-stopped: {}", state.waiting_reason),
+            )?;
+            let _ = flush_notifications(&dir, &manifest)?;
+            break;
+        }
+
         if matches!(
             state.status,
             LoopStatus::Done | LoopStatus::Failed | LoopStatus::Stopped
@@ -1399,7 +1475,8 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
         }
 
         state.version += 1;
-        state.updated_at = Utc::now();
+        state.ticks = state.ticks.saturating_add(1);
+        state.updated_at = now;
         state.lease_expires_at =
             state.updated_at + chrono::Duration::seconds(lease_window_sec(tick_sec));
 
@@ -1409,7 +1486,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
         append_event(
             &dir,
             "tick",
-            serde_json::json!({"version": state.version, "pr_changed": pr_changed}),
+            serde_json::json!({"version": state.version, "ticks": state.ticks, "pr_changed": pr_changed}),
         )?;
 
         let _ = flush_notifications(&dir, &manifest)?;
@@ -1488,6 +1565,7 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
     } else {
         None
     };
+    let runtime_sec = (Utc::now() - manifest.started_at).num_seconds().max(0);
 
     println!(
         "{}",
@@ -1500,6 +1578,10 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
             "waiting_reason": state.waiting_reason,
             "updated_at": state.updated_at,
             "lease_expires_at": state.lease_expires_at,
+            "ticks": state.ticks,
+            "max_ticks": manifest.max_ticks,
+            "max_runtime_sec": manifest.max_runtime_sec,
+            "runtime_sec": runtime_sec,
             "queued_notifications_total": queued_total,
             "pending_notifications": pending,
             "dispatched_notifications": dispatched,
@@ -2212,7 +2294,9 @@ fn main() -> Result<()> {
             owner_message_id,
             tick_sec,
             deliver_openclaw,
-        } => cmd_start(
+            max_ticks,
+            max_runtime_sec,
+        } => cmd_start(StartOptions {
             repo,
             session_key,
             channel,
@@ -2220,7 +2304,9 @@ fn main() -> Result<()> {
             owner_message_id,
             tick_sec,
             deliver_openclaw,
-        ),
+            max_ticks,
+            max_runtime_sec,
+        }),
         Commands::Daemon {
             repo,
             run_id,
@@ -2269,8 +2355,8 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ack_retry_policy, classify_ack_failure_category, compute_backoff_sec,
-        delivery_retry_backoff_sec, lease_window_sec, normalize_error_reason,
+        ack_retry_policy, classify_ack_failure_category, compute_auto_stop_reason,
+        compute_backoff_sec, delivery_retry_backoff_sec, lease_window_sec, normalize_error_reason,
         parse_task_checklist_entry,
     };
 
@@ -2361,6 +2447,24 @@ mod tests {
         let rate = ack_retry_policy("rate_limited", 3);
         assert!(rate.retryable);
         assert_eq!(rate.backoff_sec, 120);
+    }
+
+    #[test]
+    fn auto_stop_reason_prefers_max_ticks() {
+        let started_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let now = chrono::Utc::now();
+        let reason = compute_auto_stop_reason(3, Some(3), started_at, Some(3600), now)
+            .expect("expected auto stop");
+        assert!(reason.contains("max_ticks"));
+    }
+
+    #[test]
+    fn auto_stop_reason_hits_runtime_limit() {
+        let started_at = chrono::Utc::now() - chrono::Duration::seconds(11);
+        let now = chrono::Utc::now();
+        let reason = compute_auto_stop_reason(2, None, started_at, Some(10), now)
+            .expect("expected runtime auto stop");
+        assert!(reason.contains("max_runtime_sec"));
     }
 
     #[test]
