@@ -83,4 +83,18 @@ $BIN sweep --repo "$WORKDIR" --run-id "$RUN2" >/dev/null
 STATUS2="$($BIN status --repo "$WORKDIR" --run-id "$RUN2")"
 assert_json_field "$STATUS2" status blocked
 
+echo "[e2e-smoke] case3 single-writer lock start"
+IFS='|' read -r RUN3 PID3 <<<"$(run_start 10)"
+set +e
+$BIN daemon --repo "$WORKDIR" --run-id "$RUN3" --tick-sec 10 >/tmp/claw-loopd-e2e-lock.log 2>&1
+RC=$?
+set -e
+if [[ "$RC" -eq 0 ]]; then
+  echo "[e2e-smoke] expected second daemon to fail, but rc=0"
+  cat /tmp/claw-loopd-e2e-lock.log
+  exit 1
+fi
+$BIN stop --repo "$WORKDIR" --run-id "$RUN3" >/dev/null || true
+sleep 1
+
 echo "[e2e-smoke] ok"
