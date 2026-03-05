@@ -146,6 +146,37 @@ $BIN stop --repo "$WORKDIR" --run-id "$RUN1C" --immediate >/dev/null || true
 sleep 1
 
 
+echo "[e2e-smoke] case1d runner waiting state (no block)"
+TASKFILE_W="$WORKDIR/docs/roadmaps/waiting-tasklist.md"
+cat > "$TASKFILE_W" <<'EOF'
+- [ ] W1: wait merge
+EOF
+OUT1D="$($BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --task-file "$TASKFILE_W" --task-runner-cmd 'echo "TASK_WAITING_MERGE PR_URL=https://example.invalid/pr/1"; exit 10' --auto-check-on-success true --max-task-loops 10)"
+RUN1D="$(echo "$OUT1D" | awk -F= '/^run_id=/{print $2}')"
+if [[ -z "$RUN1D" ]]; then
+  echo "[e2e-smoke] failed to parse run1d id"
+  echo "$OUT1D"
+  exit 1
+fi
+sleep 3
+STATUS1F="$($BIN status --repo "$WORKDIR" --run-id "$RUN1D")"
+python3 - <<'PY' "$STATUS1F"
+import json, sys
+obj = json.loads(sys.argv[1])
+runner = obj.get("runner") or {}
+if obj.get("status") != "waiting":
+    raise SystemExit(f"expected waiting, got {obj.get('status')!r}")
+if "TASK_WAITING_MERGE" not in (obj.get("waiting_reason") or ""):
+    raise SystemExit(f"expected waiting reason to include TASK_WAITING_MERGE, got {obj.get('waiting_reason')!r}")
+if int(runner.get("task_loops_started", 0)) != 0:
+    raise SystemExit(f"expected loops_started=0, got {runner}")
+if int(obj.get("task_done_current", 0)) != 0:
+    raise SystemExit(f"expected task_done_current=0, got {obj.get('task_done_current')}")
+PY
+$BIN stop --repo "$WORKDIR" --run-id "$RUN1D" --immediate >/dev/null || true
+sleep 1
+
+
 echo "[e2e-smoke] case2 orphan sweep start"
 IFS='|' read -r RUN2 PID2 <<<"$(run_start 60)"
 kill -9 "$PID2" >/dev/null 2>&1 || true

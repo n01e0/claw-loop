@@ -26,7 +26,7 @@ Ask and confirm:
 - quality gates (`fmt`, `clippy -D warnings`, `test`, `build`, `e2e`)
 - delivery style (small PRs, merge policy)
 - completion judgment mode:
-  - default: agent-judged (`--auto-check-on-success true`)
+  - default: runner success with PR+merge confirmation (`--auto-check-on-success true` + `scripts/rl-task-agent.sh`)
   - strict/manual: completion-gated (`--auto-check-on-success false`)
 
 ## Tasklist format
@@ -61,7 +61,7 @@ claw-loopd start \
   --max-task-loops 10 \
   --max-runtime-sec 3600 \
   --task-file <tasklist_path> \
-  --task-runner-cmd '<runner command>' \
+  --task-runner-cmd './scripts/rl-task-agent.sh' \
   --auto-check-on-success true
 ```
 

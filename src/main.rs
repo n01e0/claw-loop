@@ -749,6 +749,17 @@ struct TaskRunOutcome {
     check_result: Option<serde_json::Value>,
 }
 
+struct TaskRunOptions<'a> {
+    task_file: &'a Path,
+    cmd: &'a str,
+    auto_check_on_success: bool,
+    dry_run: bool,
+    cwd: Option<&'a Path>,
+    run_id: Option<Uuid>,
+    thread_id: Option<&'a str>,
+    channel: Option<&'a str>,
+}
+
 fn clip_text(input: &str, max_chars: usize) -> String {
     if input.chars().count() <= max_chars {
         return input.to_string();
@@ -757,20 +768,13 @@ fn clip_text(input: &str, max_chars: usize) -> String {
     format!("{clipped}…")
 }
 
-fn run_task_once(
-    task_file: &Path,
-    cmd: &str,
-    auto_check_on_success: bool,
-    dry_run: bool,
-    cwd: Option<&Path>,
-    run_id: Option<Uuid>,
-) -> Result<TaskRunOutcome> {
-    let (_, _, entries) = load_task_checklist(task_file)?;
+fn run_task_once(opts: TaskRunOptions<'_>) -> Result<TaskRunOutcome> {
+    let (_, _, entries) = load_task_checklist(opts.task_file)?;
     let next = entries.iter().find(|entry| !entry.done).cloned();
 
     let mut outcome = TaskRunOutcome {
         task: next.clone(),
-        command: cmd.to_string(),
+        command: opts.cmd.to_string(),
         executed: false,
         success: false,
         exit_code: None,
@@ -783,24 +787,33 @@ fn run_task_once(
         return Ok(outcome);
     };
 
-    if dry_run {
+    if opts.dry_run {
         return Ok(outcome);
     }
 
     let mut command = Command::new("bash");
     command
         .arg("-lc")
-        .arg(cmd)
+        .arg(opts.cmd)
         .env("CLAW_TASK_ID", &task.id)
         .env("CLAW_TASK_TEXT", &task.text)
         .env("CLAW_TASK_LINE", task.line_no.to_string())
-        .env("CLAW_TASK_FILE", task_file.to_string_lossy().to_string());
+        .env(
+            "CLAW_TASK_FILE",
+            opts.task_file.to_string_lossy().to_string(),
+        );
 
-    if let Some(run_id) = run_id {
+    if let Some(run_id) = opts.run_id {
         command.env("CLAW_RUN_ID", run_id.to_string());
     }
+    if let Some(thread_id) = opts.thread_id {
+        command.env("CLAW_THREAD_ID", thread_id);
+    }
+    if let Some(channel) = opts.channel {
+        command.env("CLAW_CHANNEL", channel);
+    }
 
-    if let Some(cwd) = cwd {
+    if let Some(cwd) = opts.cwd {
         command.current_dir(cwd);
     }
 
@@ -808,7 +821,7 @@ fn run_task_once(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .with_context(|| format!("run task command: {cmd}"))?;
+        .with_context(|| format!("run task command: {}", opts.cmd))?;
 
     outcome.executed = true;
     outcome.success = output.status.success();
@@ -816,8 +829,8 @@ fn run_task_once(
     outcome.stdout = String::from_utf8_lossy(&output.stdout).to_string();
     outcome.stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    if outcome.success && auto_check_on_success {
-        outcome.check_result = Some(update_task_check(task_file, &task.id, true)?);
+    if outcome.success && opts.auto_check_on_success {
+        outcome.check_result = Some(update_task_check(opts.task_file, &task.id, true)?);
     }
 
     Ok(outcome)
@@ -1828,14 +1841,16 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             "all tasklist items completed; waiting for instruction",
                         )?;
                     } else {
-                        let runner = run_task_once(
-                            &task_file_abs,
+                        let runner = run_task_once(TaskRunOptions {
+                            task_file: &task_file_abs,
                             cmd,
-                            manifest.auto_check_on_success,
-                            false,
-                            Some(&manifest.repo_path),
-                            Some(run_id),
-                        )?;
+                            auto_check_on_success: manifest.auto_check_on_success,
+                            dry_run: false,
+                            cwd: Some(&manifest.repo_path),
+                            run_id: Some(run_id),
+                            thread_id: Some(&manifest.thread_id),
+                            channel: Some(&manifest.channel),
+                        })?;
 
                         append_event(
                             &dir,
@@ -1857,17 +1872,50 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             }),
                         )?;
 
-                        if !runner.success {
+                        let first_stdout_line = runner
+                            .stdout
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        let task_label = runner
+                            .task
+                            .as_ref()
+                            .map(|t| t.id.clone())
+                            .unwrap_or_else(|| "unknown".to_string());
+
+                        if runner.exit_code == Some(10)
+                            || first_stdout_line.starts_with("TASK_WAITING")
+                        {
+                            let prev_status = state.status.clone();
+                            let prev_waiting_reason = state.waiting_reason.clone();
+
+                            state.version += 1;
+                            state.status = LoopStatus::Waiting;
+                            state.summary = format!("task waiting: {task_label}");
+                            state.waiting_reason = if first_stdout_line.is_empty() {
+                                format!("task waiting: {task_label}")
+                            } else {
+                                clip_text(&first_stdout_line, 200)
+                            };
+                            state.updated_at = now;
+                            write_json(&dir.join("state.json"), &state)?;
+
+                            if prev_status != LoopStatus::Waiting
+                                || prev_waiting_reason != state.waiting_reason
+                            {
+                                queue_notification(
+                                    &dir,
+                                    &manifest,
+                                    "task_waiting",
+                                    format!("{} ({})", state.waiting_reason, task_label),
+                                )?;
+                            }
+                        } else if !runner.success {
                             state.version += 1;
                             state.status = LoopStatus::Blocked;
-                            state.summary = format!(
-                                "task runner failed: {}",
-                                runner
-                                    .task
-                                    .as_ref()
-                                    .map(|t| t.id.clone())
-                                    .unwrap_or_else(|| "unknown".to_string())
-                            );
+                            state.summary = format!("task runner failed: {}", task_label);
                             state.waiting_reason = format!(
                                 "runner exit={:?}: {}",
                                 runner.exit_code,
@@ -1879,20 +1927,15 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                 &dir,
                                 &manifest,
                                 "runner_failed",
-                                format!(
-                                    "task runner failed for {}",
-                                    runner
-                                        .task
-                                        .as_ref()
-                                        .map(|t| t.id.clone())
-                                        .unwrap_or_else(|| "unknown".to_string())
-                                ),
+                                format!("task runner failed for {}", task_label),
                             )?;
                             let _ = flush_notifications(&dir, &manifest)?;
                             break;
                         }
 
-                        if let Some(task) = runner.task {
+                        if runner.success
+                            && let Some(task) = runner.task
+                        {
                             runner_state.task_loops_started =
                                 runner_state.task_loops_started.saturating_add(1);
                             if manifest.auto_check_on_success {
@@ -2808,14 +2851,16 @@ fn cmd_task_run_once(
     auto_check_on_success: bool,
     dry_run: bool,
 ) -> Result<()> {
-    let outcome = run_task_once(
-        &file,
-        &cmd,
+    let outcome = run_task_once(TaskRunOptions {
+        task_file: &file,
+        cmd: &cmd,
         auto_check_on_success,
         dry_run,
-        Some(Path::new(".")),
-        None,
-    )?;
+        cwd: Some(Path::new(".")),
+        run_id: None,
+        thread_id: None,
+        channel: None,
+    })?;
 
     println!(
         "{}",
