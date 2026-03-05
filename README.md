@@ -17,6 +17,8 @@ Thread-bound monitored Ralph loop daemon (Rust).
   - `notify-ack.jsonl` (ack success/failure history)
   - `notify-dead-letter.jsonl` (max-attempt exceeded)
   - `delivery-report --status failed` includes normalized `failed_reason_histogram`
+  - `delivery-report` rows include ack fields: `acked`, `ack_at`, `ack_category`, `ack_error`
+  - `status` includes ack aggregates: `acked_total`, `unacked_total`, `last_acked_at`
 - Optional OpenClaw delivery bridge (`--deliver-openclaw`):
   - sends notifications via `openclaw message send`
   - keeps unsent events in queue for retry
