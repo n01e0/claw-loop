@@ -1244,6 +1244,7 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
     let dispatched_items =
         read_jsonl::<DispatchedNotification>(&dir.join("notify-dispatched.jsonl"))?;
     let attempt_items = read_jsonl::<DeliveryAttempt>(&delivery_attempts_path(&dir))?;
+    let ack_items = read_jsonl::<DeliveryAck>(&delivery_ack_path(&dir))?;
     let dead_letter_items = read_jsonl::<DeadLetterEntry>(&dead_letter_path(&dir))?;
 
     let mut seen = HashSet::new();
@@ -1255,10 +1256,28 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
         .filter(|n| !seen.contains(&n.event_id))
         .count();
 
+    let mut latest_ack: HashMap<Uuid, DeliveryAck> = HashMap::new();
+    for ack in ack_items {
+        match latest_ack.get(&ack.event_id) {
+            Some(prev) if prev.acked_at >= ack.acked_at => {}
+            _ => {
+                latest_ack.insert(ack.event_id, ack);
+            }
+        }
+    }
+
     let queued_total = queued_items.len();
     let dispatched = dispatched_items.len();
     let attempts_total = attempt_items.len();
     let dead_letter_total = dead_letter_items.len();
+    let ack_entries_total = latest_ack.len();
+    let acked_total = latest_ack.values().filter(|a| a.ok).count();
+    let unacked_total = latest_ack.values().filter(|a| !a.ok).count();
+    let last_acked_at = latest_ack
+        .values()
+        .filter(|a| a.ok)
+        .map(|a| a.acked_at)
+        .max();
     let last_attempt_at = attempt_items.iter().map(|a| a.attempted_at).max();
     let next_retry_at = queued_items.iter().filter_map(|n| n.next_retry_at).min();
 
@@ -1290,6 +1309,10 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
             "dispatched_notifications": dispatched,
             "delivery_attempts_total": attempts_total,
             "dead_letter_total": dead_letter_total,
+            "ack_entries_total": ack_entries_total,
+            "acked_total": acked_total,
+            "unacked_total": unacked_total,
+            "last_acked_at": last_acked_at,
             "last_attempt_at": last_attempt_at,
             "next_retry_at": next_retry_at,
             "daemon_pid": manifest.daemon_pid,
@@ -1325,6 +1348,7 @@ fn cmd_delivery_report(
     let dispatched_items =
         read_jsonl::<DispatchedNotification>(&dir.join("notify-dispatched.jsonl"))?;
     let attempt_items = read_jsonl::<DeliveryAttempt>(&delivery_attempts_path(&dir))?;
+    let ack_items = read_jsonl::<DeliveryAck>(&delivery_ack_path(&dir))?;
     let dead_letter_items = read_jsonl::<DeadLetterEntry>(&dead_letter_path(&dir))?;
 
     let mut latest_attempt: HashMap<Uuid, DeliveryAttempt> = HashMap::new();
@@ -1337,12 +1361,23 @@ fn cmd_delivery_report(
         }
     }
 
+    let mut latest_ack: HashMap<Uuid, DeliveryAck> = HashMap::new();
+    for ack in ack_items {
+        match latest_ack.get(&ack.event_id) {
+            Some(prev) if prev.acked_at >= ack.acked_at => {}
+            _ => {
+                latest_ack.insert(ack.event_id, ack);
+            }
+        }
+    }
+
     let mut rows: Vec<(DateTime<Utc>, serde_json::Value)> = Vec::new();
     let mut seen: HashSet<Uuid> = HashSet::new();
 
     for d in &dispatched_items {
         seen.insert(d.event_id);
         let last_attempt = latest_attempt.get(&d.event_id);
+        let ack = latest_ack.get(&d.event_id);
         let last_activity = last_attempt
             .map(|a| a.attempted_at)
             .unwrap_or(d.dispatched_at);
@@ -1358,6 +1393,10 @@ fn cmd_delivery_report(
                 "last_activity": last_activity,
                 "dispatched_at": d.dispatched_at,
                 "last_error": last_attempt.and_then(|a| a.error.clone()),
+                "acked": ack.map(|a| a.ok).unwrap_or(false),
+                "ack_at": ack.map(|a| a.acked_at),
+                "ack_category": ack.map(|a| a.category.clone()),
+                "ack_error": ack.and_then(|a| a.error.clone()),
             }),
         ));
     }
@@ -1368,6 +1407,7 @@ fn cmd_delivery_report(
         }
 
         let last_attempt = latest_attempt.get(&q.event_id);
+        let ack = latest_ack.get(&q.event_id);
         let last_activity = last_attempt.map(|a| a.attempted_at).unwrap_or(q.ts);
 
         rows.push((
@@ -1381,12 +1421,17 @@ fn cmd_delivery_report(
                 "last_activity": last_activity,
                 "next_retry_at": q.next_retry_at,
                 "last_error": q.last_error,
+                "acked": ack.map(|a| a.ok).unwrap_or(false),
+                "ack_at": ack.map(|a| a.acked_at),
+                "ack_category": ack.map(|a| a.category.clone()),
+                "ack_error": ack.and_then(|a| a.error.clone()),
             }),
         ));
     }
 
     for dlq in &dead_letter_items {
         let normalized_reason = normalize_error_reason(dlq.last_error.as_deref());
+        let ack = latest_ack.get(&dlq.event_id);
 
         rows.push((
             dlq.moved_at,
@@ -1400,6 +1445,10 @@ fn cmd_delivery_report(
                 "dead_letter_at": dlq.moved_at,
                 "last_error": dlq.last_error,
                 "normalized_reason": normalized_reason,
+                "acked": ack.map(|a| a.ok).unwrap_or(false),
+                "ack_at": ack.map(|a| a.acked_at),
+                "ack_category": ack.map(|a| a.category.clone()),
+                "ack_error": ack.and_then(|a| a.error.clone()),
             }),
         ));
     }
@@ -1419,6 +1468,14 @@ fn cmd_delivery_report(
         .iter()
         .filter(|q| !dispatched_items.iter().any(|d| d.event_id == q.event_id))
         .count();
+
+    let acked_total = latest_ack.values().filter(|a| a.ok).count();
+    let unacked_total = latest_ack.values().filter(|a| !a.ok).count();
+    let last_acked_at = latest_ack
+        .values()
+        .filter(|a| a.ok)
+        .map(|a| a.acked_at)
+        .max();
 
     let mut failed_for_hist: Vec<&DeadLetterEntry> = dead_letter_items.iter().collect();
     failed_for_hist.sort_by(|a, b| b.moved_at.cmp(&a.moved_at));
@@ -1476,6 +1533,12 @@ fn cmd_delivery_report(
             "delivered_count": dispatched_items.len(),
             "failed_count": dead_letter_items.len(),
             "attempt_count": latest_attempt.len(),
+            "ack_summary": {
+                "events_with_ack": latest_ack.len(),
+                "acked_total": acked_total,
+                "unacked_total": unacked_total,
+                "last_acked_at": last_acked_at,
+            },
             "failed_histogram_window": {
                 "mode": if failed_window == 0 { "all" } else { "recent" },
                 "recent_n": if failed_window == 0 { serde_json::Value::Null } else { serde_json::json!(failed_window) },

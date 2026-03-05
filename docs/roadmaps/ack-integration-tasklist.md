@@ -33,9 +33,9 @@
 ### Phase 1: 実装
 - [x] A1-1: `notify-ack.jsonl` を追加（ackイベント履歴）
 - [x] A1-2: `flush_notifications` に ack 記録を追加
-- [ ] A1-3: `delivery-report` に ack情報を統合
+- [x] A1-3: `delivery-report` に ack情報を統合
   - `acked` / `ack_at` / `ack_error` を表示
-- [ ] A1-4: `status` に ack集計を追加
+- [x] A1-4: `status` に ack集計を追加
   - `acked_total` / `unacked_total` / `last_acked_at`
 - [ ] A1-5: ack失敗の retry policy を明示化
 
