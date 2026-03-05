@@ -239,9 +239,25 @@ if not hist:
     raise SystemExit(f"expected failed_reason_histogram entries, got: {hist}")
 if hist[0].get("reason") != "openclaw_send_failed":
     raise SystemExit(f"expected normalized reason openclaw_send_failed, got: {hist}")
+by_kind = obj.get("failed_reason_histogram_by_kind") or []
+if not by_kind:
+    raise SystemExit(f"expected failed_reason_histogram_by_kind entries, got: {by_kind}")
+if by_kind[0].get("kind") != "progress":
+    raise SystemExit(f"expected kind 'progress', got: {by_kind}")
 print(items[0]["event_id"])
 PY
 )"
+
+REPORT6_RECENT="$($BIN delivery-report --repo "$WORKDIR" --run-id "$RUN6" --limit 10 --status failed --failed-window 1)"
+python3 - <<'PY' "$REPORT6_RECENT"
+import json, sys
+obj = json.loads(sys.argv[1])
+window = obj.get("failed_histogram_window") or {}
+if window.get("mode") != "recent":
+    raise SystemExit(f"expected recent window mode, got {window}")
+if int(window.get("considered_failed_count", 0)) != 1:
+    raise SystemExit(f"expected considered_failed_count=1, got {window}")
+PY
 
 echo "[e2e-smoke] case7 dead-letter requeue"
 $BIN stop --repo "$WORKDIR" --run-id "$RUN6" >/dev/null || true

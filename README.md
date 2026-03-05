@@ -69,7 +69,10 @@ cargo run -- status --repo . --run-id <RUN_ID>
 # 3.1) event-level delivery report
 cargo run -- delivery-report --repo . --run-id <RUN_ID> --limit 20 --status all
 # status: all|pending|delivered|failed
-# failed status output includes normalized `failed_reason_histogram`
+# failed status output includes:
+# - normalized `failed_reason_histogram`
+# - `failed_reason_histogram_by_kind`
+# - `--failed-window <N>` for recent-N failed histogram window
 
 # 3.2) requeue dead-letter entries
 cargo run -- requeue-dead-letter --repo . --run-id <RUN_ID> --event-id <EVENT_ID> --limit 1 --reset-attempts

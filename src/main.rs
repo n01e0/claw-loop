@@ -64,6 +64,8 @@ enum Commands {
         limit: usize,
         #[arg(long, default_value = "all")]
         status: String,
+        #[arg(long, default_value_t = 0)]
+        failed_window: usize,
     },
     RequeueDeadLetter {
         #[arg(long)]
@@ -1245,7 +1247,13 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
     Ok(())
 }
 
-fn cmd_delivery_report(repo: PathBuf, run_id: Uuid, limit: usize, status: String) -> Result<()> {
+fn cmd_delivery_report(
+    repo: PathBuf,
+    run_id: Uuid,
+    limit: usize,
+    status: String,
+    failed_window: usize,
+) -> Result<()> {
     let dir = run_dir(&repo, run_id);
     if !dir.exists() {
         bail!("run directory not found: {}", dir.display());
@@ -1277,7 +1285,6 @@ fn cmd_delivery_report(repo: PathBuf, run_id: Uuid, limit: usize, status: String
 
     let mut rows: Vec<(DateTime<Utc>, serde_json::Value)> = Vec::new();
     let mut seen: HashSet<Uuid> = HashSet::new();
-    let mut failed_reason_histogram: HashMap<String, usize> = HashMap::new();
 
     for d in &dispatched_items {
         seen.insert(d.event_id);
@@ -1326,9 +1333,6 @@ fn cmd_delivery_report(repo: PathBuf, run_id: Uuid, limit: usize, status: String
 
     for dlq in &dead_letter_items {
         let normalized_reason = normalize_error_reason(dlq.last_error.as_deref());
-        *failed_reason_histogram
-            .entry(normalized_reason.clone())
-            .or_insert(0) += 1;
 
         rows.push((
             dlq.moved_at,
@@ -1362,12 +1366,52 @@ fn cmd_delivery_report(repo: PathBuf, run_id: Uuid, limit: usize, status: String
         .filter(|q| !dispatched_items.iter().any(|d| d.event_id == q.event_id))
         .count();
 
-    let mut reason_pairs: Vec<(String, usize)> = failed_reason_histogram.into_iter().collect();
+    let mut failed_for_hist: Vec<&DeadLetterEntry> = dead_letter_items.iter().collect();
+    failed_for_hist.sort_by(|a, b| b.moved_at.cmp(&a.moved_at));
+    if failed_window > 0 && failed_for_hist.len() > failed_window {
+        failed_for_hist.truncate(failed_window);
+    }
+
+    let mut failed_reason_histogram_map: HashMap<String, usize> = HashMap::new();
+    let mut failed_reason_by_kind_map: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    for dlq in &failed_for_hist {
+        let reason = normalize_error_reason(dlq.last_error.as_deref());
+        *failed_reason_histogram_map
+            .entry(reason.clone())
+            .or_insert(0) += 1;
+        *failed_reason_by_kind_map
+            .entry(dlq.kind.clone())
+            .or_default()
+            .entry(reason)
+            .or_insert(0) += 1;
+    }
+
+    let mut reason_pairs: Vec<(String, usize)> = failed_reason_histogram_map.into_iter().collect();
     reason_pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let failed_reason_histogram = reason_pairs
         .into_iter()
         .map(|(reason, count)| serde_json::json!({"reason": reason, "count": count}))
         .collect::<Vec<_>>();
+
+    let mut by_kind: Vec<serde_json::Value> = failed_reason_by_kind_map
+        .into_iter()
+        .map(|(kind, reasons)| {
+            let mut pairs: Vec<(String, usize)> = reasons.into_iter().collect();
+            pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            serde_json::json!({
+                "kind": kind,
+                "reasons": pairs
+                    .into_iter()
+                    .map(|(reason, count)| serde_json::json!({"reason": reason, "count": count}))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    by_kind.sort_by(|a, b| {
+        let ak = a.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let bk = b.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        ak.cmp(bk)
+    });
 
     println!(
         "{}",
@@ -1378,7 +1422,13 @@ fn cmd_delivery_report(repo: PathBuf, run_id: Uuid, limit: usize, status: String
             "delivered_count": dispatched_items.len(),
             "failed_count": dead_letter_items.len(),
             "attempt_count": latest_attempt.len(),
+            "failed_histogram_window": {
+                "mode": if failed_window == 0 { "all" } else { "recent" },
+                "recent_n": if failed_window == 0 { serde_json::Value::Null } else { serde_json::json!(failed_window) },
+                "considered_failed_count": failed_for_hist.len(),
+            },
             "failed_reason_histogram": failed_reason_histogram,
+            "failed_reason_histogram_by_kind": by_kind,
             "items": items,
         }))?
     );
@@ -1770,7 +1820,8 @@ fn main() -> Result<()> {
             run_id,
             limit,
             status,
-        } => cmd_delivery_report(repo, run_id, limit, status),
+            failed_window,
+        } => cmd_delivery_report(repo, run_id, limit, status, failed_window),
         Commands::RequeueDeadLetter {
             repo,
             run_id,
