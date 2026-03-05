@@ -37,11 +37,14 @@
   - `acked` / `ack_at` / `ack_error` を表示
 - [x] A1-4: `status` に ack集計を追加
   - `acked_total` / `unacked_total` / `last_acked_at`
-- [ ] A1-5: ack失敗の retry policy を明示化
+- [x] A1-5: ack失敗の retry policy を明示化
+  - 仕様: `docs/specs/ack-retry-policy.md`
 
 ### Phase 2: 安全性
-- [ ] A2-1: ack記録の二重書き込み防止（event_id idempotency）
-- [ ] A2-2: daemon再起動跨ぎでのack整合性確認
+- [x] A2-1: ack記録の二重書き込み防止（event_id idempotency）
+  - `(event_id, attempts)` キーで重複ack appendを抑止
+- [x] A2-2: daemon再起動跨ぎでのack整合性確認
+  - daemon起動時に `delivery_reconciled` で queue/ack を再整合
 - [ ] A2-3: dead-letter と ack の状態遷移ルールを固定
 
 ### Phase 3: テスト

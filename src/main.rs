@@ -509,6 +509,64 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> {
     Ok(out)
 }
 
+fn append_ack_idempotent(
+    path: &Path,
+    ack: &DeliveryAck,
+    seen: &mut HashSet<(Uuid, u32)>,
+) -> Result<bool> {
+    let key = (ack.event_id, ack.attempts);
+    if seen.contains(&key) {
+        return Ok(false);
+    }
+    append_jsonl(path, ack)?;
+    seen.insert(key);
+    Ok(true)
+}
+
+fn reconcile_delivery_state(run_dir: &Path) -> Result<serde_json::Value> {
+    let queue_path = run_dir.join("notify-queue.jsonl");
+    let dispatched_path = run_dir.join("notify-dispatched.jsonl");
+    let ack_path = delivery_ack_path(run_dir);
+
+    let mut queue = read_jsonl::<Notification>(&queue_path)?;
+    let dispatched = read_jsonl::<DispatchedNotification>(&dispatched_path)?;
+    let acks = read_jsonl::<DeliveryAck>(&ack_path)?;
+
+    let mut dispatched_ids: HashSet<Uuid> = HashSet::new();
+    for d in &dispatched {
+        dispatched_ids.insert(d.event_id);
+    }
+
+    // Remove stale queued items already dispatched in previous process lifetimes.
+    let before_queue = queue.len();
+    queue.retain(|n| !dispatched_ids.contains(&n.event_id));
+    let removed_queued = before_queue.saturating_sub(queue.len());
+    if removed_queued > 0 {
+        rewrite_jsonl(&queue_path, &queue)?;
+    }
+
+    // De-duplicate ack entries by (event_id, attempts), keeping first seen.
+    let mut ack_seen: HashSet<(Uuid, u32)> = HashSet::new();
+    let mut ack_deduped: Vec<DeliveryAck> = Vec::new();
+    let mut removed_ack_duplicates = 0usize;
+    for ack in acks {
+        let key = (ack.event_id, ack.attempts);
+        if ack_seen.insert(key) {
+            ack_deduped.push(ack);
+        } else {
+            removed_ack_duplicates += 1;
+        }
+    }
+    if removed_ack_duplicates > 0 {
+        rewrite_jsonl(&ack_path, &ack_deduped)?;
+    }
+
+    Ok(serde_json::json!({
+        "removed_stale_queued": removed_queued,
+        "removed_ack_duplicates": removed_ack_duplicates,
+    }))
+}
+
 fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
     let queue_path = run_dir.join("notify-queue.jsonl");
     let dispatched_path = run_dir.join("notify-dispatched.jsonl");
@@ -516,7 +574,6 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
     let ack_path = delivery_ack_path(run_dir);
     let dead_letter_file = dead_letter_path(run_dir);
     let metrics_path = delivery_metrics_path(run_dir);
-    let max_attempts = delivery_max_attempts();
 
     let queued = read_jsonl::<Notification>(&queue_path)?;
     if queued.is_empty() {
@@ -528,6 +585,12 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
     for d in already {
         seen.insert(d.event_id);
     }
+
+    let existing_acks = read_jsonl::<DeliveryAck>(&ack_path)?;
+    let mut ack_seen: HashSet<(Uuid, u32)> = existing_acks
+        .into_iter()
+        .map(|a| (a.event_id, a.attempts))
+        .collect();
 
     let mut metrics = if metrics_path.exists() {
         read_json::<DeliveryMetrics>(&metrics_path)?
@@ -581,7 +644,17 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
                     attempts: n.attempts,
                     error: None,
                 };
-                append_jsonl(&ack_path, &ack)?;
+                let ack_added = append_ack_idempotent(&ack_path, &ack, &mut ack_seen)?;
+                if !ack_added {
+                    append_event(
+                        run_dir,
+                        "ack_duplicate_skipped",
+                        serde_json::json!({
+                            "event_id": ack.event_id,
+                            "attempts": ack.attempts,
+                        }),
+                    )?;
+                }
 
                 let d = DispatchedNotification {
                     event_id: n.event_id,
@@ -614,22 +687,34 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
                 };
                 append_jsonl(&attempts_path, &attempt)?;
 
+                let category = classify_ack_failure_category(Some(&err_text));
                 let ack = DeliveryAck {
                     event_id: n.event_id,
                     run_id: n.run_id,
                     acked_at: now,
                     ok: false,
-                    category: classify_ack_failure_category(Some(&err_text)),
+                    category: category.clone(),
                     attempts: n.attempts,
                     error: Some(err_text.clone()),
                 };
-                append_jsonl(&ack_path, &ack)?;
+                let ack_added = append_ack_idempotent(&ack_path, &ack, &mut ack_seen)?;
+                if !ack_added {
+                    append_event(
+                        run_dir,
+                        "ack_duplicate_skipped",
+                        serde_json::json!({
+                            "event_id": ack.event_id,
+                            "attempts": ack.attempts,
+                        }),
+                    )?;
+                }
 
                 metrics.failed_total = metrics.failed_total.saturating_add(1);
                 metrics.last_failed_at = Some(now);
                 metrics.last_error = Some(err_text.clone());
 
-                if n.attempts >= max_attempts {
+                let policy = ack_retry_policy(&category, n.attempts);
+                if !policy.retryable || n.attempts >= policy.max_attempts {
                     let dead = DeadLetterEntry {
                         event_id: n.event_id,
                         run_id: n.run_id,
@@ -650,13 +735,14 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
                         serde_json::json!({
                             "event_id": dead.event_id,
                             "attempts": dead.attempts,
+                            "category": category,
                             "error": dead.last_error,
-                            "max_attempts": max_attempts,
+                            "max_attempts": policy.max_attempts,
+                            "retryable": policy.retryable,
                         }),
                     )?;
                 } else {
-                    let backoff = delivery_retry_backoff_sec(n.attempts);
-                    n.next_retry_at = Some(now + chrono::Duration::seconds(backoff));
+                    n.next_retry_at = Some(now + chrono::Duration::seconds(policy.backoff_sec));
                     n.last_error = Some(err_text.clone());
                     kept.push(n.clone());
 
@@ -665,10 +751,12 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
                         "notify_delivery_error",
                         serde_json::json!({
                             "event_id": n.event_id,
+                            "category": category,
                             "error": err_text,
                             "attempts": n.attempts,
                             "next_retry_at": n.next_retry_at,
                             "will_retry": true,
+                            "max_attempts": policy.max_attempts,
                         }),
                     )?;
                 }
@@ -776,6 +864,66 @@ fn delivery_max_attempts() -> u32 {
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(5)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AckRetryPolicy {
+    retryable: bool,
+    max_attempts: u32,
+    backoff_sec: i64,
+}
+
+fn ack_retry_policy(category: &str, attempts: u32) -> AckRetryPolicy {
+    let global_max = delivery_max_attempts();
+    let default_backoff = delivery_retry_backoff_sec(attempts);
+
+    match category {
+        // Non-retryable categories.
+        "auth" | "permission" | "not_found" => AckRetryPolicy {
+            retryable: false,
+            max_attempts: 1,
+            backoff_sec: 0,
+        },
+        // Retryable, but with longer backoff than transport jitter.
+        "rate_limited" => AckRetryPolicy {
+            retryable: true,
+            max_attempts: global_max,
+            backoff_sec: match attempts {
+                0 | 1 => 30,
+                2 => 60,
+                3 => 120,
+                _ => 300,
+            },
+        },
+        // Retryable defaults.
+        "timeout" | "transport" | "upstream_5xx" | "unknown" => AckRetryPolicy {
+            retryable: true,
+            max_attempts: global_max,
+            backoff_sec: default_backoff,
+        },
+        // Future-safe fallback.
+        _ => AckRetryPolicy {
+            retryable: true,
+            max_attempts: global_max,
+            backoff_sec: default_backoff,
+        },
+    }
+}
+
+fn ack_retry_policy_snapshot() -> serde_json::Value {
+    let max_attempts = delivery_max_attempts();
+    serde_json::json!({
+        "retryable_categories": ["timeout", "transport", "rate_limited", "upstream_5xx", "unknown"],
+        "non_retryable_categories": ["auth", "permission", "not_found"],
+        "max_attempts": {
+            "default_retryable": max_attempts,
+            "non_retryable": 1
+        },
+        "backoff_seconds": {
+            "default": [5, 5, 15, 30, 60],
+            "rate_limited": [30, 30, 60, 120, 300]
+        }
+    })
 }
 
 fn sanitize_reason_fallback(raw: &str) -> String {
@@ -1166,6 +1314,9 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
         serde_json::json!({"pid": process::id()}),
     )?;
 
+    let reconcile_summary = reconcile_delivery_state(&dir)?;
+    append_event(&dir, "delivery_reconciled", reconcile_summary)?;
+
     let control_stop = dir.join("control.stop");
 
     loop {
@@ -1318,7 +1469,8 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
             "daemon_pid": manifest.daemon_pid,
             "deliver_openclaw": manifest.deliver_openclaw,
             "pr_tracking": pr_tracking,
-            "delivery_metrics": delivery_metrics
+            "delivery_metrics": delivery_metrics,
+            "ack_retry_policy": ack_retry_policy_snapshot()
         }))?
     );
     Ok(())
@@ -1546,6 +1698,7 @@ fn cmd_delivery_report(
             },
             "failed_reason_histogram": failed_reason_histogram,
             "failed_reason_histogram_by_kind": by_kind,
+            "ack_retry_policy": ack_retry_policy_snapshot(),
             "items": items,
         }))?
     );
@@ -1971,8 +2124,8 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_ack_failure_category, compute_backoff_sec, delivery_retry_backoff_sec,
-        lease_window_sec, normalize_error_reason,
+        ack_retry_policy, classify_ack_failure_category, compute_backoff_sec,
+        delivery_retry_backoff_sec, lease_window_sec, normalize_error_reason,
     };
 
     #[test]
@@ -2047,5 +2200,20 @@ mod tests {
             classify_ack_failure_category(Some("random opaque error")),
             "unknown"
         );
+    }
+
+    #[test]
+    fn ack_retry_policy_respects_category() {
+        let auth = ack_retry_policy("auth", 1);
+        assert!(!auth.retryable);
+        assert_eq!(auth.max_attempts, 1);
+
+        let transport = ack_retry_policy("transport", 2);
+        assert!(transport.retryable);
+        assert_eq!(transport.backoff_sec, 15);
+
+        let rate = ack_retry_policy("rate_limited", 3);
+        assert!(rate.retryable);
+        assert_eq!(rate.backoff_sec, 120);
     }
 }

@@ -38,6 +38,7 @@ Thread-bound monitored Ralph loop daemon (Rust).
 - Remaining TODO: OpenClaw delivery acknowledgement integration + long-run soak tests.
 - Roadmap / tasklist: `docs/roadmaps/ack-integration-tasklist.md`
 - Ack contract: `docs/specs/ack-contract.md`
+- Ack retry policy: `docs/specs/ack-retry-policy.md`
 
 ## Build
 
