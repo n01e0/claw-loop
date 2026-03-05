@@ -9,6 +9,9 @@ Thread-bound monitored Ralph loop daemon (Rust).
 
 ## Current status
 - Thread-bound CLI implemented (`start`, `daemon`, `stop`, `status`, `delivery-report`, `requeue-dead-letter`, `notify`, `track-pr`, `sweep`, `task-next`, `task-check`).
+- Safety guard for runaway loops:
+  - `start --max-ticks <N>`: auto-stop after N daemon ticks
+  - `start --max-runtime-sec <SEC>`: auto-stop after wall-clock runtime cap
 - Per-run isolated state under `.ralph/runs/<run_id>/`.
 - Event log and lease heartbeat in place.
 - Notification queue + dispatcher log (`notify-queue.jsonl` -> `notify-dispatched.jsonl`) in place.
@@ -64,7 +67,8 @@ cargo build
 
 ```bash
 # 1) start daemon (OpenClaw delivery有効化するなら --deliver-openclaw を付ける)
-cargo run -- start --repo . --session-key test --channel discord --thread-id thread-test --tick-sec 1 --deliver-openclaw
+# runaway防止なら --max-ticks / --max-runtime-sec を併用
+cargo run -- start --repo . --session-key test --channel discord --thread-id thread-test --tick-sec 1 --deliver-openclaw --max-ticks 300 --max-runtime-sec 3600
 
 # 2) bind PR tracking (example)
 cargo run -- track-pr --repo . --run-id <RUN_ID> --gh-repo n01e0/dimpact --pr 24 --merge-method merge
@@ -90,7 +94,7 @@ cargo run -- requeue-dead-letter --repo . --run-id <RUN_ID> --event-id <EVENT_ID
 cargo run -- task-next
 
 # 3.5) dogfood: タスクを完了チェック
-cargo run -- task-check --id A1-5 --done
+cargo run -- task-check --id A1-5 --done true
 
 # (任意) delivery bridge を送信せず検証
 CLAW_LOOPD_OPENCLAW_DRY_RUN=1 cargo run -- start --repo . --session-key test --channel discord --thread-id thread-test --tick-sec 1 --deliver-openclaw
