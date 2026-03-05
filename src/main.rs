@@ -34,8 +34,8 @@ enum Commands {
         tick_sec: u64,
         #[arg(long, default_value_t = false)]
         deliver_openclaw: bool,
-        #[arg(long)]
-        max_ticks: Option<u64>,
+        #[arg(long, default_value_t = 10)]
+        max_ticks: u64,
         #[arg(long)]
         max_runtime_sec: Option<u64>,
     },
@@ -292,7 +292,7 @@ struct StartOptions {
     owner_message_id: Option<String>,
     tick_sec: u64,
     deliver_openclaw: bool,
-    max_ticks: Option<u64>,
+    max_ticks: u64,
     max_runtime_sec: Option<u64>,
 }
 
@@ -1340,7 +1340,7 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
         started_at: now,
         daemon_pid: child.id(),
         deliver_openclaw: opts.deliver_openclaw,
-        max_ticks: opts.max_ticks,
+        max_ticks: Some(opts.max_ticks),
         max_runtime_sec: opts.max_runtime_sec,
     };
     let state = State {
