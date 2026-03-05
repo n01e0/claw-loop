@@ -105,4 +105,7 @@ cargo run -- sweep --repo .
 
 # 5) stop daemon
 cargo run -- stop --repo . --run-id <RUN_ID>
+
+# 5.1) kill switch (即時停止)
+cargo run -- stop --repo . --run-id <RUN_ID> --immediate
 ```

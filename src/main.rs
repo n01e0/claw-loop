@@ -56,6 +56,8 @@ enum Commands {
         repo: PathBuf,
         #[arg(long)]
         run_id: Uuid,
+        #[arg(long, default_value_t = false)]
+        immediate: bool,
     },
     Status {
         #[arg(long)]
@@ -1184,6 +1186,27 @@ fn process_matches_run(pid: u32, run_id: Uuid) -> bool {
     cmdline.contains("claw-loopd") && cmdline.contains(&run_id.to_string())
 }
 
+fn send_signal(pid: u32, signal: &str) {
+    let _ = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn stop_daemon_process_now(pid: u32, run_id: Uuid) {
+    if !process_matches_run(pid, run_id) {
+        return;
+    }
+
+    send_signal(pid, "TERM");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    if process_matches_run(pid, run_id) {
+        send_signal(pid, "KILL");
+    }
+}
+
 fn reduce_pr_tracking(run_dir: &Path, manifest: &Manifest, state: &mut State) -> Result<bool> {
     let tracking_path = pr_tracking_path(run_dir);
     if !tracking_path.exists() {
@@ -1583,13 +1606,55 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
     Ok(())
 }
 
-fn cmd_stop(repo: PathBuf, run_id: Uuid) -> Result<()> {
+fn cmd_stop(repo: PathBuf, run_id: Uuid, immediate: bool) -> Result<()> {
     let dir = run_dir(&repo, run_id);
     if !dir.exists() {
         bail!("run directory not found: {}", dir.display());
     }
+
     fs::write(dir.join("control.stop"), b"stop\n")?;
-    println!("stop requested: {}", run_id);
+
+    if !immediate {
+        println!("stop requested: {}", run_id);
+        return Ok(());
+    }
+
+    let manifest: Manifest = read_json(&dir.join("manifest.json"))?;
+    let mut state: State = read_json(&dir.join("state.json"))?;
+
+    if !matches!(
+        state.status,
+        LoopStatus::Done | LoopStatus::Failed | LoopStatus::Stopped
+    ) {
+        state.version += 1;
+        state.status = LoopStatus::Stopped;
+        state.summary = "stopped immediately by kill switch".into();
+        state.waiting_reason = "kill switch".into();
+        state.updated_at = Utc::now();
+        state.lease_expires_at = state.updated_at;
+        write_json(&dir.join("state.json"), &state)?;
+
+        append_event(
+            &dir,
+            "stop_immediate",
+            serde_json::json!({
+                "run_id": run_id,
+                "daemon_pid": manifest.daemon_pid,
+                "state_version": state.version,
+            }),
+        )?;
+        queue_notification(
+            &dir,
+            &manifest,
+            "stopped",
+            "loop daemon stopped immediately by kill switch".to_string(),
+        )?;
+    }
+
+    stop_daemon_process_now(manifest.daemon_pid, run_id);
+    let _ = flush_notifications(&dir, &manifest)?;
+
+    println!("stopped immediately: {}", run_id);
     Ok(())
 }
 
@@ -2411,7 +2476,11 @@ fn main() -> Result<()> {
             run_id,
             tick_sec,
         } => cmd_daemon(repo, run_id, tick_sec),
-        Commands::Stop { repo, run_id } => cmd_stop(repo, run_id),
+        Commands::Stop {
+            repo,
+            run_id,
+            immediate,
+        } => cmd_stop(repo, run_id, immediate),
         Commands::Status { repo, run_id } => cmd_status(repo, run_id),
         Commands::DeliveryReport {
             repo,

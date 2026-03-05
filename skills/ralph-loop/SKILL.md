@@ -42,6 +42,7 @@ Never start without `thread_id` + `session_key`.
   - `claw-loopd sweep --repo <repo>`
 - Stop:
   - `claw-loopd stop --repo <repo> --run-id <run_id>`
+  - `claw-loopd stop --repo <repo> --run-id <run_id> --immediate` (kill switch)
 
 ## Notification contract (what arrives and when)
 Expect these kinds:
@@ -70,10 +71,12 @@ Delivery behavior:
 Always set explicit `waiting_reason` for `waiting` and `blocked`.
 
 ## Stop semantics (Discord operations)
-- Discord users stop runs by asking the agent.
-- Agent resolves `run_id` and executes `claw-loopd stop`.
-- Daemon stops on next tick after seeing `control.stop`.
-- Stop latency target: `<= tick_sec + flush time`.
+- Discord users stop runs by asking the agent **or** native command kill switch.
+- Normal stop: `claw-loopd stop ...` → daemon stops on next tick after seeing `control.stop`.
+- Immediate stop: `claw-loopd stop ... --immediate` → stateを即 `stopped` 化し、daemon pidをTERM/KILLで停止。
+- Stop latency target:
+  - normal: `<= tick_sec + flush time`
+  - immediate: near-immediate (process signal + local flush)
 
 `blocked` は即停止しない（ただし max-task-loops / max-ticks / max-runtime 到達時は `auto_stopped`）。
 
