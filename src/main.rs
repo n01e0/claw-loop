@@ -812,6 +812,59 @@ fn extract_pr_url(line: &str) -> Option<String> {
     })
 }
 
+fn pr_url_is_merged(pr_url: &str) -> Result<bool> {
+    let gh = gh_bin();
+    let args: Vec<String> = vec![
+        "pr".into(),
+        "view".into(),
+        pr_url.to_string(),
+        "--json".into(),
+        "state,mergedAt".into(),
+    ];
+    let output = run_with_timeout_cmd(&gh, &args, 5)?;
+    if !output.status.success() {
+        bail!(
+            "gh pr view failed: status={:?} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("parse gh pr view json for {pr_url}"))?;
+    let state = value
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let merged_at = value.get("mergedAt").and_then(|v| v.as_str());
+    Ok(state.eq_ignore_ascii_case("MERGED") || merged_at.is_some())
+}
+
+fn validate_task_done_contract_with(
+    first_stdout_line: &str,
+    is_merged: impl FnOnce(&str) -> Result<bool>,
+) -> Result<String> {
+    if !first_stdout_line.starts_with("TASK_DONE") {
+        bail!("first line must start with TASK_DONE");
+    }
+
+    let pr_url = extract_pr_url(first_stdout_line)
+        .ok_or_else(|| anyhow::anyhow!("TASK_DONE line must include PR_URL=<url>"))?;
+
+    if !pr_url.starts_with("http://") && !pr_url.starts_with("https://") {
+        bail!("PR_URL must be absolute URL: {pr_url}");
+    }
+
+    if !is_merged(&pr_url)? {
+        bail!("PR is not merged yet: {pr_url}");
+    }
+
+    Ok(pr_url)
+}
+
+fn validate_task_done_contract(first_stdout_line: &str) -> Result<String> {
+    validate_task_done_contract_with(first_stdout_line, pr_url_is_merged)
+}
+
 fn run_task_once(opts: TaskRunOptions<'_>) -> Result<TaskRunOutcome> {
     let (_, _, entries) = load_task_checklist(opts.task_file)?;
     let next = entries.iter().find(|entry| !entry.done).cloned();
@@ -874,7 +927,32 @@ fn run_task_once(opts: TaskRunOptions<'_>) -> Result<TaskRunOutcome> {
     outcome.stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
     if outcome.success && opts.auto_check_on_success {
-        outcome.check_result = Some(update_task_check(opts.task_file, &task.id, true)?);
+        let first_stdout_line = outcome
+            .stdout
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        match validate_task_done_contract(&first_stdout_line) {
+            Ok(_) => {
+                outcome.check_result = Some(update_task_check(opts.task_file, &task.id, true)?);
+            }
+            Err(err) => {
+                outcome.success = false;
+                if outcome.exit_code == Some(0) {
+                    outcome.exit_code = Some(65);
+                }
+                if !outcome.stderr.trim().is_empty() {
+                    outcome.stderr.push('\n');
+                }
+                outcome.stderr.push_str(&format!(
+                    "completion guard failed: {}",
+                    err.to_string().replace('\n', " ")
+                ));
+            }
+        }
     }
 
     Ok(outcome)
@@ -3154,6 +3232,7 @@ mod tests {
         compute_auto_stop_reason, compute_backoff_sec, dead_letter_path, delivery_ack_path,
         delivery_attempts_path, delivery_retry_backoff_sec, extract_pr_url, flush_notifications,
         lease_window_sec, normalize_error_reason, parse_task_checklist_entry, read_jsonl,
+        validate_task_done_contract_with,
     };
     use chrono::{Duration, Utc};
     use std::{
@@ -3525,5 +3604,21 @@ mod tests {
             Some("https://github.com/n01e0/claw-loop/pull/99".to_string())
         );
         assert_eq!(extract_pr_url("TASK_BLOCKED: no PR"), None);
+    }
+
+    #[test]
+    fn validate_task_done_contract_requires_task_done_prefix_and_pr_url() {
+        assert!(validate_task_done_contract_with("TASK_BLOCKED: reason", |_| Ok(true)).is_err());
+        assert!(validate_task_done_contract_with("TASK_DONE", |_| Ok(true)).is_err());
+    }
+
+    #[test]
+    fn validate_task_done_contract_requires_merged_pr() {
+        let line = "TASK_DONE PR_URL=https://github.com/n01e0/claw-loop/pull/123";
+        assert!(validate_task_done_contract_with(line, |_| Ok(false)).is_err());
+
+        let ok = validate_task_done_contract_with(line, |_| Ok(true))
+            .expect("merged PR should satisfy completion guard");
+        assert_eq!(ok, "https://github.com/n01e0/claw-loop/pull/123");
     }
 }
