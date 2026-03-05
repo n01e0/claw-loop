@@ -1019,10 +1019,39 @@ fn reconcile_orphan_if_needed(repo: &Path, run_id: Uuid) -> Result<Option<&'stat
     }
 
     let now = Utc::now();
+    let observed_version = state.version;
+    let observed_status = state.status.clone();
     let lease_expired = now > state.lease_expires_at;
     let daemon_alive = process_matches_run(manifest.daemon_pid, run_id);
 
     if lease_expired && !daemon_alive {
+        // CAS-style recheck: if state moved since observation, do not force blocked.
+        let latest: State = read_json(&dir.join("state.json"))?;
+        let latest_daemon_alive = process_matches_run(manifest.daemon_pid, run_id);
+        let latest_expired = Utc::now() > latest.lease_expires_at;
+
+        if latest.version != observed_version
+            || latest.status != observed_status
+            || latest_daemon_alive
+            || !latest_expired
+        {
+            append_event(
+                &dir,
+                "orphan_recheck_skipped",
+                serde_json::json!({
+                    "observed_version": observed_version,
+                    "latest_version": latest.version,
+                    "observed_status": observed_status,
+                    "latest_status": latest.status,
+                    "latest_daemon_alive": latest_daemon_alive,
+                    "latest_expired": latest_expired,
+                }),
+            )?;
+            let _ = flush_notifications(&dir, &manifest)?;
+            return Ok(Some("race_skipped"));
+        }
+
+        state = latest;
         state.version += 1;
         state.status = LoopStatus::Blocked;
         state.summary = format!(
@@ -1030,7 +1059,7 @@ fn reconcile_orphan_if_needed(repo: &Path, run_id: Uuid) -> Result<Option<&'stat
             manifest.daemon_pid
         );
         state.waiting_reason = "daemon orphan detected".into();
-        state.updated_at = now;
+        state.updated_at = Utc::now();
         write_json(&dir.join("state.json"), &state)?;
 
         append_event(
@@ -1039,7 +1068,7 @@ fn reconcile_orphan_if_needed(repo: &Path, run_id: Uuid) -> Result<Option<&'stat
             serde_json::json!({
                 "daemon_pid": manifest.daemon_pid,
                 "lease_expires_at": state.lease_expires_at,
-                "now": now,
+                "now": state.updated_at,
             }),
         )?;
 
