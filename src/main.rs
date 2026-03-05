@@ -63,6 +63,18 @@ enum Commands {
         #[arg(long)]
         message: String,
     },
+    TrackPr {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        run_id: Uuid,
+        #[arg(long)]
+        gh_repo: String,
+        #[arg(long)]
+        pr: u64,
+        #[arg(long, default_value = "merge")]
+        merge_method: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -77,7 +89,7 @@ struct Manifest {
     daemon_pid: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum LoopStatus {
     Idle,
@@ -89,7 +101,7 @@ enum LoopStatus {
     Stopped,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct State {
     version: u64,
     status: LoopStatus,
@@ -121,12 +133,43 @@ struct DispatchedNotification {
     message: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct PrTracking {
+    gh_repo: String,
+    pr: u64,
+    merge_method: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    last_polled_at: Option<DateTime<Utc>>,
+    next_poll_at: DateTime<Utc>,
+    unchanged_polls: u32,
+    consecutive_errors: u32,
+    last_observed_state: Option<String>,
+    last_merge_state_status: Option<String>,
+    last_error: Option<String>,
+    auto_merge_armed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhPrView {
+    state: String,
+    url: String,
+    #[serde(rename = "mergeStateStatus")]
+    merge_state_status: Option<String>,
+    #[serde(rename = "autoMergeRequest")]
+    auto_merge_request: Option<serde_json::Value>,
+}
+
 fn runs_root(repo: &Path) -> PathBuf {
     repo.join(".ralph").join("runs")
 }
 
 fn run_dir(repo: &Path, run_id: Uuid) -> PathBuf {
     runs_root(repo).join(run_id.to_string())
+}
+
+fn pr_tracking_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("pr-tracking.json")
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -258,6 +301,268 @@ fn flush_notifications(run_dir: &Path) -> Result<usize> {
     Ok(delivered)
 }
 
+fn with_timeout_or_fallback(args: &[&str]) -> Result<std::process::Output> {
+    let try_timeout = Command::new("timeout")
+        .arg("5s")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+
+    match try_timeout {
+        Ok(output) => Ok(output),
+        Err(_) => Command::new(args[0])
+            .args(&args[1..])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| format!("spawn {}", args[0])),
+    }
+}
+
+fn gh_pr_view(gh_repo: &str, pr: u64) -> Result<GhPrView> {
+    let pr_str = pr.to_string();
+    let output = with_timeout_or_fallback(&[
+        "gh",
+        "pr",
+        "view",
+        &pr_str,
+        "--repo",
+        gh_repo,
+        "--json",
+        "state,url,mergeStateStatus,autoMergeRequest",
+    ])?;
+
+    if !output.status.success() {
+        bail!(
+            "gh pr view failed: status={:?} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let view: GhPrView = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("parse gh pr view json for {gh_repo}#{pr}"))?;
+    Ok(view)
+}
+
+fn gh_pr_arm_auto_merge(gh_repo: &str, pr: u64, merge_method: &str) -> Result<()> {
+    let method_flag = match merge_method {
+        "merge" => "--merge",
+        "squash" => "--squash",
+        "rebase" => "--rebase",
+        other => bail!("invalid merge method: {other}"),
+    };
+
+    let pr_str = pr.to_string();
+    let output = with_timeout_or_fallback(&[
+        "gh",
+        "pr",
+        "merge",
+        &pr_str,
+        "--repo",
+        gh_repo,
+        "--auto",
+        method_flag,
+        "--delete-branch",
+    ])?;
+
+    if !output.status.success() {
+        bail!(
+            "gh pr merge --auto failed: status={:?} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
+}
+
+fn compute_backoff_sec(unchanged_polls: u32) -> i64 {
+    match unchanged_polls {
+        0 => 60,
+        1 => 120,
+        2 => 240,
+        _ => 300,
+    }
+}
+
+fn reduce_pr_tracking(run_dir: &Path, manifest: &Manifest, state: &mut State) -> Result<bool> {
+    let tracking_path = pr_tracking_path(run_dir);
+    if !tracking_path.exists() {
+        return Ok(false);
+    }
+
+    if state.status != LoopStatus::Waiting {
+        return Ok(false);
+    }
+
+    let mut tracking: PrTracking = read_json(&tracking_path)?;
+    let now = Utc::now();
+    if now < tracking.next_poll_at {
+        return Ok(false);
+    }
+
+    let view = match gh_pr_view(&tracking.gh_repo, tracking.pr) {
+        Ok(v) => v,
+        Err(err) => {
+            tracking.consecutive_errors += 1;
+            tracking.last_error = Some(err.to_string());
+            tracking.updated_at = now;
+            tracking.last_polled_at = Some(now);
+            let next = compute_backoff_sec(tracking.unchanged_polls.saturating_add(1));
+            tracking.next_poll_at = now + chrono::Duration::seconds(next);
+            write_json(&tracking_path, &tracking)?;
+            append_event(
+                run_dir,
+                "pr_poll_error",
+                serde_json::json!({
+                    "repo": tracking.gh_repo,
+                    "pr": tracking.pr,
+                    "error": tracking.last_error,
+                    "next_poll_at": tracking.next_poll_at,
+                    "consecutive_errors": tracking.consecutive_errors
+                }),
+            )?;
+            if tracking.consecutive_errors == 1 {
+                queue_notification(
+                    run_dir,
+                    manifest,
+                    "pr_poll_error",
+                    format!(
+                        "PR #{} poll failed once; will retry with backoff",
+                        tracking.pr
+                    ),
+                )?;
+            }
+            return Ok(false);
+        }
+    };
+
+    tracking.last_polled_at = Some(now);
+    tracking.updated_at = now;
+    tracking.consecutive_errors = 0;
+    tracking.last_error = None;
+
+    let pr_state = view.state.as_str();
+    let merge_state = view.merge_state_status.clone().unwrap_or_default();
+    let observed_changed = tracking.last_observed_state.as_deref() != Some(pr_state)
+        || tracking.last_merge_state_status.as_deref() != Some(merge_state.as_str());
+
+    match pr_state {
+        "MERGED" => {
+            state.version += 1;
+            state.summary = format!("PR #{} merged", tracking.pr);
+            state.waiting_reason = "ready for next loop".into();
+            state.updated_at = now;
+
+            append_event(
+                run_dir,
+                "pr_merged",
+                serde_json::json!({
+                    "repo": tracking.gh_repo,
+                    "pr": tracking.pr,
+                    "url": view.url,
+                }),
+            )?;
+            queue_notification(
+                run_dir,
+                manifest,
+                "pr_merged",
+                format!("PR #{} merged: {}", tracking.pr, view.url),
+            )?;
+            fs::remove_file(&tracking_path)?;
+            return Ok(true);
+        }
+        "CLOSED" => {
+            state.version += 1;
+            state.status = LoopStatus::Blocked;
+            state.summary = format!("PR #{} closed without merge", tracking.pr);
+            state.waiting_reason = format!("PR #{} state=CLOSED", tracking.pr);
+            state.updated_at = now;
+
+            append_event(
+                run_dir,
+                "pr_closed",
+                serde_json::json!({
+                    "repo": tracking.gh_repo,
+                    "pr": tracking.pr,
+                    "url": view.url,
+                }),
+            )?;
+            queue_notification(
+                run_dir,
+                manifest,
+                "pr_closed",
+                format!("PR #{} closed without merge: {}", tracking.pr, view.url),
+            )?;
+            fs::remove_file(&tracking_path)?;
+            return Ok(true);
+        }
+        "OPEN" => {
+            if view.auto_merge_request.is_none() && merge_state == "CLEAN" {
+                if gh_pr_arm_auto_merge(&tracking.gh_repo, tracking.pr, &tracking.merge_method)
+                    .is_ok()
+                {
+                    tracking.auto_merge_armed = true;
+                    append_event(
+                        run_dir,
+                        "pr_auto_merge_armed",
+                        serde_json::json!({
+                            "repo": tracking.gh_repo,
+                            "pr": tracking.pr,
+                            "merge_method": tracking.merge_method,
+                        }),
+                    )?;
+                }
+            }
+
+            if observed_changed {
+                tracking.unchanged_polls = 0;
+            } else {
+                tracking.unchanged_polls = tracking.unchanged_polls.saturating_add(1);
+            }
+
+            tracking.last_observed_state = Some(pr_state.to_string());
+            tracking.last_merge_state_status = Some(merge_state.clone());
+            let next = compute_backoff_sec(tracking.unchanged_polls);
+            tracking.next_poll_at = now + chrono::Duration::seconds(next);
+
+            write_json(&tracking_path, &tracking)?;
+            append_event(
+                run_dir,
+                "pr_open_polled",
+                serde_json::json!({
+                    "repo": tracking.gh_repo,
+                    "pr": tracking.pr,
+                    "merge_state": merge_state,
+                    "next_poll_at": tracking.next_poll_at,
+                    "unchanged_polls": tracking.unchanged_polls
+                }),
+            )?;
+            return Ok(false);
+        }
+        _ => {
+            tracking.last_observed_state = Some(pr_state.to_string());
+            tracking.last_merge_state_status = Some(merge_state);
+            tracking.next_poll_at = now + chrono::Duration::seconds(300);
+            write_json(&tracking_path, &tracking)?;
+
+            append_event(
+                run_dir,
+                "pr_unknown_state",
+                serde_json::json!({
+                    "repo": tracking.gh_repo,
+                    "pr": tracking.pr,
+                    "state": pr_state,
+                    "url": view.url,
+                }),
+            )?;
+            return Ok(false);
+        }
+    }
+}
+
 fn cmd_start(
     repo: PathBuf,
     session_key: String,
@@ -372,12 +677,17 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
         state.updated_at = Utc::now();
         state.lease_expires_at =
             state.updated_at + chrono::Duration::seconds((tick_sec as i64) * 3);
+
+        let pr_changed = reduce_pr_tracking(&dir, &manifest, &mut state)?;
         write_json(&dir.join("state.json"), &state)?;
 
-        append_event(&dir, "tick", serde_json::json!({"version": state.version}))?;
+        append_event(
+            &dir,
+            "tick",
+            serde_json::json!({"version": state.version, "pr_changed": pr_changed}),
+        )?;
 
         let _ = flush_notifications(&dir)?;
-
         std::thread::sleep(std::time::Duration::from_secs(tick_sec));
     }
 
@@ -404,6 +714,11 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
     let queued = read_jsonl::<Notification>(&dir.join("notify-queue.jsonl"))?.len();
     let dispatched =
         read_jsonl::<DispatchedNotification>(&dir.join("notify-dispatched.jsonl"))?.len();
+    let pr_tracking = if pr_tracking_path(&dir).exists() {
+        Some(read_json::<PrTracking>(&pr_tracking_path(&dir))?)
+    } else {
+        None
+    };
 
     println!(
         "{}",
@@ -418,7 +733,8 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
             "lease_expires_at": state.lease_expires_at,
             "queued_notifications": queued,
             "dispatched_notifications": dispatched,
-            "daemon_pid": manifest.daemon_pid
+            "daemon_pid": manifest.daemon_pid,
+            "pr_tracking": pr_tracking
         }))?
     );
     Ok(())
@@ -433,6 +749,85 @@ fn cmd_notify(repo: PathBuf, run_id: Uuid, kind: String, message: String) -> Res
     let event_id = queue_notification(&dir, &manifest, kind, message)?;
     println!("queued event_id={}", event_id);
     Ok(())
+}
+
+fn cmd_track_pr(
+    repo: PathBuf,
+    run_id: Uuid,
+    gh_repo: String,
+    pr: u64,
+    merge_method: String,
+) -> Result<()> {
+    if !matches!(merge_method.as_str(), "merge" | "squash" | "rebase") {
+        bail!("invalid merge method: {merge_method}");
+    }
+
+    let dir = run_dir(&repo, run_id);
+    if !dir.exists() {
+        bail!("run directory not found: {}", dir.display());
+    }
+
+    let manifest: Manifest = read_json(&dir.join("manifest.json"))?;
+    let now = Utc::now();
+    let tracking = PrTracking {
+        gh_repo,
+        pr,
+        merge_method,
+        created_at: now,
+        updated_at: now,
+        last_polled_at: None,
+        next_poll_at: now,
+        unchanged_polls: 0,
+        consecutive_errors: 0,
+        last_observed_state: None,
+        last_merge_state_status: None,
+        last_error: None,
+        auto_merge_armed: false,
+    };
+
+    write_json(&pr_tracking_path(&dir), &tracking)?;
+
+    let mut state: State = read_json(&dir.join("state.json"))?;
+    state.version += 1;
+    state.status = LoopStatus::Waiting;
+    state.summary = format!("tracking PR #{} for merge", tracking.pr);
+    state.waiting_reason = format!("PR #{} CI/merge pending", tracking.pr);
+    state.updated_at = now;
+    write_json(&dir.join("state.json"), &state)?;
+
+    append_event(
+        &dir,
+        "pr_tracking_started",
+        serde_json::json!({
+            "repo": tracking.gh_repo,
+            "pr": tracking.pr,
+            "merge_method": tracking.merge_method
+        }),
+    )?;
+
+    queue_notification(
+        &dir,
+        &manifest,
+        "pr_tracking_started",
+        format!("tracking PR #{} ({})", tracking.pr, tracking.gh_repo),
+    )?;
+
+    println!("pr tracking set: {}#{}", tracking.gh_repo, tracking.pr);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_backoff_sec;
+
+    #[test]
+    fn backoff_schedule_is_expected() {
+        assert_eq!(compute_backoff_sec(0), 60);
+        assert_eq!(compute_backoff_sec(1), 120);
+        assert_eq!(compute_backoff_sec(2), 240);
+        assert_eq!(compute_backoff_sec(3), 300);
+        assert_eq!(compute_backoff_sec(99), 300);
+    }
 }
 
 fn main() -> Result<()> {
@@ -467,6 +862,13 @@ fn main() -> Result<()> {
             kind,
             message,
         } => cmd_notify(repo, run_id, kind, message),
+        Commands::TrackPr {
+            repo,
+            run_id,
+            gh_repo,
+            pr,
+            merge_method,
+        } => cmd_track_pr(repo, run_id, gh_repo, pr, merge_method),
     }
     .map_err(|e| {
         eprintln!("error: {e:?}");
