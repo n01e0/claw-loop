@@ -33,6 +33,7 @@ Thread-bound monitored Ralph loop daemon (Rust).
   - checks lease expiry against daemon process ownership
   - marks run `blocked` when lease expired and daemon process is gone
 - Remaining TODO: OpenClaw delivery acknowledgement integration + long-run soak tests.
+- Roadmap / tasklist: `docs/roadmaps/ack-integration-tasklist.md`
 
 ## Build
 
