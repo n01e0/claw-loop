@@ -895,9 +895,13 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
     }
 
     let already = read_jsonl::<DispatchedNotification>(&dispatched_path)?;
-    let mut seen = HashSet::new();
+    let mut terminal_ids = HashSet::new();
     for d in already {
-        seen.insert(d.event_id);
+        terminal_ids.insert(d.event_id);
+    }
+    let existing_dead_letter = read_jsonl::<DeadLetterEntry>(&dead_letter_file)?;
+    for dlq in existing_dead_letter {
+        terminal_ids.insert(dlq.event_id);
     }
 
     let existing_acks = read_jsonl::<DeliveryAck>(&ack_path)?;
@@ -915,9 +919,13 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
     let now = Utc::now();
     let mut delivered = 0usize;
     let mut kept: Vec<Notification> = Vec::new();
+    let mut processed_in_flush: HashSet<Uuid> = HashSet::new();
 
     for mut n in queued {
-        if seen.contains(&n.event_id) {
+        if terminal_ids.contains(&n.event_id) {
+            continue;
+        }
+        if !processed_in_flush.insert(n.event_id) {
             continue;
         }
 
@@ -981,6 +989,7 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
                     attempts: n.attempts,
                 };
                 append_jsonl(&dispatched_path, &d)?;
+                terminal_ids.insert(n.event_id);
                 delivered += 1;
 
                 metrics.delivered_total = metrics.delivered_total.saturating_add(1);
@@ -1039,6 +1048,7 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
                         last_error: Some(err_text.clone()),
                     };
                     append_jsonl(&dead_letter_file, &dead)?;
+                    terminal_ids.insert(n.event_id);
 
                     metrics.dead_letter_total = metrics.dead_letter_total.saturating_add(1);
                     metrics.last_dead_letter_at = Some(now);
@@ -2922,10 +2932,250 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ack_retry_policy, classify_ack_failure_category, compute_auto_stop_reason,
-        compute_backoff_sec, delivery_retry_backoff_sec, lease_window_sec, normalize_error_reason,
-        parse_task_checklist_entry,
+        DeadLetterEntry, DeliveryAck, DeliveryAttempt, DispatchedNotification, Manifest,
+        Notification, ack_retry_policy, append_jsonl, classify_ack_failure_category,
+        compute_auto_stop_reason, compute_backoff_sec, dead_letter_path, delivery_ack_path,
+        delivery_attempts_path, delivery_retry_backoff_sec, flush_notifications, lease_window_sec,
+        normalize_error_reason, parse_task_checklist_entry, read_jsonl,
     };
+    use chrono::{Duration, Utc};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
+    use uuid::Uuid;
+
+    struct TestRunDir {
+        path: PathBuf,
+    }
+
+    impl TestRunDir {
+        fn new(tag: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("claw-loopd-test-{tag}-{}", Uuid::new_v4()));
+            fs::create_dir_all(&path).expect("create temp run dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TestRunDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn test_manifest(run_dir: &Path, run_id: Uuid, deliver_openclaw: bool) -> Manifest {
+        Manifest {
+            run_id,
+            repo_path: run_dir.to_path_buf(),
+            session_key: "test-session".to_string(),
+            channel: "discord".to_string(),
+            thread_id: "test-thread".to_string(),
+            owner_message_id: None,
+            started_at: Utc::now(),
+            daemon_pid: std::process::id(),
+            deliver_openclaw,
+            max_ticks: None,
+            max_runtime_sec: None,
+            max_task_loops: 10,
+            task_file: PathBuf::from("docs/roadmaps/ack-integration-tasklist.md"),
+            task_done_baseline: 0,
+            task_runner_cmd: None,
+            auto_check_on_success: true,
+        }
+    }
+
+    fn base_notification(event_id: Uuid, run_id: Uuid, message: &str) -> Notification {
+        Notification {
+            event_id,
+            run_id,
+            ts: Utc::now(),
+            channel: "discord".to_string(),
+            thread_id: "test-thread".to_string(),
+            kind: "progress".to_string(),
+            message: message.to_string(),
+            attempts: 0,
+            next_retry_at: None,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn flush_notifications_drops_queued_terminal_event_ids() {
+        let run = TestRunDir::new("terminal");
+        let run_id = Uuid::new_v4();
+        let queue_path = run.path.join("notify-queue.jsonl");
+        let dispatched_path = run.path.join("notify-dispatched.jsonl");
+
+        let dispatched_id = Uuid::new_v4();
+        let dead_letter_id = Uuid::new_v4();
+
+        append_jsonl(
+            &queue_path,
+            &base_notification(dispatched_id, run_id, "stale dispatched"),
+        )
+        .expect("append stale dispatched queued");
+        append_jsonl(
+            &queue_path,
+            &base_notification(dead_letter_id, run_id, "stale dead-letter"),
+        )
+        .expect("append stale dead-letter queued");
+
+        append_jsonl(
+            &dispatched_path,
+            &DispatchedNotification {
+                event_id: dispatched_id,
+                run_id,
+                dispatched_at: Utc::now(),
+                channel: "discord".to_string(),
+                thread_id: "test-thread".to_string(),
+                kind: "progress".to_string(),
+                message: "already delivered".to_string(),
+                attempts: 1,
+            },
+        )
+        .expect("append dispatched terminal");
+
+        append_jsonl(
+            &dead_letter_path(&run.path),
+            &DeadLetterEntry {
+                event_id: dead_letter_id,
+                run_id,
+                moved_at: Utc::now(),
+                attempts: 1,
+                kind: "progress".to_string(),
+                message: "already failed".to_string(),
+                last_error: Some("permanent failure".to_string()),
+            },
+        )
+        .expect("append dead-letter terminal");
+
+        let delivered = flush_notifications(&run.path, &test_manifest(&run.path, run_id, false))
+            .expect("flush");
+        assert_eq!(delivered, 0);
+
+        let remaining_queue = read_jsonl::<Notification>(&queue_path).expect("read queue");
+        assert!(remaining_queue.is_empty());
+        assert!(
+            read_jsonl::<DeliveryAttempt>(&delivery_attempts_path(&run.path))
+                .expect("read attempts")
+                .is_empty()
+        );
+        assert!(
+            read_jsonl::<DeliveryAck>(&delivery_ack_path(&run.path))
+                .expect("read ack")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn flush_notifications_processes_duplicate_event_id_once_per_flush() {
+        let run = TestRunDir::new("duplicate");
+        let run_id = Uuid::new_v4();
+        let queue_path = run.path.join("notify-queue.jsonl");
+        let event_id = Uuid::new_v4();
+
+        append_jsonl(&queue_path, &base_notification(event_id, run_id, "first"))
+            .expect("append first duplicate");
+        append_jsonl(&queue_path, &base_notification(event_id, run_id, "second"))
+            .expect("append second duplicate");
+
+        let delivered = flush_notifications(&run.path, &test_manifest(&run.path, run_id, false))
+            .expect("flush");
+        assert_eq!(delivered, 1);
+
+        assert!(
+            read_jsonl::<Notification>(&queue_path)
+                .expect("read queue")
+                .is_empty()
+        );
+
+        let dispatched =
+            read_jsonl::<DispatchedNotification>(&run.path.join("notify-dispatched.jsonl"))
+                .expect("read dispatched");
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].event_id, event_id);
+
+        let attempts = read_jsonl::<DeliveryAttempt>(&delivery_attempts_path(&run.path))
+            .expect("read attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].event_id, event_id);
+
+        let ack = read_jsonl::<DeliveryAck>(&delivery_ack_path(&run.path)).expect("read ack");
+        assert_eq!(ack.len(), 1);
+        assert!(ack[0].ok);
+        assert_eq!(ack[0].event_id, event_id);
+        assert_eq!(ack[0].attempts, 1);
+    }
+
+    #[test]
+    fn flush_notifications_keeps_retry_wait_when_not_due() {
+        let run = TestRunDir::new("retry-wait");
+        let run_id = Uuid::new_v4();
+        let queue_path = run.path.join("notify-queue.jsonl");
+        let event_id = Uuid::new_v4();
+
+        let mut notification = base_notification(event_id, run_id, "waiting for backoff");
+        notification.attempts = 2;
+        notification.next_retry_at = Some(Utc::now() + Duration::seconds(120));
+        append_jsonl(&queue_path, &notification).expect("append queued retry_wait");
+
+        let delivered = flush_notifications(&run.path, &test_manifest(&run.path, run_id, false))
+            .expect("flush");
+        assert_eq!(delivered, 0);
+
+        let queue = read_jsonl::<Notification>(&queue_path).expect("read queue");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].event_id, event_id);
+        assert_eq!(queue[0].attempts, 2);
+        assert!(queue[0].next_retry_at.is_some());
+
+        assert!(
+            read_jsonl::<DeliveryAttempt>(&delivery_attempts_path(&run.path))
+                .expect("read attempts")
+                .is_empty()
+        );
+        assert!(
+            read_jsonl::<DeliveryAck>(&delivery_ack_path(&run.path))
+                .expect("read ack")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn flush_notifications_retries_when_next_retry_at_is_due() {
+        let run = TestRunDir::new("retry-due");
+        let run_id = Uuid::new_v4();
+        let queue_path = run.path.join("notify-queue.jsonl");
+        let event_id = Uuid::new_v4();
+
+        let mut notification = base_notification(event_id, run_id, "retry due now");
+        notification.attempts = 2;
+        notification.next_retry_at = Some(Utc::now() - Duration::seconds(1));
+        append_jsonl(&queue_path, &notification).expect("append queued due retry");
+
+        let delivered = flush_notifications(&run.path, &test_manifest(&run.path, run_id, false))
+            .expect("flush");
+        assert_eq!(delivered, 1);
+        assert!(
+            read_jsonl::<Notification>(&queue_path)
+                .expect("read queue")
+                .is_empty()
+        );
+
+        let attempts = read_jsonl::<DeliveryAttempt>(&delivery_attempts_path(&run.path))
+            .expect("read attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].event_id, event_id);
+        assert_eq!(attempts[0].attempts, 3);
+        assert!(attempts[0].success);
+
+        let ack = read_jsonl::<DeliveryAck>(&delivery_ack_path(&run.path)).expect("read ack");
+        assert_eq!(ack.len(), 1);
+        assert_eq!(ack[0].event_id, event_id);
+        assert!(ack[0].ok);
+        assert_eq!(ack[0].attempts, 3);
+    }
 
     #[test]
     fn backoff_schedule_is_expected() {
