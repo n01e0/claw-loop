@@ -9,7 +9,7 @@ description: Start a thread-bound monitored loop daemon for "ralph loopでやっ
 Before implementation loop starts:
 1. Confirm strategy/goal/done_when/scope constraints.
 2. Start run daemon:
-   - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id>`
+   - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --deliver-openclaw`
 3. Post run id to the active thread.
 
 ## Runtime contract

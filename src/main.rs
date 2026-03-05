@@ -32,6 +32,8 @@ enum Commands {
         owner_message_id: Option<String>,
         #[arg(long, default_value_t = 60)]
         tick_sec: u64,
+        #[arg(long, default_value_t = false)]
+        deliver_openclaw: bool,
     },
     Daemon {
         #[arg(long)]
@@ -93,6 +95,8 @@ struct Manifest {
     owner_message_id: Option<String>,
     started_at: DateTime<Utc>,
     daemon_pid: u32,
+    #[serde(default)]
+    deliver_openclaw: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -117,7 +121,7 @@ struct State {
     updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct Notification {
     event_id: Uuid,
     run_id: Uuid,
@@ -205,6 +209,63 @@ fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
+fn run_with_timeout_cmd(
+    bin: &str,
+    args: &[String],
+    timeout_sec: u64,
+) -> Result<std::process::Output> {
+    let mut timeout_args: Vec<String> = vec![format!("{}s", timeout_sec), bin.to_string()];
+    timeout_args.extend(args.iter().cloned());
+
+    let timeout_try = Command::new("timeout")
+        .args(&timeout_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+
+    match timeout_try {
+        Ok(output) => Ok(output),
+        Err(_) => Command::new(bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| format!("spawn {}", bin)),
+    }
+}
+
+fn deliver_via_openclaw(notification: &Notification) -> Result<()> {
+    let mut args: Vec<String> = vec![
+        "message".into(),
+        "send".into(),
+        "--channel".into(),
+        notification.channel.clone(),
+        "--target".into(),
+        notification.thread_id.clone(),
+        "--message".into(),
+        format!(
+            "[ralph-loop][{}] {}",
+            notification.kind, notification.message
+        ),
+        "--silent".into(),
+    ];
+
+    if std::env::var("CLAW_LOOPD_OPENCLAW_DRY_RUN").ok().as_deref() == Some("1") {
+        args.push("--dry-run".into());
+    }
+
+    let output = run_with_timeout_cmd("openclaw", &args, 5)?;
+    if !output.status.success() {
+        bail!(
+            "openclaw message send failed: status={:?} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
+}
+
 fn append_event(run_dir: &Path, kind: &str, extra: serde_json::Value) -> Result<()> {
     let path = run_dir.join("events.jsonl");
     let line = serde_json::json!({
@@ -258,7 +319,7 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> {
     Ok(out)
 }
 
-fn flush_notifications(run_dir: &Path) -> Result<usize> {
+fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
     let queue_path = run_dir.join("notify-queue.jsonl");
     let dispatched_path = run_dir.join("notify-dispatched.jsonl");
 
@@ -274,26 +335,44 @@ fn flush_notifications(run_dir: &Path) -> Result<usize> {
     }
 
     let mut delivered = 0usize;
+
     for n in queued {
         if seen.contains(&n.event_id) {
             continue;
         }
-        let d = DispatchedNotification {
-            event_id: n.event_id,
-            run_id: n.run_id,
-            dispatched_at: Utc::now(),
-            channel: n.channel,
-            thread_id: n.thread_id,
-            kind: n.kind,
-            message: n.message,
-        };
-        append_jsonl(&dispatched_path, &d)?;
-        delivered += 1;
-    }
 
-    // queue is fully consumed by local dispatcher
-    if queue_path.exists() {
-        fs::remove_file(&queue_path)?;
+        let delivery_result = if manifest.deliver_openclaw {
+            deliver_via_openclaw(&n)
+        } else {
+            Ok(())
+        };
+
+        match delivery_result {
+            Ok(()) => {
+                let d = DispatchedNotification {
+                    event_id: n.event_id,
+                    run_id: n.run_id,
+                    dispatched_at: Utc::now(),
+                    channel: n.channel,
+                    thread_id: n.thread_id,
+                    kind: n.kind,
+                    message: n.message,
+                };
+                append_jsonl(&dispatched_path, &d)?;
+                delivered += 1;
+            }
+            Err(err) => {
+                append_event(
+                    run_dir,
+                    "notify_delivery_error",
+                    serde_json::json!({
+                        "event_id": n.event_id,
+                        "error": err.to_string(),
+                        "will_retry": true,
+                    }),
+                )?;
+            }
+        }
     }
 
     if delivered > 0 {
@@ -592,6 +671,7 @@ fn cmd_start(
     thread_id: String,
     owner_message_id: Option<String>,
     tick_sec: u64,
+    deliver_openclaw: bool,
 ) -> Result<()> {
     let run_id = Uuid::new_v4();
     let dir = run_dir(&repo, run_id);
@@ -622,6 +702,7 @@ fn cmd_start(
         owner_message_id,
         started_at: now,
         daemon_pid: child.id(),
+        deliver_openclaw,
     };
     let state = State {
         version: 1,
@@ -671,7 +752,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
             write_json(&dir.join("state.json"), &state)?;
             append_event(&dir, "daemon_stopped", serde_json::json!({}))?;
             queue_notification(&dir, &manifest, "stopped", "loop daemon stopped")?;
-            let _ = flush_notifications(&dir)?;
+            let _ = flush_notifications(&dir, &manifest)?;
             break;
         }
 
@@ -691,7 +772,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                 "terminal",
                 format!("daemon exit terminal state: {:?}", state.status),
             )?;
-            let _ = flush_notifications(&dir)?;
+            let _ = flush_notifications(&dir, &manifest)?;
             break;
         }
 
@@ -709,7 +790,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
             serde_json::json!({"version": state.version, "pr_changed": pr_changed}),
         )?;
 
-        let _ = flush_notifications(&dir)?;
+        let _ = flush_notifications(&dir, &manifest)?;
         std::thread::sleep(std::time::Duration::from_secs(tick_sec));
     }
 
@@ -733,9 +814,22 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
     }
     let manifest: Manifest = read_json(&dir.join("manifest.json"))?;
     let state: State = read_json(&dir.join("state.json"))?;
-    let queued = read_jsonl::<Notification>(&dir.join("notify-queue.jsonl"))?.len();
-    let dispatched =
-        read_jsonl::<DispatchedNotification>(&dir.join("notify-dispatched.jsonl"))?.len();
+    let queued_items = read_jsonl::<Notification>(&dir.join("notify-queue.jsonl"))?;
+    let dispatched_items =
+        read_jsonl::<DispatchedNotification>(&dir.join("notify-dispatched.jsonl"))?;
+
+    let mut seen = HashSet::new();
+    for d in &dispatched_items {
+        seen.insert(d.event_id);
+    }
+    let pending = queued_items
+        .iter()
+        .filter(|n| !seen.contains(&n.event_id))
+        .count();
+
+    let queued_total = queued_items.len();
+    let dispatched = dispatched_items.len();
+
     let pr_tracking = if pr_tracking_path(&dir).exists() {
         Some(read_json::<PrTracking>(&pr_tracking_path(&dir))?)
     } else {
@@ -753,9 +847,11 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
             "waiting_reason": state.waiting_reason,
             "updated_at": state.updated_at,
             "lease_expires_at": state.lease_expires_at,
-            "queued_notifications": queued,
+            "queued_notifications_total": queued_total,
+            "pending_notifications": pending,
             "dispatched_notifications": dispatched,
             "daemon_pid": manifest.daemon_pid,
+            "deliver_openclaw": manifest.deliver_openclaw,
             "pr_tracking": pr_tracking
         }))?
     );
@@ -851,7 +947,7 @@ fn reconcile_orphan_if_needed(repo: &Path, run_id: Uuid) -> Result<Option<&'stat
         state.status,
         LoopStatus::Done | LoopStatus::Failed | LoopStatus::Stopped
     ) {
-        let _ = flush_notifications(&dir)?;
+        let _ = flush_notifications(&dir, &manifest)?;
         return Ok(Some("terminal"));
     }
 
@@ -890,11 +986,11 @@ fn reconcile_orphan_if_needed(repo: &Path, run_id: Uuid) -> Result<Option<&'stat
             ),
         )?;
 
-        let _ = flush_notifications(&dir)?;
+        let _ = flush_notifications(&dir, &manifest)?;
         return Ok(Some("blocked_orphan"));
     }
 
-    let _ = flush_notifications(&dir)?;
+    let _ = flush_notifications(&dir, &manifest)?;
     Ok(Some("ok"))
 }
 
@@ -976,6 +1072,7 @@ fn main() -> Result<()> {
             thread_id,
             owner_message_id,
             tick_sec,
+            deliver_openclaw,
         } => cmd_start(
             repo,
             session_key,
@@ -983,6 +1080,7 @@ fn main() -> Result<()> {
             thread_id,
             owner_message_id,
             tick_sec,
+            deliver_openclaw,
         ),
         Commands::Daemon {
             repo,
