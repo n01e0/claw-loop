@@ -8,7 +8,7 @@ Thread-bound monitored Ralph loop daemon (Rust).
 - Guarantee explicit stop/blocked/done visibility.
 
 ## Current status
-- Thread-bound CLI implemented (`start`, `daemon`, `stop`, `status`, `notify`, `track-pr`).
+- Thread-bound CLI implemented (`start`, `daemon`, `stop`, `status`, `notify`, `track-pr`, `sweep`).
 - Per-run isolated state under `.ralph/runs/<run_id>/`.
 - Event log and lease heartbeat in place.
 - Notification queue + local dispatcher log (`notify-queue.jsonl` -> `notify-dispatched.jsonl`) in place.
@@ -17,6 +17,9 @@ Thread-bound monitored Ralph loop daemon (Rust).
   - backoff (60s -> 120s -> 240s -> 300s)
   - auto-arm merge when possible
   - transitions on merged/closed and emits notifications
+- Orphan/stale guard via `sweep` command:
+  - checks lease expiry against daemon process ownership
+  - marks run `blocked` when lease expired and daemon process is gone
 - OpenClaw delivery bridge is TODO.
 
 ## Build
@@ -37,6 +40,9 @@ cargo run -- track-pr --repo . --run-id <RUN_ID> --gh-repo n01e0/dimpact --pr 24
 # 3) inspect status
 cargo run -- status --repo . --run-id <RUN_ID>
 
-# 4) stop daemon
+# 4) reconcile stale/orphan runs (cron想定: 1分おき)
+cargo run -- sweep --repo .
+
+# 5) stop daemon
 cargo run -- stop --repo . --run-id <RUN_ID>
 ```

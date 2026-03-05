@@ -20,6 +20,7 @@ Before implementation loop starts:
 - Use `claw-loopd status` to inspect bound run status and queued/dispatched notifications.
 - Use `claw-loopd notify` for explicit loop progress events during implementation tests.
 - Use `claw-loopd track-pr` to bind waiting state to a specific PR and let daemon poll with backoff.
+- Run `claw-loopd sweep --repo <repo>` every minute (cron/systemd timer) to block orphaned runs with expired lease.
 
 ## Stop contract
 On `done|failed|stopped`:
