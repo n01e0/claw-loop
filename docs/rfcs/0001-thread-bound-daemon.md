@@ -20,7 +20,9 @@ Per-run directory:
   manifest.json
   state.json
   events.jsonl
-  notify-queue.jsonl   # TODO (next step)
+  notify-queue.jsonl
+  notify-dispatched.jsonl
+  pr-tracking.json     # optional, created when PR monitor is enabled
   daemon.pid           # optional (can be in manifest)
 ```
 
@@ -78,10 +80,10 @@ No periodic OpenClaw agent turn for monitoring.
 5. Tick loop avg CPU and I/O remain low under idle conditions.
 
 ## Next steps
-1. implement PR tracking reducer
-2. implement stale daemon/orphan detection
-3. add OpenClaw delivery bridge (thread-targeted send/wake)
-4. add integration tests (start -> wait PR -> merged -> next -> done)
+1. implement stale daemon/orphan detection
+2. add OpenClaw delivery bridge (thread-targeted send/wake)
+3. add integration tests (start -> wait PR -> merged -> next -> done)
 
 ## Progress note
-- notify queue + local dispatcher has been implemented in the first Rust iteration.
+- notify queue + local dispatcher has been implemented.
+- PR tracking reducer has been implemented with low-load polling + backoff + merged/closed transitions.
