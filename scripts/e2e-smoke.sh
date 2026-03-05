@@ -234,6 +234,11 @@ if len(items) < 2:
     raise SystemExit(f"expected >=2 failed items, got {items}")
 if not all(it.get("status") == "failed" for it in items):
     raise SystemExit(f"expected only failed items: {items}")
+hist = obj.get("failed_reason_histogram") or []
+if not hist:
+    raise SystemExit(f"expected failed_reason_histogram entries, got: {hist}")
+if hist[0].get("reason") != "openclaw_send_failed":
+    raise SystemExit(f"expected normalized reason openclaw_send_failed, got: {hist}")
 print(items[0]["event_id"])
 PY
 )"

@@ -737,6 +737,92 @@ fn delivery_max_attempts() -> u32 {
         .unwrap_or(5)
 }
 
+fn sanitize_reason_fallback(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut prev_sep = false;
+    for ch in raw.chars() {
+        let mapped = if ch.is_ascii_digit() {
+            '#'
+        } else if ch.is_ascii_whitespace() {
+            ' '
+        } else {
+            ch.to_ascii_lowercase()
+        };
+
+        let sep = mapped == ' ' || mapped == ':' || mapped == ';' || mapped == ',';
+        if sep {
+            if !prev_sep {
+                out.push(' ');
+            }
+        } else {
+            out.push(mapped);
+        }
+        prev_sep = sep;
+    }
+
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.chars().take(96).collect()
+    }
+}
+
+fn normalize_error_reason(raw: Option<&str>) -> String {
+    let line = raw
+        .unwrap_or("unknown")
+        .lines()
+        .next()
+        .unwrap_or("unknown")
+        .trim()
+        .to_ascii_lowercase();
+
+    if line.is_empty() {
+        return "unknown".to_string();
+    }
+
+    if line.contains("openclaw message send failed") {
+        return "openclaw_send_failed".to_string();
+    }
+    if line.contains("timeout") || line.contains("timed out") {
+        return "timeout".to_string();
+    }
+    if line.contains("rate limit") || line.contains("429") {
+        return "rate_limited".to_string();
+    }
+    if line.contains("permission denied") {
+        return "permission_denied".to_string();
+    }
+    if line.contains("unauthorized") || line.contains(" 401") || line.ends_with("401") {
+        return "unauthorized".to_string();
+    }
+    if line.contains("forbidden") || line.contains(" 403") || line.ends_with("403") {
+        return "forbidden".to_string();
+    }
+    if line.contains("not found") || line.contains("no such file") || line.contains(" 404") {
+        return "not_found".to_string();
+    }
+    if line.contains("connection refused") {
+        return "connection_refused".to_string();
+    }
+    if line.contains("network is unreachable")
+        || line.contains("temporary failure in name resolution")
+        || line.contains("name or service not known")
+        || line.contains("dns")
+    {
+        return "dns_or_network".to_string();
+    }
+    if line.contains("broken pipe") {
+        return "broken_pipe".to_string();
+    }
+    if line.contains("500") || line.contains("502") || line.contains("503") || line.contains("504")
+    {
+        return "upstream_5xx".to_string();
+    }
+
+    sanitize_reason_fallback(&line)
+}
+
 fn lease_window_sec(tick_sec: u64) -> i64 {
     // Keep detection reasonably fast while allowing scheduler jitter.
     // tick=60s -> lease=90s.
@@ -1191,6 +1277,7 @@ fn cmd_delivery_report(repo: PathBuf, run_id: Uuid, limit: usize, status: String
 
     let mut rows: Vec<(DateTime<Utc>, serde_json::Value)> = Vec::new();
     let mut seen: HashSet<Uuid> = HashSet::new();
+    let mut failed_reason_histogram: HashMap<String, usize> = HashMap::new();
 
     for d in &dispatched_items {
         seen.insert(d.event_id);
@@ -1238,6 +1325,11 @@ fn cmd_delivery_report(repo: PathBuf, run_id: Uuid, limit: usize, status: String
     }
 
     for dlq in &dead_letter_items {
+        let normalized_reason = normalize_error_reason(dlq.last_error.as_deref());
+        *failed_reason_histogram
+            .entry(normalized_reason.clone())
+            .or_insert(0) += 1;
+
         rows.push((
             dlq.moved_at,
             serde_json::json!({
@@ -1249,6 +1341,7 @@ fn cmd_delivery_report(repo: PathBuf, run_id: Uuid, limit: usize, status: String
                 "last_activity": dlq.moved_at,
                 "dead_letter_at": dlq.moved_at,
                 "last_error": dlq.last_error,
+                "normalized_reason": normalized_reason,
             }),
         ));
     }
@@ -1269,6 +1362,13 @@ fn cmd_delivery_report(repo: PathBuf, run_id: Uuid, limit: usize, status: String
         .filter(|q| !dispatched_items.iter().any(|d| d.event_id == q.event_id))
         .count();
 
+    let mut reason_pairs: Vec<(String, usize)> = failed_reason_histogram.into_iter().collect();
+    reason_pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let failed_reason_histogram = reason_pairs
+        .into_iter()
+        .map(|(reason, count)| serde_json::json!({"reason": reason, "count": count}))
+        .collect::<Vec<_>>();
+
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -1278,6 +1378,7 @@ fn cmd_delivery_report(repo: PathBuf, run_id: Uuid, limit: usize, status: String
             "delivered_count": dispatched_items.len(),
             "failed_count": dead_letter_items.len(),
             "attempt_count": latest_attempt.len(),
+            "failed_reason_histogram": failed_reason_histogram,
             "items": items,
         }))?
     );
@@ -1701,7 +1802,9 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_backoff_sec, delivery_retry_backoff_sec, lease_window_sec};
+    use super::{
+        compute_backoff_sec, delivery_retry_backoff_sec, lease_window_sec, normalize_error_reason,
+    };
 
     #[test]
     fn backoff_schedule_is_expected() {
@@ -1726,5 +1829,33 @@ mod tests {
         assert_eq!(delivery_retry_backoff_sec(2), 15);
         assert_eq!(delivery_retry_backoff_sec(3), 30);
         assert_eq!(delivery_retry_backoff_sec(9), 60);
+    }
+
+    #[test]
+    fn normalize_error_reason_classifies_common_patterns() {
+        assert_eq!(
+            normalize_error_reason(Some("openclaw message send failed: status=1 stderr=mock")),
+            "openclaw_send_failed"
+        );
+        assert_eq!(normalize_error_reason(Some("request timed out")), "timeout");
+        assert_eq!(
+            normalize_error_reason(Some("HTTP 429 rate limit")),
+            "rate_limited"
+        );
+        assert_eq!(
+            normalize_error_reason(Some("permission denied")),
+            "permission_denied"
+        );
+        assert_eq!(
+            normalize_error_reason(Some("connection refused by peer")),
+            "connection_refused"
+        );
+    }
+
+    #[test]
+    fn normalize_error_reason_fallback_sanitizes_digits() {
+        let out = normalize_error_reason(Some("Custom Error CODE 12345 at shard 7"));
+        assert!(out.contains('#'));
+        assert!(!out.contains("12345"));
     }
 }
