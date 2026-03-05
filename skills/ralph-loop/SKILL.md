@@ -25,6 +25,7 @@ Never start without `thread_id` + `session_key`.
    - goal
    - done_when
    - scope/constraints
+   - if tasklist is not approved yet, run `ralph-planning-gate` first
 2. Start daemon:
    - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --tick-sec 60 --deliver-openclaw --max-task-loops 10 --max-runtime-sec 3600 --task-runner-cmd '<loop command>'`
    - default: agent判定で自動チェックして次へ進む（`--auto-check-on-success=true`）

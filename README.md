@@ -46,6 +46,9 @@ Thread-bound monitored Ralph loop daemon (Rust).
   - marks run `blocked` when lease expired and daemon process is gone
 - Remaining TODO: dead-letter/ack遷移の最終固定 (A2-3) + dogfood自走入口の拡張 + long-run soak tests.
 - Roadmap / tasklist: `docs/roadmaps/ack-integration-tasklist.md`
+- Skills:
+  - `skills/ralph-loop/SKILL.md` (loop operations)
+  - `skills/ralph-planning-gate/SKILL.md` (pre-loop planning + approval gate)
 - Ack contract: `docs/specs/ack-contract.md`
 - Ack retry policy: `docs/specs/ack-retry-policy.md`
 
