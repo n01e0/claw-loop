@@ -10,7 +10,8 @@ fi
 
 WORKDIR="$(mktemp -d)"
 cleanup() {
-  rm -rf "$WORKDIR"
+  pkill -f "claw-loopd.*--repo $WORKDIR" >/dev/null 2>&1 || true
+  rm -rf "$WORKDIR" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -137,6 +138,50 @@ if obj.get("pr_tracking") is not None:
     raise SystemExit("expected pr_tracking to be removed after merge")
 PY
 $BIN stop --repo "$WORKDIR" --run-id "$RUN4" >/dev/null || true
+sleep 1
+
+echo "[e2e-smoke] case5 delivery retry metrics"
+cat > "$MOCKDIR/openclaw" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+STATE_FILE="${CLAW_LOOPD_MOCK_OPENCLAW_STATE:?missing CLAW_LOOPD_MOCK_OPENCLAW_STATE}"
+count=0
+if [[ -f "$STATE_FILE" ]]; then
+  count="$(cat "$STATE_FILE")"
+fi
+count=$((count + 1))
+echo "$count" > "$STATE_FILE"
+if [[ "$count" -eq 1 ]]; then
+  echo "mock openclaw transient failure" >&2
+  exit 1
+fi
+exit 0
+EOF
+chmod +x "$MOCKDIR/openclaw"
+MOCK_STATE="$WORKDIR/mock-openclaw-count.txt"
+
+OUT5="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw" CLAW_LOOPD_MOCK_OPENCLAW_STATE="$MOCK_STATE" $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw)"
+RUN5="$(echo "$OUT5" | awk -F= '/^run_id=/{print $2}')"
+if [[ -z "$RUN5" ]]; then
+  echo "[e2e-smoke] failed to parse run5 id"
+  echo "$OUT5"
+  exit 1
+fi
+$BIN notify --repo "$WORKDIR" --run-id "$RUN5" --kind progress --message "delivery retry" >/dev/null
+sleep 7
+STATUS5="$($BIN status --repo "$WORKDIR" --run-id "$RUN5")"
+python3 - <<'PY' "$STATUS5"
+import json, sys
+obj = json.loads(sys.argv[1])
+metrics = obj.get("delivery_metrics") or {}
+if int(metrics.get("failed_total", 0)) < 1:
+    raise SystemExit(f"expected failed_total>=1, got {metrics}")
+if int(metrics.get("retried_total", 0)) < 1:
+    raise SystemExit(f"expected retried_total>=1, got {metrics}")
+if int(obj.get("pending_notifications", 0)) != 0:
+    raise SystemExit(f"expected pending_notifications=0, got {obj.get('pending_notifications')}")
+PY
+$BIN stop --repo "$WORKDIR" --run-id "$RUN5" >/dev/null || true
 sleep 1
 
 echo "[e2e-smoke] ok"
