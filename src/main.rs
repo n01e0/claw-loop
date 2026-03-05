@@ -30,6 +30,8 @@ enum Commands {
         thread_id: String,
         #[arg(long)]
         owner_message_id: Option<String>,
+        #[arg(long)]
+        requester_user_id: Option<String>,
         #[arg(long, default_value_t = 60)]
         tick_sec: u64,
         #[arg(long, default_value_t = false)]
@@ -155,6 +157,8 @@ struct Manifest {
     channel: String,
     thread_id: String,
     owner_message_id: Option<String>,
+    #[serde(default)]
+    requester_user_id: Option<String>,
     started_at: DateTime<Utc>,
     daemon_pid: u32,
     #[serde(default)]
@@ -372,6 +376,7 @@ struct StartOptions {
     channel: String,
     thread_id: String,
     owner_message_id: Option<String>,
+    requester_user_id: Option<String>,
     tick_sec: u64,
     deliver_openclaw: bool,
     max_ticks: Option<u64>,
@@ -808,6 +813,16 @@ fn clip_text(input: &str, max_chars: usize) -> String {
     }
     let clipped: String = input.chars().take(max_chars).collect();
     format!("{clipped}…")
+}
+
+fn completion_mention_prefix(manifest: &Manifest) -> String {
+    if manifest.channel == "discord"
+        && let Some(user_id) = manifest.requester_user_id.as_deref()
+        && !user_id.trim().is_empty()
+    {
+        return format!("<@{}> ", user_id.trim());
+    }
+    String::new()
 }
 
 fn update_waiting_stuck_tracker(
@@ -1818,6 +1833,7 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
         channel: opts.channel,
         thread_id: opts.thread_id,
         owner_message_id: opts.owner_message_id,
+        requester_user_id: opts.requester_user_id,
         started_at: now,
         daemon_pid: child.id(),
         deliver_openclaw: opts.deliver_openclaw,
@@ -2064,12 +2080,20 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                         state.summary = "all tasklist items completed".into();
                         state.waiting_reason =
                             "all tasklist items completed; waiting for new instruction".into();
-                        queue_notification(
-                            &dir,
-                            &manifest,
-                            "all_tasks_completed",
-                            "all tasklist items completed; waiting for instruction",
-                        )?;
+
+                        let mention = completion_mention_prefix(&manifest);
+                        let last_task = runner_state
+                            .last_task_id
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let summary = format!(
+                            "{mention}all tasks completed (run_id={}, loops_started={}, done={}, last_task={}); waiting for instruction",
+                            manifest.run_id,
+                            runner_state.task_loops_started,
+                            task_done_now,
+                            last_task,
+                        );
+                        queue_notification(&dir, &manifest, "all_tasks_completed", summary)?;
                     } else {
                         let queued_task = next.clone().expect("checked next.is_some");
                         runner_state.current_task_id = Some(queued_task.id.clone());
@@ -2561,6 +2585,7 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
             "run_id": manifest.run_id,
             "thread_id": manifest.thread_id,
             "session_key": manifest.session_key,
+            "requester_user_id": manifest.requester_user_id,
             "status": state.status,
             "summary": state.summary,
             "waiting_reason": state.waiting_reason,
@@ -3262,6 +3287,7 @@ fn main() -> Result<()> {
             channel,
             thread_id,
             owner_message_id,
+            requester_user_id,
             tick_sec,
             deliver_openclaw,
             max_ticks,
@@ -3276,6 +3302,7 @@ fn main() -> Result<()> {
             channel,
             thread_id,
             owner_message_id,
+            requester_user_id,
             tick_sec,
             deliver_openclaw,
             max_ticks,
@@ -3385,6 +3412,7 @@ mod tests {
             channel: "discord".to_string(),
             thread_id: "test-thread".to_string(),
             owner_message_id: None,
+            requester_user_id: None,
             started_at: Utc::now(),
             daemon_pid: std::process::id(),
             deliver_openclaw,

@@ -56,6 +56,7 @@ claw-loopd start \
   --session-key <session_key> \
   --channel discord \
   --thread-id <thread_id> \
+  --requester-user-id <discord_user_id> \
   --tick-sec 60 \
   --deliver-openclaw \
   --max-task-loops 10 \
