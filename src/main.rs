@@ -44,7 +44,7 @@ enum Commands {
         task_file: PathBuf,
         #[arg(long)]
         task_runner_cmd: Option<String>,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         auto_check_on_success: bool,
     },
     Daemon {
@@ -353,7 +353,7 @@ fn default_max_task_loops() -> u64 {
 }
 
 fn default_auto_check_on_success() -> bool {
-    false
+    true
 }
 
 fn default_task_file() -> PathBuf {

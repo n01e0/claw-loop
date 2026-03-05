@@ -15,7 +15,7 @@ Collect all of these before start:
 - delivery mode (`--deliver-openclaw` on/off)
 - safety guard (`--max-task-loops` / `--max-ticks` / `--max-runtime-sec`) ※`max_task_loops` のデフォルトは 10
 - dogfood runner command (`--task-runner-cmd`) ※未指定時は monitor_only
-- `--auto-check-on-success` default は `false`（完了確認待ちで次タスクへ進む）
+- `--auto-check-on-success` default は `true`（agent判定で自動チェック）
 
 Never start without `thread_id` + `session_key`.
 
@@ -27,7 +27,8 @@ Never start without `thread_id` + `session_key`.
    - scope/constraints
 2. Start daemon:
    - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --tick-sec 60 --deliver-openclaw --max-task-loops 10 --max-runtime-sec 3600 --task-runner-cmd '<loop command>'`
-   - runnerは1タスクずつ進める（進行中タスクが完了チェックされるまで次は開始しない）
+   - default: agent判定で自動チェックして次へ進む（`--auto-check-on-success=true`）
+   - `--auto-check-on-success=false` で完了確認待ちモード（進行中タスクが完了チェックされるまで次は開始しない）
 3. Post `run_id` in-thread immediately.
 4. Record first planned loop item.
 

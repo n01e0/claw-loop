@@ -97,7 +97,7 @@ cat > "$TASKFILE" <<'EOF'
 - [ ] R1: first
 - [ ] R2: second
 EOF
-OUT1C="$($BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --task-runner-cmd 'echo start:$CLAW_TASK_ID' --max-task-loops 10)"
+OUT1C="$($BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --task-runner-cmd 'echo start:$CLAW_TASK_ID' --auto-check-on-success false --max-task-loops 10)"
 RUN1C="$(echo "$OUT1C" | awk -F= '/^run_id=/{print $2}')"
 if [[ -z "$RUN1C" ]]; then
   echo "[e2e-smoke] failed to parse run1c id"
