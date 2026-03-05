@@ -181,6 +181,16 @@ if int(metrics.get("retried_total", 0)) < 1:
 if int(obj.get("pending_notifications", 0)) != 0:
     raise SystemExit(f"expected pending_notifications=0, got {obj.get('pending_notifications')}")
 PY
+REPORT5="$($BIN delivery-report --repo "$WORKDIR" --run-id "$RUN5" --limit 5)"
+python3 - <<'PY' "$REPORT5"
+import json, sys
+obj = json.loads(sys.argv[1])
+items = obj.get("items") or []
+if not items:
+    raise SystemExit("expected non-empty delivery report items")
+if not any(it.get("status") == "delivered" for it in items):
+    raise SystemExit(f"expected delivered item in report: {items}")
+PY
 $BIN stop --repo "$WORKDIR" --run-id "$RUN5" >/dev/null || true
 sleep 1
 
