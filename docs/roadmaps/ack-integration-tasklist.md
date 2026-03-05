@@ -19,11 +19,11 @@
 - [x] CI (`fmt/clippy/test/e2e-smoke`)
 
 ## Current Execution Plan (approved)
-- [ ] T1: A2-3の状態遷移ルールを仕様化（遷移表＋禁止遷移を文書化）
-- [ ] T2: A2-3を実装（遷移ルールをコードへ反映）
-- [ ] T3: A3-1 unit test追加（A2-3遷移と境界ケース）
-- [ ] T4: A3-2 e2e拡張（再送/復帰/ack整合）
-- [ ] T5: docs/tasklist最終更新＋完了報告
+- [x] T1: A2-3の状態遷移ルールを仕様化（遷移表＋禁止遷移を文書化）
+- [x] T2: A2-3を実装（遷移ルールをコードへ反映）
+- [x] T3: A3-1 unit test追加（A2-3遷移と境界ケース）
+- [x] T4: A3-2 e2e拡張（再送/復帰/ack整合）
+- [x] T5: docs/tasklist最終更新＋完了報告
 
 ## Dogfood TODO
 - [x] D0-1: tasklist から次の未完了を取得 (`task-next`)
@@ -61,12 +61,17 @@
   - `(event_id, attempts)` キーで重複ack appendを抑止
 - [x] A2-2: daemon再起動跨ぎでのack整合性確認
   - daemon起動時に `delivery_reconciled` で queue/ack を再整合
-- [ ] A2-3: dead-letter と ack の状態遷移ルールを固定
+- [x] A2-3: dead-letter と ack の状態遷移ルールを固定
+  - 仕様: `docs/specs/ack-state-transitions.md`
 
 ### Phase 3: テスト
-- [ ] A3-1: unit test（ack分類・遷移）
-- [ ] A3-2: e2e smoke拡張（配信成功/失敗/再送/ack）
-- [ ] A3-3: 24h soak test シナリオ追加
+- [x] A3-1: unit test（ack分類・遷移）
+  - `flush_notifications_*` 系テストで A2-3 遷移と境界ケースを追加
+- [x] A3-2: e2e smoke拡張（配信成功/失敗/再送/ack）
+  - `scripts/e2e-smoke.sh` に case8/case9（再送/復帰/reconcile+ack整合）を追加
+- [x] A3-3: 24h soak test シナリオ追加
+  - 仕様: `docs/specs/ack-soak-24h.md`
+  - 実行: `scripts/soak-24h.sh`
 
 ## 進め方ルール
 - 1PRで1テーマ（小さく分割）
@@ -74,7 +79,20 @@
 - CI green + e2e pass で次へ進む
 - 迷ったら仕様（Phase 0）に戻って先に言語化
 
+## 完了報告（Run: cb3e88b1-d322-467c-b984-64d49f337ac8）
+- 完了タスク: T1 / T2 / T3 / T4 / T5
+- 反映済み:
+  - A2-3 仕様化 + 実装（遷移ガード/terminal判定）
+  - A3-1 unit test 追加（遷移/境界ケース）
+  - A3-2 e2e 拡張（再送/復帰/ack整合/reconcile）
+  - A3-3 24h soak シナリオ追加（`docs/specs/ack-soak-24h.md` / `scripts/soak-24h.sh`）
+- 主要検証:
+  - `cargo fmt --all -- --check`
+  - `cargo test --all --all-features`
+  - `cargo clippy --all-targets --all-features -- -D warnings`
+  - `./scripts/e2e-smoke.sh ./target/debug/claw-loopd`
+
 ## 次の1手（着手順）
-1. A2-3: dead-letter と ack の状態遷移ルール固定
-2. A3-1/A3-2: ack遷移テスト強化
-3. A3-3: 24h soak test
+1. 24h soak 実行（本番相当条件）と結果収集
+2. soak結果を踏まえた retry/backoff パラメータ再評価（必要時）
+3. ack連携フェーズの最終クローズ（PR/リリースノート反映）
