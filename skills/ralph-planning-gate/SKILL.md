@@ -48,7 +48,8 @@ Then ask: "このタスクリストで開始していい?"
 Start only after a clear yes.
 
 ## Loop start template
-After approval, start with explicit runner mode:
+After approval, start with explicit runner mode.
+Resolve `<discord_user_id>` from inbound `sender_id` of the request message (never hardcode in repo files).
 
 ```bash
 claw-loopd start \
