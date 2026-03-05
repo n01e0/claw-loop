@@ -14,6 +14,7 @@ Thread-bound monitored Ralph loop daemon (Rust).
 - Notification queue + dispatcher log (`notify-queue.jsonl` -> `notify-dispatched.jsonl`) in place.
 - Delivery traces in run dir:
   - `notify-attempts.jsonl` (every attempt)
+  - `notify-ack.jsonl` (ack success/failure history)
   - `notify-dead-letter.jsonl` (max-attempt exceeded)
   - `delivery-report --status failed` includes normalized `failed_reason_histogram`
 - Optional OpenClaw delivery bridge (`--deliver-openclaw`):
