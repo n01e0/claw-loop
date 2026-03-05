@@ -18,6 +18,11 @@
 - [x] failed reason normalization + histogram/trend
 - [x] CI (`fmt/clippy/test/e2e-smoke`)
 
+## Dogfood TODO
+- [x] D0-1: tasklist から次の未完了を取得 (`task-next`)
+- [x] D0-2: tasklist のチェック状態をCLIで更新 (`task-check`)
+- [ ] D1-1: tasklistの「次の未完了」を自動実行する runner エントリ
+
 ## Ack Integration TODO
 
 ### Phase 0: 契約定義（先に仕様を固定）
@@ -59,6 +64,7 @@
 - 迷ったら仕様（Phase 0）に戻って先に言語化
 
 ## 次の1手（着手順）
-1. A0-1, A0-2, A0-3 を最小仕様として確定
-2. A1-1（`notify-ack.jsonl`）だけ先行実装
-3. A1-2/A1-4 で status 可視化まで接続
+1. A2-3: dead-letter と ack の状態遷移ルール固定
+2. D1-1: tasklist駆動 runner（dogfood自走入口）
+3. A3-1/A3-2: ack遷移テスト強化
+4. A3-3: 24h soak test
