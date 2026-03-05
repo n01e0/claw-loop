@@ -76,6 +76,8 @@ enum Commands {
         limit: usize,
         #[arg(long, default_value_t = true)]
         reset_attempts: bool,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
     Notify {
         #[arg(long)]
@@ -1289,6 +1291,7 @@ fn cmd_requeue_dead_letter(
     event_id: Option<Uuid>,
     limit: usize,
     reset_attempts: bool,
+    dry_run: bool,
 ) -> Result<()> {
     let dir = run_dir(&repo, run_id);
     if !dir.exists() {
@@ -1311,19 +1314,27 @@ fn cmd_requeue_dead_letter(
     }
 
     let mut selected = 0usize;
+    let mut would_requeue = 0usize;
     let mut requeued = 0usize;
+    let mut skipped_occupied = 0usize;
+    let mut target_seen = false;
     let now = Utc::now();
     let mut keep_dead: Vec<DeadLetterEntry> = Vec::new();
 
     for entry in dead_letter_items {
-        if selected >= limit {
-            keep_dead.push(entry);
-            continue;
+        if let Some(target) = event_id {
+            if entry.event_id != target {
+                keep_dead.push(entry);
+                continue;
+            }
+            if target_seen {
+                keep_dead.push(entry);
+                continue;
+            }
+            target_seen = true;
         }
 
-        if let Some(target) = event_id
-            && entry.event_id != target
-        {
+        if selected >= limit {
             keep_dead.push(entry);
             continue;
         }
@@ -1331,9 +1342,12 @@ fn cmd_requeue_dead_letter(
         selected += 1;
 
         if occupied.contains(&entry.event_id) {
+            skipped_occupied += 1;
             keep_dead.push(entry);
             continue;
         }
+
+        would_requeue += 1;
 
         let notification = Notification {
             event_id: entry.event_id,
@@ -1348,7 +1362,25 @@ fn cmd_requeue_dead_letter(
             last_error: entry.last_error,
         };
 
+        if dry_run {
+            keep_dead.push(DeadLetterEntry {
+                event_id: notification.event_id,
+                run_id,
+                moved_at: now,
+                attempts: if reset_attempts {
+                    0
+                } else {
+                    notification.attempts
+                },
+                kind: notification.kind,
+                message: notification.message,
+                last_error: notification.last_error,
+            });
+            continue;
+        }
+
         append_jsonl(&queue_path, &notification)?;
+        occupied.insert(notification.event_id);
         append_event(
             &dir,
             "notify_requeued",
@@ -1361,17 +1393,19 @@ fn cmd_requeue_dead_letter(
         requeued += 1;
     }
 
-    rewrite_jsonl(&dead_letter_file, &keep_dead)?;
+    if !dry_run {
+        rewrite_jsonl(&dead_letter_file, &keep_dead)?;
 
-    let mut metrics = if metrics_path.exists() {
-        read_json::<DeliveryMetrics>(&metrics_path)?
-    } else {
-        DeliveryMetrics::default()
-    };
-    if requeued > 0 {
-        metrics.requeued_total = metrics.requeued_total.saturating_add(requeued as u64);
-        metrics.last_requeued_at = Some(now);
-        write_json(&metrics_path, &metrics)?;
+        let mut metrics = if metrics_path.exists() {
+            read_json::<DeliveryMetrics>(&metrics_path)?
+        } else {
+            DeliveryMetrics::default()
+        };
+        if requeued > 0 {
+            metrics.requeued_total = metrics.requeued_total.saturating_add(requeued as u64);
+            metrics.last_requeued_at = Some(now);
+            write_json(&metrics_path, &metrics)?;
+        }
     }
 
     println!(
@@ -1379,7 +1413,11 @@ fn cmd_requeue_dead_letter(
         serde_json::to_string_pretty(&serde_json::json!({
             "run_id": run_id,
             "selected": selected,
+            "would_requeue": would_requeue,
             "requeued": requeued,
+            "skipped_occupied": skipped_occupied,
+            "target_found": event_id.map(|_| target_seen).unwrap_or(true),
+            "dry_run": dry_run,
             "remaining_dead_letter": keep_dead.len(),
         }))?
     );
@@ -1638,7 +1676,8 @@ fn main() -> Result<()> {
             event_id,
             limit,
             reset_attempts,
-        } => cmd_requeue_dead_letter(repo, run_id, event_id, limit, reset_attempts),
+            dry_run,
+        } => cmd_requeue_dead_letter(repo, run_id, event_id, limit, reset_attempts, dry_run),
         Commands::Notify {
             repo,
             run_id,

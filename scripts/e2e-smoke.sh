@@ -210,52 +210,86 @@ if [[ -z "$RUN6" ]]; then
   echo "$OUT6"
   exit 1
 fi
-$BIN notify --repo "$WORKDIR" --run-id "$RUN6" --kind progress --message "should dead-letter" >/dev/null
+$BIN notify --repo "$WORKDIR" --run-id "$RUN6" --kind progress --message "should dead-letter A" >/dev/null
+$BIN notify --repo "$WORKDIR" --run-id "$RUN6" --kind progress --message "should dead-letter B" >/dev/null
 sleep 3
 STATUS6="$($BIN status --repo "$WORKDIR" --run-id "$RUN6")"
 python3 - <<'PY' "$STATUS6"
 import json, sys
 obj = json.loads(sys.argv[1])
 metrics = obj.get("delivery_metrics") or {}
-if int(obj.get("dead_letter_total", 0)) < 1:
-    raise SystemExit(f"expected dead_letter_total>=1, got {obj.get('dead_letter_total')}")
-if int(metrics.get("dead_letter_total", 0)) < 1:
-    raise SystemExit(f"expected metrics.dead_letter_total>=1, got {metrics}")
+if int(obj.get("dead_letter_total", 0)) < 2:
+    raise SystemExit(f"expected dead_letter_total>=2, got {obj.get('dead_letter_total')}")
+if int(metrics.get("dead_letter_total", 0)) < 2:
+    raise SystemExit(f"expected metrics.dead_letter_total>=2, got {metrics}")
 if int(obj.get("pending_notifications", 0)) != 0:
     raise SystemExit(f"expected pending_notifications=0, got {obj.get('pending_notifications')}")
 PY
-REPORT6="$($BIN delivery-report --repo "$WORKDIR" --run-id "$RUN6" --limit 5 --status failed)"
-python3 - <<'PY' "$REPORT6"
+REPORT6="$($BIN delivery-report --repo "$WORKDIR" --run-id "$RUN6" --limit 10 --status failed)"
+TARGET_EVENT_ID="$(python3 - <<'PY' "$REPORT6"
 import json, sys
 obj = json.loads(sys.argv[1])
 items = obj.get("items") or []
-if not items:
-    raise SystemExit("expected failed items in delivery-report")
+if len(items) < 2:
+    raise SystemExit(f"expected >=2 failed items, got {items}")
 if not all(it.get("status") == "failed" for it in items):
     raise SystemExit(f"expected only failed items: {items}")
+print(items[0]["event_id"])
 PY
+)"
 
 echo "[e2e-smoke] case7 dead-letter requeue"
 $BIN stop --repo "$WORKDIR" --run-id "$RUN6" >/dev/null || true
 sleep 1
 
-REQUEUE6="$($BIN requeue-dead-letter --repo "$WORKDIR" --run-id "$RUN6" --limit 1 --reset-attempts)"
+REQUEUE6_DRY="$($BIN requeue-dead-letter --repo "$WORKDIR" --run-id "$RUN6" --event-id "$TARGET_EVENT_ID" --limit 1 --reset-attempts --dry-run)"
+python3 - <<'PY' "$REQUEUE6_DRY"
+import json, sys
+obj = json.loads(sys.argv[1])
+if obj.get("dry_run") is not True:
+    raise SystemExit(f"expected dry_run=true, got {obj}")
+if int(obj.get("would_requeue", 0)) != 1:
+    raise SystemExit(f"expected would_requeue==1, got {obj}")
+if int(obj.get("requeued", 0)) != 0:
+    raise SystemExit(f"expected requeued==0 in dry-run, got {obj}")
+if obj.get("target_found") is not True:
+    raise SystemExit(f"expected target_found=true in dry-run, got {obj}")
+PY
+
+REQUEUE6="$($BIN requeue-dead-letter --repo "$WORKDIR" --run-id "$RUN6" --event-id "$TARGET_EVENT_ID" --limit 1 --reset-attempts)"
 python3 - <<'PY' "$REQUEUE6"
 import json, sys
 obj = json.loads(sys.argv[1])
-if int(obj.get("requeued", 0)) < 1:
-    raise SystemExit(f"expected requeued>=1, got {obj}")
+if int(obj.get("requeued", 0)) != 1:
+    raise SystemExit(f"expected requeued==1, got {obj}")
+if obj.get("target_found") is not True:
+    raise SystemExit(f"expected target_found=true, got {obj}")
+if int(obj.get("remaining_dead_letter", 0)) < 1:
+    raise SystemExit(f"expected remaining_dead_letter>=1, got {obj}")
 PY
 
-REPORT6B="$($BIN delivery-report --repo "$WORKDIR" --run-id "$RUN6" --limit 5 --status pending)"
-python3 - <<'PY' "$REPORT6B"
+REQUEUE6B="$($BIN requeue-dead-letter --repo "$WORKDIR" --run-id "$RUN6" --event-id "$TARGET_EVENT_ID" --limit 1 --reset-attempts)"
+python3 - <<'PY' "$REQUEUE6B"
 import json, sys
 obj = json.loads(sys.argv[1])
+if int(obj.get("requeued", 0)) != 0:
+    raise SystemExit(f"expected second requeue requeued==0, got {obj}")
+if obj.get("target_found") is not False:
+    raise SystemExit(f"expected target_found=false on second requeue, got {obj}")
+PY
+
+REPORT6B="$($BIN delivery-report --repo "$WORKDIR" --run-id "$RUN6" --limit 10 --status pending)"
+python3 - <<'PY' "$REPORT6B" "$TARGET_EVENT_ID"
+import json, sys
+obj = json.loads(sys.argv[1])
+target = sys.argv[2]
 items = obj.get("items") or []
 if not items:
     raise SystemExit("expected pending items after dead-letter requeue")
 if not all(it.get("status") == "pending" for it in items):
     raise SystemExit(f"expected only pending items: {items}")
+if not any(it.get("event_id") == target for it in items):
+    raise SystemExit(f"expected target event in pending report: {items}")
 PY
 
 echo "[e2e-smoke] ok"
