@@ -180,6 +180,10 @@ if int(metrics.get("retried_total", 0)) < 1:
     raise SystemExit(f"expected retried_total>=1, got {metrics}")
 if int(obj.get("pending_notifications", 0)) != 0:
     raise SystemExit(f"expected pending_notifications=0, got {obj.get('pending_notifications')}")
+if int(obj.get("acked_total", 0)) < 1:
+    raise SystemExit(f"expected acked_total>=1, got {obj.get('acked_total')}")
+if int(obj.get("ack_entries_total", 0)) < 1:
+    raise SystemExit(f"expected ack_entries_total>=1, got {obj.get('ack_entries_total')}")
 PY
 ACK5_PATH="$WORKDIR/.ralph/runs/$RUN5/notify-ack.jsonl"
 python3 - <<'PY' "$ACK5_PATH"
@@ -206,6 +210,10 @@ if not items:
     raise SystemExit("expected non-empty delivery report items")
 if not all(it.get("status") == "delivered" for it in items):
     raise SystemExit(f"expected only delivered items in report: {items}")
+if not all(it.get("acked") is True for it in items):
+    raise SystemExit(f"expected delivered items to be acked=true: {items}")
+if not all(it.get("ack_at") is not None for it in items):
+    raise SystemExit(f"expected delivered items to include ack_at: {items}")
 PY
 $BIN stop --repo "$WORKDIR" --run-id "$RUN5" >/dev/null || true
 sleep 1
@@ -260,6 +268,8 @@ if len(items) < 2:
     raise SystemExit(f"expected >=2 failed items, got {items}")
 if not all(it.get("status") == "failed" for it in items):
     raise SystemExit(f"expected only failed items: {items}")
+if not all(it.get("acked") is False for it in items):
+    raise SystemExit(f"expected failed items to be acked=false: {items}")
 hist = obj.get("failed_reason_histogram") or []
 if not hist:
     raise SystemExit(f"expected failed_reason_histogram entries, got: {hist}")
