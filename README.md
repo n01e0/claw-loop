@@ -15,6 +15,7 @@ Thread-bound monitored Ralph loop daemon (Rust).
 - Delivery traces in run dir:
   - `notify-attempts.jsonl` (every attempt)
   - `notify-dead-letter.jsonl` (max-attempt exceeded)
+  - `delivery-report --status failed` includes normalized `failed_reason_histogram`
 - Optional OpenClaw delivery bridge (`--deliver-openclaw`):
   - sends notifications via `openclaw message send`
   - keeps unsent events in queue for retry
@@ -68,6 +69,7 @@ cargo run -- status --repo . --run-id <RUN_ID>
 # 3.1) event-level delivery report
 cargo run -- delivery-report --repo . --run-id <RUN_ID> --limit 20 --status all
 # status: all|pending|delivered|failed
+# failed status output includes normalized `failed_reason_histogram`
 
 # 3.2) requeue dead-letter entries
 cargo run -- requeue-dead-letter --repo . --run-id <RUN_ID> --event-id <EVENT_ID> --limit 1 --reset-attempts
