@@ -181,6 +181,22 @@ if int(metrics.get("retried_total", 0)) < 1:
 if int(obj.get("pending_notifications", 0)) != 0:
     raise SystemExit(f"expected pending_notifications=0, got {obj.get('pending_notifications')}")
 PY
+ACK5_PATH="$WORKDIR/.ralph/runs/$RUN5/notify-ack.jsonl"
+python3 - <<'PY' "$ACK5_PATH"
+import json, sys
+path = sys.argv[1]
+rows = [json.loads(line) for line in open(path) if line.strip()]
+if len(rows) < 2:
+    raise SystemExit(f"expected >=2 ack rows, got {len(rows)}")
+oks = [r for r in rows if r.get("ok") is True]
+fails = [r for r in rows if r.get("ok") is False]
+if not oks:
+    raise SystemExit(f"expected success ack rows, got {rows}")
+if not fails:
+    raise SystemExit(f"expected failure ack rows, got {rows}")
+if not any(r.get("category") == "transport" for r in fails):
+    raise SystemExit(f"expected transport category in failed ack rows, got {fails}")
+PY
 REPORT5="$($BIN delivery-report --repo "$WORKDIR" --run-id "$RUN5" --limit 5 --status delivered)"
 python3 - <<'PY' "$REPORT5"
 import json, sys
@@ -224,6 +240,16 @@ if int(metrics.get("dead_letter_total", 0)) < 2:
     raise SystemExit(f"expected metrics.dead_letter_total>=2, got {metrics}")
 if int(obj.get("pending_notifications", 0)) != 0:
     raise SystemExit(f"expected pending_notifications=0, got {obj.get('pending_notifications')}")
+PY
+ACK6_PATH="$WORKDIR/.ralph/runs/$RUN6/notify-ack.jsonl"
+python3 - <<'PY' "$ACK6_PATH"
+import json, sys
+path = sys.argv[1]
+rows = [json.loads(line) for line in open(path) if line.strip()]
+if len(rows) < 2:
+    raise SystemExit(f"expected >=2 ack rows for run6, got {len(rows)}")
+if not all(r.get("ok") is False for r in rows):
+    raise SystemExit(f"expected all run6 ack rows to be failures, got {rows}")
 PY
 REPORT6="$($BIN delivery-report --repo "$WORKDIR" --run-id "$RUN6" --limit 10 --status failed)"
 TARGET_EVENT_ID="$(python3 - <<'PY' "$REPORT6"

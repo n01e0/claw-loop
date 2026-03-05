@@ -204,6 +204,18 @@ struct DeliveryAttempt {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+struct DeliveryAck {
+    event_id: Uuid,
+    run_id: Uuid,
+    acked_at: DateTime<Utc>,
+    ok: bool,
+    category: String,
+    attempts: u32,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct DeadLetterEntry {
     event_id: Uuid,
     run_id: Uuid,
@@ -323,6 +335,10 @@ fn delivery_metrics_path(run_dir: &Path) -> PathBuf {
 
 fn delivery_attempts_path(run_dir: &Path) -> PathBuf {
     run_dir.join("notify-attempts.jsonl")
+}
+
+fn delivery_ack_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("notify-ack.jsonl")
 }
 
 fn dead_letter_path(run_dir: &Path) -> PathBuf {
@@ -497,6 +513,7 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
     let queue_path = run_dir.join("notify-queue.jsonl");
     let dispatched_path = run_dir.join("notify-dispatched.jsonl");
     let attempts_path = delivery_attempts_path(run_dir);
+    let ack_path = delivery_ack_path(run_dir);
     let dead_letter_file = dead_letter_path(run_dir);
     let metrics_path = delivery_metrics_path(run_dir);
     let max_attempts = delivery_max_attempts();
@@ -555,6 +572,17 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
                 };
                 append_jsonl(&attempts_path, &attempt)?;
 
+                let ack = DeliveryAck {
+                    event_id: n.event_id,
+                    run_id: n.run_id,
+                    acked_at: now,
+                    ok: true,
+                    category: "ok".to_string(),
+                    attempts: n.attempts,
+                    error: None,
+                };
+                append_jsonl(&ack_path, &ack)?;
+
                 let d = DispatchedNotification {
                     event_id: n.event_id,
                     run_id: n.run_id,
@@ -585,6 +613,17 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
                     error: Some(err_text.clone()),
                 };
                 append_jsonl(&attempts_path, &attempt)?;
+
+                let ack = DeliveryAck {
+                    event_id: n.event_id,
+                    run_id: n.run_id,
+                    acked_at: now,
+                    ok: false,
+                    category: classify_ack_failure_category(Some(&err_text)),
+                    attempts: n.attempts,
+                    error: Some(err_text.clone()),
+                };
+                append_jsonl(&ack_path, &ack)?;
 
                 metrics.failed_total = metrics.failed_total.saturating_add(1);
                 metrics.last_failed_at = Some(now);
@@ -823,6 +862,21 @@ fn normalize_error_reason(raw: Option<&str>) -> String {
     }
 
     sanitize_reason_fallback(&line)
+}
+
+fn classify_ack_failure_category(raw: Option<&str>) -> String {
+    match normalize_error_reason(raw).as_str() {
+        "timeout" => "timeout".to_string(),
+        "rate_limited" => "rate_limited".to_string(),
+        "unauthorized" => "auth".to_string(),
+        "forbidden" | "permission_denied" => "permission".to_string(),
+        "not_found" => "not_found".to_string(),
+        "upstream_5xx" => "upstream_5xx".to_string(),
+        "connection_refused" | "dns_or_network" | "broken_pipe" | "openclaw_send_failed" => {
+            "transport".to_string()
+        }
+        _ => "unknown".to_string(),
+    }
 }
 
 fn lease_window_sec(tick_sec: u64) -> i64 {
@@ -1854,7 +1908,8 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_backoff_sec, delivery_retry_backoff_sec, lease_window_sec, normalize_error_reason,
+        classify_ack_failure_category, compute_backoff_sec, delivery_retry_backoff_sec,
+        lease_window_sec, normalize_error_reason,
     };
 
     #[test]
@@ -1908,5 +1963,26 @@ mod tests {
         let out = normalize_error_reason(Some("Custom Error CODE 12345 at shard 7"));
         assert!(out.contains('#'));
         assert!(!out.contains("12345"));
+    }
+
+    #[test]
+    fn classify_ack_failure_category_maps_expected_buckets() {
+        assert_eq!(
+            classify_ack_failure_category(Some("openclaw message send failed: status=1")),
+            "transport"
+        );
+        assert_eq!(
+            classify_ack_failure_category(Some("request timed out")),
+            "timeout"
+        );
+        assert_eq!(
+            classify_ack_failure_category(Some("permission denied")),
+            "permission"
+        );
+        assert_eq!(classify_ack_failure_category(Some("HTTP 401")), "auth");
+        assert_eq!(
+            classify_ack_failure_category(Some("random opaque error")),
+            "unknown"
+        );
     }
 }
