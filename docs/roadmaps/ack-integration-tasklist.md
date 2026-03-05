@@ -21,12 +21,14 @@
 ## Ack Integration TODO
 
 ### Phase 0: 契約定義（先に仕様を固定）
-- [ ] A0-1: ack の「成功」定義を明文化
-  - 候補: `openclaw message send` 成功応答を ack とみなす
-- [ ] A0-2: ack の「失敗」分類を定義
-  - transport error / timeout / auth / permission / unknown
-- [ ] A0-3: 冪等キーを定義
+- [x] A0-1: ack の「成功」定義を明文化
+  - `openclaw message send` が exit code 0 かつ timeout なしを ack success とする
+- [x] A0-2: ack の「失敗」分類を定義
+  - `timeout/transport/auth/permission/rate_limited/not_found/upstream_5xx/unknown`
+- [x] A0-3: 冪等キーを定義
   - `event_id` を配信・ackの一意キーとして固定
+
+仕様書: `docs/specs/ack-contract.md`
 
 ### Phase 1: 実装
 - [ ] A1-1: `notify-ack.jsonl` を追加（ackイベント履歴）
