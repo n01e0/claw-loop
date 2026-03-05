@@ -78,7 +78,10 @@ No periodic OpenClaw agent turn for monitoring.
 5. Tick loop avg CPU and I/O remain low under idle conditions.
 
 ## Next steps
-1. implement notify queue + dispatcher
-2. implement PR tracking reducer
-3. implement stale daemon/orphan detection
+1. implement PR tracking reducer
+2. implement stale daemon/orphan detection
+3. add OpenClaw delivery bridge (thread-targeted send/wake)
 4. add integration tests (start -> wait PR -> merged -> next -> done)
+
+## Progress note
+- notify queue + local dispatcher has been implemented in the first Rust iteration.

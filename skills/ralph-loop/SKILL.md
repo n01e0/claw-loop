@@ -17,6 +17,8 @@ Before implementation loop starts:
 - Loop workers append events; daemon updates state.
 - Report at least once per loop.
 - Waiting/blocked must always include explicit reason.
+- Use `claw-loopd status` to inspect bound run status and queued/dispatched notifications.
+- Use `claw-loopd notify` for explicit loop progress events during implementation tests.
 
 ## Stop contract
 On `done|failed|stopped`:

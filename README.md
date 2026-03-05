@@ -8,10 +8,11 @@ Thread-bound monitored Ralph loop daemon (Rust).
 - Guarantee explicit stop/blocked/done visibility.
 
 ## Current status
-- CLI skeleton implemented (`start`, `daemon`, `stop`).
+- Thread-bound CLI implemented (`start`, `daemon`, `stop`, `status`, `notify`).
 - Per-run isolated state under `.ralph/runs/<run_id>/`.
 - Event log and lease heartbeat in place.
-- PR-sync/notify integration is TODO.
+- Notification queue + local dispatcher log (`notify-queue.jsonl` -> `notify-dispatched.jsonl`) in place.
+- PR-sync/OpenClaw delivery bridge is TODO.
 
 ## Build
 
