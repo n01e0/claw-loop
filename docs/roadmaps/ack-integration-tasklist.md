@@ -32,7 +32,8 @@
 - [x] S1-3: `status` 可視化強化（current/last/blocked reason/last PR URL）
 - [x] S1-4: 完了判定ガードの回帰強化（`TASK_DONE + PR_URL + merged` 必須）
 - [x] S1-5: stuck検知（状態変化なしの待機を通知）
-- [ ] S1-6: runbook更新（確認ポイント/復旧/手動介入）
+- [x] S1-6: runbook更新（確認ポイント/復旧/手動介入）
+  - `docs/runbooks/dogfood-runbook.md`
 
 ## Dogfood TODO
 - [x] D0-1: tasklist から次の未完了を取得 (`task-next`)
@@ -102,7 +103,6 @@
   - `./scripts/e2e-smoke.sh ./target/debug/claw-loopd`
 
 ## 次の1手（着手順）
-1. S1-3: status可視化強化
-2. S1-4: 完了判定ガード回帰強化
-3. S1-5: stuck検知
-4. S1-6: runbook更新
+1. S2: 監視運用（stuck通知の頻度/閾値チューニング）
+2. 24h soak 本番条件実行と結果レビュー
+3. 必要なら retry/backoff と通知ポリシー再調整
