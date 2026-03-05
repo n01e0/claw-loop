@@ -109,6 +109,18 @@ enum Commands {
         #[arg(long)]
         run_id: Option<Uuid>,
     },
+    TaskNext {
+        #[arg(long, default_value = "docs/roadmaps/ack-integration-tasklist.md")]
+        file: PathBuf,
+    },
+    TaskCheck {
+        #[arg(long, default_value = "docs/roadmaps/ack-integration-tasklist.md")]
+        file: PathBuf,
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        done: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -252,6 +264,14 @@ struct GhPrView {
     merge_state_status: Option<String>,
     #[serde(rename = "autoMergeRequest")]
     auto_merge_request: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+struct TaskChecklistEntry {
+    line_no: usize,
+    done: bool,
+    id: String,
+    text: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -507,6 +527,31 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> {
         out.push(item);
     }
     Ok(out)
+}
+
+fn parse_task_checklist_entry(line_no: usize, line: &str) -> Option<TaskChecklistEntry> {
+    let trimmed = line.trim_start();
+    let (done, rest) = if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
+        (false, rest)
+    } else if let Some(rest) = trimmed.strip_prefix("- [x] ") {
+        (true, rest)
+    } else {
+        return None;
+    };
+
+    let (id_raw, text_raw) = rest.split_once(':')?;
+    let id = id_raw.trim().to_string();
+    if id.is_empty() {
+        return None;
+    }
+
+    let text = text_raw.trim().to_string();
+    Some(TaskChecklistEntry {
+        line_no,
+        done,
+        id,
+        text,
+    })
 }
 
 fn append_ack_idempotent(
@@ -2057,6 +2102,104 @@ fn cmd_sweep(repo: PathBuf, run_id: Option<Uuid>) -> Result<()> {
     Ok(())
 }
 
+fn cmd_task_next(file: PathBuf) -> Result<()> {
+    let content = fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
+    let lines: Vec<&str> = content.lines().collect();
+
+    let entries: Vec<TaskChecklistEntry> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| parse_task_checklist_entry(idx + 1, line))
+        .collect();
+
+    let total = entries.len();
+    let done_count = entries.iter().filter(|e| e.done).count();
+    let open_count = total.saturating_sub(done_count);
+    let next = entries.iter().find(|e| !e.done);
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "file": file,
+            "total": total,
+            "done": done_count,
+            "open": open_count,
+            "next": next.map(|e| serde_json::json!({
+                "line": e.line_no,
+                "id": e.id,
+                "text": e.text,
+            })),
+        }))?
+    );
+
+    Ok(())
+}
+
+fn cmd_task_check(file: PathBuf, id: String, done: bool) -> Result<()> {
+    let content = fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
+    let had_trailing_newline = content.ends_with('\n');
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+
+    let mut found_line = None;
+    let mut changed = false;
+
+    for (idx, line) in lines.iter_mut().enumerate() {
+        if let Some(entry) = parse_task_checklist_entry(idx + 1, line)
+            && entry.id == id
+        {
+            found_line = Some(idx + 1);
+            if entry.done != done {
+                if done {
+                    *line = line.replacen("[ ]", "[x]", 1);
+                } else {
+                    *line = line.replacen("[x]", "[ ]", 1);
+                }
+                changed = true;
+            }
+            break;
+        }
+    }
+
+    let line_no = match found_line {
+        Some(v) => v,
+        None => bail!("task id not found: {id}"),
+    };
+
+    if changed {
+        let mut rebuilt = lines.join("\n");
+        if had_trailing_newline {
+            rebuilt.push('\n');
+        }
+        fs::write(&file, rebuilt).with_context(|| format!("write {}", file.display()))?;
+    }
+
+    let entries: Vec<TaskChecklistEntry> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| parse_task_checklist_entry(idx + 1, line))
+        .collect();
+    let total = entries.len();
+    let done_count = entries.iter().filter(|e| e.done).count();
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "file": file,
+            "id": id,
+            "line": line_no,
+            "done": done,
+            "changed": changed,
+            "summary": {
+                "total": total,
+                "done": done_count,
+                "open": total.saturating_sub(done_count),
+            }
+        }))?
+    );
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -2114,6 +2257,8 @@ fn main() -> Result<()> {
             merge_method,
         } => cmd_track_pr(repo, run_id, gh_repo, pr, merge_method),
         Commands::Sweep { repo, run_id } => cmd_sweep(repo, run_id),
+        Commands::TaskNext { file } => cmd_task_next(file),
+        Commands::TaskCheck { file, id, done } => cmd_task_check(file, id, done),
     }
     .map_err(|e| {
         eprintln!("error: {e:?}");
@@ -2126,6 +2271,7 @@ mod tests {
     use super::{
         ack_retry_policy, classify_ack_failure_category, compute_backoff_sec,
         delivery_retry_backoff_sec, lease_window_sec, normalize_error_reason,
+        parse_task_checklist_entry,
     };
 
     #[test]
@@ -2215,5 +2361,18 @@ mod tests {
         let rate = ack_retry_policy("rate_limited", 3);
         assert!(rate.retryable);
         assert_eq!(rate.backoff_sec, 120);
+    }
+
+    #[test]
+    fn parse_task_checklist_entry_handles_checkbox_lines() {
+        let open = parse_task_checklist_entry(10, "- [ ] A1-5: define retry policy").unwrap();
+        assert!(!open.done);
+        assert_eq!(open.id, "A1-5");
+
+        let done = parse_task_checklist_entry(11, "  - [x] A2-1: idempotent ack").unwrap();
+        assert!(done.done);
+        assert_eq!(done.id, "A2-1");
+
+        assert!(parse_task_checklist_entry(12, "- [ ] malformed without colon").is_none());
     }
 }
