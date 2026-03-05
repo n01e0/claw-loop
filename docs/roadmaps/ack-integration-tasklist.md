@@ -22,6 +22,7 @@
 - [x] D0-1: tasklist から次の未完了を取得 (`task-next`)
 - [x] D0-2: tasklist のチェック状態をCLIで更新 (`task-check`)
 - [x] D0-3: runaway guard を追加（`--max-ticks` / `--max-runtime-sec`）
+- [x] D0-4: taskループ数ベースの上限を追加（`--max-task-loops`, default 10）
 - [ ] D1-1: tasklistの「次の未完了」を自動実行する runner エントリ
 
 ## Ack Integration TODO
