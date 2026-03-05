@@ -10,7 +10,7 @@ Thread-bound monitored Ralph loop daemon (Rust).
 ## Current status
 - Thread-bound CLI implemented (`start`, `daemon`, `stop`, `status`, `delivery-report`, `requeue-dead-letter`, `notify`, `track-pr`, `sweep`, `task-next`, `task-check`).
 - Safety guard for runaway loops:
-  - `start --max-ticks <N>`: auto-stop after N daemon ticks
+  - `start --max-ticks <N>`: auto-stop after N daemon ticks (default: 10)
   - `start --max-runtime-sec <SEC>`: auto-stop after wall-clock runtime cap
 - Per-run isolated state under `.ralph/runs/<run_id>/`.
 - Event log and lease heartbeat in place.
@@ -67,8 +67,8 @@ cargo build
 
 ```bash
 # 1) start daemon (OpenClaw delivery有効化するなら --deliver-openclaw を付ける)
-# runaway防止なら --max-ticks / --max-runtime-sec を併用
-cargo run -- start --repo . --session-key test --channel discord --thread-id thread-test --tick-sec 1 --deliver-openclaw --max-ticks 300 --max-runtime-sec 3600
+# max-ticks はデフォルト10。必要なら上書き
+cargo run -- start --repo . --session-key test --channel discord --thread-id thread-test --tick-sec 1 --deliver-openclaw --max-runtime-sec 3600
 
 # 2) bind PR tracking (example)
 cargo run -- track-pr --repo . --run-id <RUN_ID> --gh-repo n01e0/dimpact --pr 24 --merge-method merge
