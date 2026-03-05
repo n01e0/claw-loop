@@ -36,6 +36,9 @@ cargo build
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --all --all-features`
 - `./scripts/e2e-smoke.sh ./target/debug/claw-loopd`
+  - lifecycle (start/notify/stop)
+  - orphan sweep block
+  - single-writer lock rejection
 
 ## Quick test
 
