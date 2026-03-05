@@ -224,6 +224,8 @@ struct RunnerState {
     #[serde(default)]
     current_task_blocked_reason: Option<String>,
     #[serde(default)]
+    current_task_pr_url: Option<String>,
+    #[serde(default)]
     last_task_id: Option<String>,
     #[serde(default)]
     last_task_state: Option<RunnerTaskState>,
@@ -231,6 +233,8 @@ struct RunnerState {
     last_task_at: Option<DateTime<Utc>>,
     #[serde(default)]
     last_task_reason: Option<String>,
+    #[serde(default)]
+    last_task_pr_url: Option<String>,
     #[serde(default)]
     task_loops_started: u64,
     #[serde(default)]
@@ -788,6 +792,24 @@ fn clip_text(input: &str, max_chars: usize) -> String {
     }
     let clipped: String = input.chars().take(max_chars).collect();
     format!("{clipped}…")
+}
+
+fn extract_pr_url(line: &str) -> Option<String> {
+    line.split_whitespace().find_map(|token| {
+        let raw = token.strip_prefix("PR_URL=")?;
+        let trimmed = raw.trim_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    ',' | ';' | '(' | ')' | '[' | ']' | '<' | '>' | '"' | '\''
+                )
+        });
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
 }
 
 fn run_task_once(opts: TaskRunOptions<'_>) -> Result<TaskRunOutcome> {
@@ -1794,12 +1816,15 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             runner_state.last_task_state = Some(RunnerTaskState::Done);
                             runner_state.last_task_at = Some(now);
                             runner_state.last_task_reason = Some("checklist marked done".into());
+                            runner_state.last_task_pr_url =
+                                runner_state.current_task_pr_url.clone();
                             runner_state.current_task_id = None;
                             runner_state.current_task_text = None;
                             runner_state.current_task_line = None;
                             runner_state.current_task_started_at = None;
                             runner_state.current_task_state = None;
                             runner_state.current_task_blocked_reason = None;
+                            runner_state.current_task_pr_url = None;
                             write_runner_state(&dir, &runner_state)?;
                             task_done_now = task_checklist_done_count(&task_file_abs)?;
                             task_loops_completed =
@@ -1846,6 +1871,8 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             runner_state.last_task_at = Some(now);
                             runner_state.last_task_reason =
                                 Some("task missing from checklist".into());
+                            runner_state.last_task_pr_url =
+                                runner_state.current_task_pr_url.clone();
                             write_runner_state(&dir, &runner_state)?;
                             write_json(&dir.join("state.json"), &state)?;
                             queue_notification(
@@ -1867,6 +1894,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                     if runner_state.task_loops_started >= manifest.max_task_loops {
                         runner_state.paused = true;
                         runner_state.current_task_state = None;
+                        runner_state.current_task_pr_url = None;
                         runner_state.pause_reason = Some(format!(
                             "max_task_loops reached ({}/{})",
                             runner_state.task_loops_started, manifest.max_task_loops
@@ -1887,6 +1915,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                     } else if next.is_none() {
                         runner_state.paused = true;
                         runner_state.current_task_state = None;
+                        runner_state.current_task_pr_url = None;
                         runner_state.pause_reason = Some("all tasklist items completed".into());
                         write_runner_state(&dir, &runner_state)?;
                         state.status = LoopStatus::Waiting;
@@ -1907,6 +1936,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                         runner_state.current_task_started_at = Some(now);
                         runner_state.current_task_state = Some(RunnerTaskState::Queued);
                         runner_state.current_task_blocked_reason = None;
+                        runner_state.current_task_pr_url = None;
                         runner_state.paused = false;
                         runner_state.pause_reason = None;
                         write_runner_state(&dir, &runner_state)?;
@@ -1959,6 +1989,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             .unwrap_or("")
                             .trim()
                             .to_string();
+                        let first_line_pr_url = extract_pr_url(&first_stdout_line);
                         let task_label = runner
                             .task
                             .as_ref()
@@ -1983,6 +2014,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
 
                             runner_state.current_task_state = Some(RunnerTaskState::WaitingMerge);
                             runner_state.current_task_blocked_reason = None;
+                            runner_state.current_task_pr_url = first_line_pr_url.clone();
                             write_runner_state(&dir, &runner_state)?;
                             write_json(&dir.join("state.json"), &state)?;
 
@@ -2010,10 +2042,12 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             runner_state.current_task_state = Some(RunnerTaskState::Blocked);
                             runner_state.current_task_blocked_reason =
                                 Some(state.waiting_reason.clone());
+                            runner_state.current_task_pr_url = first_line_pr_url.clone();
                             runner_state.last_task_id = Some(task_label.clone());
                             runner_state.last_task_state = Some(RunnerTaskState::Blocked);
                             runner_state.last_task_at = Some(now);
                             runner_state.last_task_reason = Some(state.waiting_reason.clone());
+                            runner_state.last_task_pr_url = first_line_pr_url.clone();
                             write_runner_state(&dir, &runner_state)?;
 
                             write_json(&dir.join("state.json"), &state)?;
@@ -2039,12 +2073,14 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                 runner_state.last_task_at = Some(now);
                                 runner_state.last_task_reason =
                                     Some("runner success + auto-check".into());
+                                runner_state.last_task_pr_url = first_line_pr_url.clone();
                                 runner_state.current_task_id = None;
                                 runner_state.current_task_text = None;
                                 runner_state.current_task_line = None;
                                 runner_state.current_task_started_at = None;
                                 runner_state.current_task_state = None;
                                 runner_state.current_task_blocked_reason = None;
+                                runner_state.current_task_pr_url = None;
 
                                 queue_notification(
                                     &dir,
@@ -2062,6 +2098,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                 runner_state.current_task_started_at = Some(now);
                                 runner_state.current_task_state = Some(RunnerTaskState::Running);
                                 runner_state.current_task_blocked_reason = None;
+                                runner_state.current_task_pr_url = first_line_pr_url.clone();
                                 state.status = LoopStatus::Waiting;
                                 state.summary = format!("task running: {}", task.id);
                                 state.waiting_reason =
@@ -2280,23 +2317,48 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
     } else {
         "monitor_only"
     };
+    let last_task_pr_url = runner_state.last_task_pr_url.clone();
+    let visible_last_pr_url = runner_state
+        .current_task_pr_url
+        .clone()
+        .or_else(|| last_task_pr_url.clone());
+    let runner_current_view = serde_json::json!({
+        "id": runner_state.current_task_id.clone(),
+        "text": runner_state.current_task_text.clone(),
+        "line": runner_state.current_task_line,
+        "started_at": runner_state.current_task_started_at,
+        "state": runner_state.current_task_state.clone(),
+        "blocked_reason": runner_state.current_task_blocked_reason.clone(),
+        "pr_url": runner_state.current_task_pr_url.clone(),
+    });
+    let runner_last_view = serde_json::json!({
+        "id": runner_state.last_task_id.clone(),
+        "state": runner_state.last_task_state.clone(),
+        "at": runner_state.last_task_at,
+        "reason": runner_state.last_task_reason.clone(),
+        "pr_url": runner_state.last_task_pr_url.clone(),
+    });
     let runner_view = serde_json::json!({
         "mode": runner_mode,
         "task_runner_cmd": manifest.task_runner_cmd,
         "auto_check_on_success": manifest.auto_check_on_success,
         "task_loops_started": runner_state.task_loops_started,
-        "current_task_id": runner_state.current_task_id,
-        "current_task_text": runner_state.current_task_text,
+        "current_task_id": runner_state.current_task_id.clone(),
+        "current_task_text": runner_state.current_task_text.clone(),
         "current_task_line": runner_state.current_task_line,
         "current_task_started_at": runner_state.current_task_started_at,
-        "current_task_state": runner_state.current_task_state,
-        "current_task_blocked_reason": runner_state.current_task_blocked_reason,
-        "last_task_id": runner_state.last_task_id,
-        "last_task_state": runner_state.last_task_state,
+        "current_task_state": runner_state.current_task_state.clone(),
+        "current_task_blocked_reason": runner_state.current_task_blocked_reason.clone(),
+        "current_task_pr_url": runner_state.current_task_pr_url.clone(),
+        "last_task_id": runner_state.last_task_id.clone(),
+        "last_task_state": runner_state.last_task_state.clone(),
         "last_task_at": runner_state.last_task_at,
-        "last_task_reason": runner_state.last_task_reason,
+        "last_task_reason": runner_state.last_task_reason.clone(),
+        "last_task_pr_url": last_task_pr_url.clone(),
+        "current": runner_current_view,
+        "last": runner_last_view,
         "paused": runner_state.paused,
-        "pause_reason": runner_state.pause_reason,
+        "pause_reason": runner_state.pause_reason.clone(),
     });
 
     println!(
@@ -2320,6 +2382,7 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
             "task_done_current": task_done_current,
             "task_loops_completed": task_loops_completed,
             "runner": runner_view,
+            "last_pr_url": visible_last_pr_url,
             "queued_notifications_total": queued_total,
             "pending_notifications": pending,
             "dispatched_notifications": dispatched,
@@ -3089,8 +3152,8 @@ mod tests {
         DeadLetterEntry, DeliveryAck, DeliveryAttempt, DispatchedNotification, Manifest,
         Notification, ack_retry_policy, append_jsonl, classify_ack_failure_category,
         compute_auto_stop_reason, compute_backoff_sec, dead_letter_path, delivery_ack_path,
-        delivery_attempts_path, delivery_retry_backoff_sec, flush_notifications, lease_window_sec,
-        normalize_error_reason, parse_task_checklist_entry, read_jsonl,
+        delivery_attempts_path, delivery_retry_backoff_sec, extract_pr_url, flush_notifications,
+        lease_window_sec, normalize_error_reason, parse_task_checklist_entry, read_jsonl,
     };
     use chrono::{Duration, Utc};
     use std::{
@@ -3449,5 +3512,18 @@ mod tests {
         assert_eq!(done.id, "A2-1");
 
         assert!(parse_task_checklist_entry(12, "- [ ] malformed without colon").is_none());
+    }
+
+    #[test]
+    fn extract_pr_url_parses_task_contract_line() {
+        assert_eq!(
+            extract_pr_url("TASK_WAITING_MERGE PR_URL=https://github.com/n01e0/claw-loop/pull/42"),
+            Some("https://github.com/n01e0/claw-loop/pull/42".to_string())
+        );
+        assert_eq!(
+            extract_pr_url("TASK_DONE PR_URL=<https://github.com/n01e0/claw-loop/pull/99>"),
+            Some("https://github.com/n01e0/claw-loop/pull/99".to_string())
+        );
+        assert_eq!(extract_pr_url("TASK_BLOCKED: no PR"), None);
     }
 }
