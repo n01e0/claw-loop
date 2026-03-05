@@ -118,8 +118,21 @@ if runner.get("active_task_id") != "R1":
     raise SystemExit(f"expected active_task_id=R1, got {runner}")
 PY
 $BIN task-check --file "$TASKFILE" --id R1 --done true >/dev/null
-sleep 3
-STATUS1E="$($BIN status --repo "$WORKDIR" --run-id "$RUN1C")"
+STATUS1E=""
+for _ in {1..10}; do
+  STATUS1E="$($BIN status --repo "$WORKDIR" --run-id "$RUN1C")"
+  if python3 - <<'PY' "$STATUS1E"
+import json, sys
+obj = json.loads(sys.argv[1])
+runner = obj.get("runner") or {}
+ok = int(runner.get("task_loops_started", 0)) >= 2 and runner.get("active_task_id") == "R2"
+raise SystemExit(0 if ok else 1)
+PY
+  then
+    break
+  fi
+  sleep 1
+done
 python3 - <<'PY' "$STATUS1E"
 import json, sys
 obj = json.loads(sys.argv[1])
@@ -412,6 +425,182 @@ if not all(it.get("status") == "pending" for it in items):
     raise SystemExit(f"expected only pending items: {items}")
 if not any(it.get("event_id") == target for it in items):
     raise SystemExit(f"expected target event in pending report: {items}")
+PY
+
+echo "[e2e-smoke] case8 resend + ack consistency"
+cat > "$MOCKDIR/openclaw-ok" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exit 0
+EOF
+chmod +x "$MOCKDIR/openclaw-ok"
+
+OUT8="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-fail" CLAW_LOOPD_DELIVERY_MAX_ATTEMPTS=1 $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw)"
+RUN8="$(echo "$OUT8" | awk -F= '/^run_id=/{print $2}')"
+if [[ -z "$RUN8" ]]; then
+  echo "[e2e-smoke] failed to parse run8 id"
+  echo "$OUT8"
+  exit 1
+fi
+$BIN notify --repo "$WORKDIR" --run-id "$RUN8" --kind progress --message "run8 fail then resend" >/dev/null
+sleep 3
+REPORT8_FAIL="$($BIN delivery-report --repo "$WORKDIR" --run-id "$RUN8" --limit 10 --status failed)"
+EVENT8_ID="$(python3 - <<'PY' "$REPORT8_FAIL"
+import json, sys
+obj = json.loads(sys.argv[1])
+items = obj.get("items") or []
+if not items:
+    raise SystemExit(f"expected failed items for run8, got {items}")
+print(items[0]["event_id"])
+PY
+)"
+$BIN stop --repo "$WORKDIR" --run-id "$RUN8" >/dev/null || true
+sleep 1
+
+RUN8_DIR="$WORKDIR/.ralph/runs/$RUN8"
+python3 - <<'PY' "$RUN8_DIR" "$EVENT8_ID" "$RUN8"
+import json, pathlib, sys
+run_dir = pathlib.Path(sys.argv[1])
+event_id = sys.argv[2]
+run_id = sys.argv[3]
+dead_path = run_dir / "notify-dead-letter.jsonl"
+queue_path = run_dir / "notify-queue.jsonl"
+rows = [json.loads(line) for line in dead_path.read_text().splitlines() if line.strip()]
+keep = []
+target = None
+for row in rows:
+    if row.get("event_id") == event_id and target is None:
+        target = row
+    else:
+        keep.append(row)
+if target is None:
+    raise SystemExit(f"target dead-letter event not found: {event_id}")
+dead_path.write_text("" if not keep else "\n".join(json.dumps(r) for r in keep) + "\n")
+with queue_path.open("a") as qf:
+    qf.write(json.dumps({
+        "event_id": target["event_id"],
+        "run_id": run_id,
+        "ts": "2020-01-01T00:00:00Z",
+        "channel": "discord",
+        "thread_id": "test-thread",
+        "kind": target["kind"],
+        "message": target["message"],
+        "attempts": target["attempts"],
+        "next_retry_at": None,
+        "last_error": target.get("last_error"),
+    }) + "\n")
+PY
+
+CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-ok" $BIN daemon --repo "$WORKDIR" --run-id "$RUN8" --tick-sec 1 >/tmp/claw-loopd-e2e-run8.log 2>&1 || true
+sleep 1
+
+STATUS8="$($BIN status --repo "$WORKDIR" --run-id "$RUN8")"
+python3 - <<'PY' "$STATUS8"
+import json, sys
+obj = json.loads(sys.argv[1])
+if int(obj.get("pending_notifications", 0)) != 0:
+    raise SystemExit(f"expected pending_notifications=0 for run8, got {obj.get('pending_notifications')}")
+if int(obj.get("dispatched_notifications", 0)) < 1:
+    raise SystemExit(f"expected dispatched_notifications>=1 for run8, got {obj.get('dispatched_notifications')}")
+if int(obj.get("acked_total", 0)) < 1:
+    raise SystemExit(f"expected acked_total>=1 for run8, got {obj.get('acked_total')}")
+PY
+
+ACK8_PATH="$WORKDIR/.ralph/runs/$RUN8/notify-ack.jsonl"
+python3 - <<'PY' "$ACK8_PATH" "$EVENT8_ID"
+import json, sys
+path = sys.argv[1]
+event_id = sys.argv[2]
+rows = []
+for line in open(path):
+    line = line.strip()
+    if not line:
+        continue
+    row = json.loads(line)
+    if row.get("event_id") == event_id:
+        rows.append(row)
+if len(rows) < 2:
+    raise SystemExit(f"expected >=2 ack rows for event {event_id}, got {rows}")
+if not any(r.get("ok") is False for r in rows):
+    raise SystemExit(f"expected at least one failed ack row, got {rows}")
+if not any(r.get("ok") is True for r in rows):
+    raise SystemExit(f"expected at least one success ack row, got {rows}")
+keys = {(r.get("event_id"), r.get("attempts")) for r in rows}
+if len(keys) != len(rows):
+    raise SystemExit(f"expected no duplicate (event_id,attempts) keys, got {rows}")
+PY
+
+echo "[e2e-smoke] case9 recovery reconcile + ack dedupe"
+OUT9="$($BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1)"
+RUN9="$(echo "$OUT9" | awk -F= '/^run_id=/{print $2}')"
+if [[ -z "$RUN9" ]]; then
+  echo "[e2e-smoke] failed to parse run9 id"
+  echo "$OUT9"
+  exit 1
+fi
+$BIN notify --repo "$WORKDIR" --run-id "$RUN9" --kind progress --message "run9 reconcile seed" >/dev/null
+sleep 2
+$BIN stop --repo "$WORKDIR" --run-id "$RUN9" >/dev/null || true
+sleep 1
+
+RUN9_DIR="$WORKDIR/.ralph/runs/$RUN9"
+python3 - <<'PY' "$RUN9_DIR"
+import json, pathlib, sys
+run_dir = pathlib.Path(sys.argv[1])
+ack_path = run_dir / "notify-ack.jsonl"
+queue_path = run_dir / "notify-queue.jsonl"
+acks = [json.loads(line) for line in ack_path.read_text().splitlines() if line.strip()]
+ok = next((r for r in acks if r.get("ok") is True), None)
+if ok is None:
+    raise SystemExit(f"expected at least one success ack row: {acks}")
+with queue_path.open("a") as qf:
+    qf.write(json.dumps({
+        "event_id": ok["event_id"],
+        "run_id": ok["run_id"],
+        "ts": "2020-01-01T00:00:00Z",
+        "channel": "discord",
+        "thread_id": "test-thread",
+        "kind": "progress",
+        "message": "stale queued duplicate",
+        "attempts": 0,
+        "next_retry_at": None,
+        "last_error": None,
+    }) + "\n")
+with ack_path.open("a") as af:
+    af.write(json.dumps(ok) + "\n")
+PY
+
+$BIN daemon --repo "$WORKDIR" --run-id "$RUN9" --tick-sec 1 >/tmp/claw-loopd-e2e-run9.log 2>&1 || true
+
+python3 - <<'PY' "$RUN9_DIR"
+import json, pathlib, sys
+run_dir = pathlib.Path(sys.argv[1])
+queue_path = run_dir / "notify-queue.jsonl"
+ack_path = run_dir / "notify-ack.jsonl"
+dispatched_path = run_dir / "notify-dispatched.jsonl"
+
+def read_jsonl(path):
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+queue_rows = read_jsonl(queue_path)
+ack_rows = read_jsonl(ack_path)
+events = read_jsonl(run_dir / "events.jsonl")
+reconciles = [e for e in events if e.get("kind") == "delivery_reconciled"]
+if not reconciles:
+    raise SystemExit("expected delivery_reconciled event")
+last = reconciles[-1].get("extra") or {}
+if int(last.get("removed_stale_queued", 0)) < 1:
+    raise SystemExit(f"expected removed_stale_queued>=1, got {last}")
+if int(last.get("removed_ack_duplicates", 0)) < 1:
+    raise SystemExit(f"expected removed_ack_duplicates>=1, got {last}")
+keys = [(r.get("event_id"), r.get("attempts")) for r in ack_rows]
+if len(keys) != len(set(keys)):
+    raise SystemExit(f"expected ack keys deduped after reconcile, got duplicates in {ack_rows}")
+terminal_ids = {r.get("event_id") for r in read_jsonl(dispatched_path)}
+if any(r.get("event_id") in terminal_ids for r in queue_rows):
+    raise SystemExit(f"expected no stale queued terminal rows after reconcile, got queue={queue_rows}")
 PY
 
 echo "[e2e-smoke] ok"
