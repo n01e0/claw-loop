@@ -42,6 +42,10 @@ enum Commands {
         max_task_loops: u64,
         #[arg(long, default_value = "docs/roadmaps/ack-integration-tasklist.md")]
         task_file: PathBuf,
+        #[arg(long)]
+        task_runner_cmd: Option<String>,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        auto_check_on_success: bool,
     },
     Daemon {
         #[arg(long)]
@@ -131,6 +135,16 @@ enum Commands {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         done: bool,
     },
+    TaskRunOnce {
+        #[arg(long, default_value = "docs/roadmaps/ack-integration-tasklist.md")]
+        file: PathBuf,
+        #[arg(long)]
+        cmd: String,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        auto_check_on_success: bool,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -155,6 +169,10 @@ struct Manifest {
     task_file: PathBuf,
     #[serde(default)]
     task_done_baseline: u64,
+    #[serde(default)]
+    task_runner_cmd: Option<String>,
+    #[serde(default = "default_auto_check_on_success")]
+    auto_check_on_success: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -308,10 +326,16 @@ struct StartOptions {
     max_runtime_sec: Option<u64>,
     max_task_loops: u64,
     task_file: PathBuf,
+    task_runner_cmd: Option<String>,
+    auto_check_on_success: bool,
 }
 
 fn default_max_task_loops() -> u64 {
     10
+}
+
+fn default_auto_check_on_success() -> bool {
+    true
 }
 
 fn default_task_file() -> PathBuf {
@@ -619,6 +643,150 @@ fn task_checklist_done_count(file: &Path) -> Result<u64> {
         .filter(|entry| entry.done)
         .count() as u64;
     Ok(done)
+}
+
+fn load_task_checklist(file: &Path) -> Result<(String, Vec<String>, Vec<TaskChecklistEntry>)> {
+    let content = fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+    let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    let entries: Vec<TaskChecklistEntry> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| parse_task_checklist_entry(idx + 1, line))
+        .collect();
+    Ok((content, lines, entries))
+}
+
+fn update_task_check(file: &Path, id: &str, done: bool) -> Result<serde_json::Value> {
+    let (content, mut lines, entries) = load_task_checklist(file)?;
+    let had_trailing_newline = content.ends_with('\n');
+
+    let target = entries
+        .iter()
+        .find(|entry| entry.id == id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("task id not found: {id}"))?;
+
+    let idx = target.line_no.saturating_sub(1);
+    let mut changed = false;
+    if target.done != done {
+        if done {
+            lines[idx] = lines[idx].replacen("[ ]", "[x]", 1);
+        } else {
+            lines[idx] = lines[idx].replacen("[x]", "[ ]", 1);
+        }
+        changed = true;
+    }
+
+    if changed {
+        let mut rebuilt = lines.join("\n");
+        if had_trailing_newline {
+            rebuilt.push('\n');
+        }
+        fs::write(file, rebuilt).with_context(|| format!("write {}", file.display()))?;
+    }
+
+    let (_, _, updated_entries) = load_task_checklist(file)?;
+    let total = updated_entries.len();
+    let done_count = updated_entries.iter().filter(|entry| entry.done).count();
+
+    Ok(serde_json::json!({
+        "file": file,
+        "id": id,
+        "line": target.line_no,
+        "done": done,
+        "changed": changed,
+        "summary": {
+            "total": total,
+            "done": done_count,
+            "open": total.saturating_sub(done_count),
+        }
+    }))
+}
+
+#[derive(Debug)]
+struct TaskRunOutcome {
+    task: Option<TaskChecklistEntry>,
+    command: String,
+    executed: bool,
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    check_result: Option<serde_json::Value>,
+}
+
+fn clip_text(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    let clipped: String = input.chars().take(max_chars).collect();
+    format!("{clipped}…")
+}
+
+fn run_task_once(
+    task_file: &Path,
+    cmd: &str,
+    auto_check_on_success: bool,
+    dry_run: bool,
+    cwd: Option<&Path>,
+    run_id: Option<Uuid>,
+) -> Result<TaskRunOutcome> {
+    let (_, _, entries) = load_task_checklist(task_file)?;
+    let next = entries.iter().find(|entry| !entry.done).cloned();
+
+    let mut outcome = TaskRunOutcome {
+        task: next.clone(),
+        command: cmd.to_string(),
+        executed: false,
+        success: false,
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        check_result: None,
+    };
+
+    let Some(task) = next else {
+        return Ok(outcome);
+    };
+
+    if dry_run {
+        return Ok(outcome);
+    }
+
+    let mut command = Command::new("bash");
+    command
+        .arg("-lc")
+        .arg(cmd)
+        .env("CLAW_TASK_ID", &task.id)
+        .env("CLAW_TASK_TEXT", &task.text)
+        .env("CLAW_TASK_LINE", task.line_no.to_string())
+        .env("CLAW_TASK_FILE", task_file.to_string_lossy().to_string());
+
+    if let Some(run_id) = run_id {
+        command.env("CLAW_RUN_ID", run_id.to_string());
+    }
+
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+
+    let output = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("run task command: {cmd}"))?;
+
+    outcome.executed = true;
+    outcome.success = output.status.success();
+    outcome.exit_code = output.status.code();
+    outcome.stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    outcome.stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if outcome.success && auto_check_on_success {
+        outcome.check_result = Some(update_task_check(task_file, &task.id, true)?);
+    }
+
+    Ok(outcome)
 }
 
 fn append_ack_idempotent(
@@ -1423,6 +1591,8 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
         max_task_loops: opts.max_task_loops,
         task_file,
         task_done_baseline,
+        task_runner_cmd: opts.task_runner_cmd,
+        auto_check_on_success: opts.auto_check_on_success,
     };
     let state = State {
         version: 1,
@@ -1503,7 +1673,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
         let now = Utc::now();
 
         let task_file_abs = resolve_task_file_path(&manifest.repo_path, &manifest.task_file);
-        let task_done_now = match task_checklist_done_count(&task_file_abs) {
+        let mut task_done_now = match task_checklist_done_count(&task_file_abs) {
             Ok(v) => v,
             Err(err) => {
                 append_event(
@@ -1517,7 +1687,91 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                 manifest.task_done_baseline
             }
         };
-        let task_loops_completed = task_done_now.saturating_sub(manifest.task_done_baseline);
+        let mut task_loops_completed = task_done_now.saturating_sub(manifest.task_done_baseline);
+
+        if let Some(cmd) = manifest.task_runner_cmd.as_deref() {
+            let runner = run_task_once(
+                &task_file_abs,
+                cmd,
+                manifest.auto_check_on_success,
+                false,
+                Some(&manifest.repo_path),
+                Some(run_id),
+            )?;
+
+            append_event(
+                &dir,
+                "task_runner_tick",
+                serde_json::json!({
+                    "task": runner.task.as_ref().map(|t| serde_json::json!({
+                        "id": t.id,
+                        "line": t.line_no,
+                        "text": t.text,
+                    })),
+                    "command": runner.command,
+                    "executed": runner.executed,
+                    "success": runner.success,
+                    "exit_code": runner.exit_code,
+                    "auto_check_on_success": manifest.auto_check_on_success,
+                    "check_result": runner.check_result,
+                    "stdout": clip_text(&runner.stdout, 1000),
+                    "stderr": clip_text(&runner.stderr, 1000),
+                }),
+            )?;
+
+            if runner.task.is_none() {
+                state.version += 1;
+                state.status = LoopStatus::Done;
+                state.summary = "all tasklist items completed".into();
+                state.waiting_reason.clear();
+                state.updated_at = now;
+                write_json(&dir.join("state.json"), &state)?;
+                queue_notification(&dir, &manifest, "done", "all tasklist items completed")?;
+                let _ = flush_notifications(&dir, &manifest)?;
+                break;
+            }
+
+            if !runner.success {
+                state.version += 1;
+                state.status = LoopStatus::Blocked;
+                state.summary = format!(
+                    "task runner failed: {}",
+                    runner
+                        .task
+                        .as_ref()
+                        .map(|t| t.id.clone())
+                        .unwrap_or_else(|| "unknown".to_string())
+                );
+                state.waiting_reason = format!(
+                    "runner exit={:?}: {}",
+                    runner.exit_code,
+                    clip_text(&runner.stderr, 200)
+                );
+                state.updated_at = now;
+                write_json(&dir.join("state.json"), &state)?;
+                queue_notification(
+                    &dir,
+                    &manifest,
+                    "runner_failed",
+                    format!(
+                        "task runner failed for {}",
+                        runner
+                            .task
+                            .as_ref()
+                            .map(|t| t.id.clone())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    ),
+                )?;
+                let _ = flush_notifications(&dir, &manifest)?;
+                break;
+            }
+
+            task_done_now = match task_checklist_done_count(&task_file_abs) {
+                Ok(v) => v,
+                Err(_) => task_done_now,
+            };
+            task_loops_completed = task_done_now.saturating_sub(manifest.task_done_baseline);
+        }
 
         if let Some(reason) = compute_auto_stop_reason(
             task_loops_completed,
@@ -1742,6 +1996,9 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
             "task_done_baseline": manifest.task_done_baseline,
             "task_done_current": task_done_current,
             "task_loops_completed": task_loops_completed,
+            "task_runner_cmd": manifest.task_runner_cmd,
+            "auto_check_on_success": manifest.auto_check_on_success,
+            "runner_mode": if manifest.task_runner_cmd.is_some() { "dogfood" } else { "monitor_only" },
             "queued_notifications_total": queued_total,
             "pending_notifications": pending,
             "dispatched_notifications": dispatched,
@@ -2345,14 +2602,7 @@ fn cmd_sweep(repo: PathBuf, run_id: Option<Uuid>) -> Result<()> {
 }
 
 fn cmd_task_next(file: PathBuf) -> Result<()> {
-    let content = fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
-    let lines: Vec<&str> = content.lines().collect();
-
-    let entries: Vec<TaskChecklistEntry> = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, line)| parse_task_checklist_entry(idx + 1, line))
-        .collect();
+    let (_, _, entries) = load_task_checklist(&file)?;
 
     let total = entries.len();
     let done_count = entries.iter().filter(|e| e.done).count();
@@ -2378,64 +2628,44 @@ fn cmd_task_next(file: PathBuf) -> Result<()> {
 }
 
 fn cmd_task_check(file: PathBuf, id: String, done: bool) -> Result<()> {
-    let content = fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
-    let had_trailing_newline = content.ends_with('\n');
-    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    let result = update_task_check(&file, &id, done)?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
 
-    let mut found_line = None;
-    let mut changed = false;
-
-    for (idx, line) in lines.iter_mut().enumerate() {
-        if let Some(entry) = parse_task_checklist_entry(idx + 1, line)
-            && entry.id == id
-        {
-            found_line = Some(idx + 1);
-            if entry.done != done {
-                if done {
-                    *line = line.replacen("[ ]", "[x]", 1);
-                } else {
-                    *line = line.replacen("[x]", "[ ]", 1);
-                }
-                changed = true;
-            }
-            break;
-        }
-    }
-
-    let line_no = match found_line {
-        Some(v) => v,
-        None => bail!("task id not found: {id}"),
-    };
-
-    if changed {
-        let mut rebuilt = lines.join("\n");
-        if had_trailing_newline {
-            rebuilt.push('\n');
-        }
-        fs::write(&file, rebuilt).with_context(|| format!("write {}", file.display()))?;
-    }
-
-    let entries: Vec<TaskChecklistEntry> = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, line)| parse_task_checklist_entry(idx + 1, line))
-        .collect();
-    let total = entries.len();
-    let done_count = entries.iter().filter(|e| e.done).count();
+fn cmd_task_run_once(
+    file: PathBuf,
+    cmd: String,
+    auto_check_on_success: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let outcome = run_task_once(
+        &file,
+        &cmd,
+        auto_check_on_success,
+        dry_run,
+        Some(Path::new(".")),
+        None,
+    )?;
 
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "file": file,
-            "id": id,
-            "line": line_no,
-            "done": done,
-            "changed": changed,
-            "summary": {
-                "total": total,
-                "done": done_count,
-                "open": total.saturating_sub(done_count),
-            }
+            "task": outcome.task.as_ref().map(|t| serde_json::json!({
+                "line": t.line_no,
+                "id": t.id,
+                "text": t.text,
+            })),
+            "command": outcome.command,
+            "dry_run": dry_run,
+            "executed": outcome.executed,
+            "success": outcome.success,
+            "exit_code": outcome.exit_code,
+            "auto_check_on_success": auto_check_on_success,
+            "check_result": outcome.check_result,
+            "stdout": outcome.stdout,
+            "stderr": outcome.stderr,
         }))?
     );
 
@@ -2458,6 +2688,8 @@ fn main() -> Result<()> {
             max_runtime_sec,
             max_task_loops,
             task_file,
+            task_runner_cmd,
+            auto_check_on_success,
         } => cmd_start(StartOptions {
             repo,
             session_key,
@@ -2470,6 +2702,8 @@ fn main() -> Result<()> {
             max_runtime_sec,
             max_task_loops,
             task_file,
+            task_runner_cmd,
+            auto_check_on_success,
         }),
         Commands::Daemon {
             repo,
@@ -2513,6 +2747,12 @@ fn main() -> Result<()> {
         Commands::Sweep { repo, run_id } => cmd_sweep(repo, run_id),
         Commands::TaskNext { file } => cmd_task_next(file),
         Commands::TaskCheck { file, id, done } => cmd_task_check(file, id, done),
+        Commands::TaskRunOnce {
+            file,
+            cmd,
+            auto_check_on_success,
+            dry_run,
+        } => cmd_task_run_once(file, cmd, auto_check_on_success, dry_run),
     }
     .map_err(|e| {
         eprintln!("error: {e:?}");
