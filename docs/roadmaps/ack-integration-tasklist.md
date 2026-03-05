@@ -25,6 +25,14 @@
 - [x] T4: A3-2 e2e拡張（再送/復帰/ack整合）
 - [x] T5: docs/tasklist最終更新＋完了報告
 
+## Current Execution Plan v2 (approved: visibility/safety first)
+- [ ] S1-1: タスク状態モデルを固定（`queued/running/waiting_merge/blocked/done`）
+- [ ] S1-2: スレ通知契約を固定（`task_started/task_waiting_merge/task_done/task_blocked` 必須）
+- [ ] S1-3: `status` 可視化強化（current/last/blocked reason/last PR URL）
+- [ ] S1-4: 完了判定ガードの回帰強化（`TASK_DONE + PR_URL + merged` 必須）
+- [ ] S1-5: stuck検知（状態変化なしの待機を通知）
+- [ ] S1-6: runbook更新（確認ポイント/復旧/手動介入）
+
 ## Dogfood TODO
 - [x] D0-1: tasklist から次の未完了を取得 (`task-next`)
 - [x] D0-2: tasklist のチェック状態をCLIで更新 (`task-check`)
@@ -93,6 +101,9 @@
   - `./scripts/e2e-smoke.sh ./target/debug/claw-loopd`
 
 ## 次の1手（着手順）
-1. 24h soak 実行（本番相当条件）と結果収集
-2. soak結果を踏まえた retry/backoff パラメータ再評価（必要時）
-3. ack連携フェーズの最終クローズ（PR/リリースノート反映）
+1. S1-1: タスク状態モデル固定
+2. S1-2: スレ通知契約固定
+3. S1-3: status可視化強化
+4. S1-4: 完了判定ガード回帰強化
+5. S1-5: stuck検知
+6. S1-6: runbook更新
