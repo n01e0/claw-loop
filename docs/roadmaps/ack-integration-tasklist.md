@@ -18,6 +18,13 @@
 - [x] failed reason normalization + histogram/trend
 - [x] CI (`fmt/clippy/test/e2e-smoke`)
 
+## Current Execution Plan (approved)
+- [ ] T1: A2-3の状態遷移ルールを仕様化（遷移表＋禁止遷移を文書化）
+- [ ] T2: A2-3を実装（遷移ルールをコードへ反映）
+- [ ] T3: A3-1 unit test追加（A2-3遷移と境界ケース）
+- [ ] T4: A3-2 e2e拡張（再送/復帰/ack整合）
+- [ ] T5: docs/tasklist最終更新＋完了報告
+
 ## Dogfood TODO
 - [x] D0-1: tasklist から次の未完了を取得 (`task-next`)
 - [x] D0-2: tasklist のチェック状態をCLIで更新 (`task-check`)
