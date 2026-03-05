@@ -75,6 +75,12 @@ enum Commands {
         #[arg(long, default_value = "merge")]
         merge_method: String,
     },
+    Sweep {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        run_id: Option<Uuid>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -387,6 +393,22 @@ fn compute_backoff_sec(unchanged_polls: u32) -> i64 {
     }
 }
 
+fn lease_window_sec(tick_sec: u64) -> i64 {
+    // Keep detection reasonably fast while allowing scheduler jitter.
+    // tick=60s -> lease=90s.
+    std::cmp::max(45, tick_sec as i64 + 30)
+}
+
+fn process_matches_run(pid: u32, run_id: Uuid) -> bool {
+    let cmdline_path = PathBuf::from(format!("/proc/{pid}/cmdline"));
+    let data = match fs::read(cmdline_path) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    let cmdline = String::from_utf8_lossy(&data).replace('\0', " ");
+    cmdline.contains("claw-loopd") && cmdline.contains(&run_id.to_string())
+}
+
 fn reduce_pr_tracking(run_dir: &Path, manifest: &Manifest, state: &mut State) -> Result<bool> {
     let tracking_path = pr_tracking_path(run_dir);
     if !tracking_path.exists() {
@@ -606,7 +628,7 @@ fn cmd_start(
         status: LoopStatus::Running,
         summary: "daemon started".into(),
         waiting_reason: String::new(),
-        lease_expires_at: now + chrono::Duration::seconds((tick_sec as i64) * 3),
+        lease_expires_at: now + chrono::Duration::seconds(lease_window_sec(tick_sec)),
         updated_at: now,
     };
 
@@ -676,7 +698,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
         state.version += 1;
         state.updated_at = Utc::now();
         state.lease_expires_at =
-            state.updated_at + chrono::Duration::seconds((tick_sec as i64) * 3);
+            state.updated_at + chrono::Duration::seconds(lease_window_sec(tick_sec));
 
         let pr_changed = reduce_pr_tracking(&dir, &manifest, &mut state)?;
         write_json(&dir.join("state.json"), &state)?;
@@ -816,9 +838,115 @@ fn cmd_track_pr(
     Ok(())
 }
 
+fn reconcile_orphan_if_needed(repo: &Path, run_id: Uuid) -> Result<Option<&'static str>> {
+    let dir = run_dir(repo, run_id);
+    if !dir.exists() {
+        return Ok(None);
+    }
+
+    let manifest: Manifest = read_json(&dir.join("manifest.json"))?;
+    let mut state: State = read_json(&dir.join("state.json"))?;
+
+    if matches!(
+        state.status,
+        LoopStatus::Done | LoopStatus::Failed | LoopStatus::Stopped
+    ) {
+        let _ = flush_notifications(&dir)?;
+        return Ok(Some("terminal"));
+    }
+
+    let now = Utc::now();
+    let lease_expired = now > state.lease_expires_at;
+    let daemon_alive = process_matches_run(manifest.daemon_pid, run_id);
+
+    if lease_expired && !daemon_alive {
+        state.version += 1;
+        state.status = LoopStatus::Blocked;
+        state.summary = format!(
+            "orphan detected: daemon pid {} missing after lease expiry",
+            manifest.daemon_pid
+        );
+        state.waiting_reason = "daemon orphan detected".into();
+        state.updated_at = now;
+        write_json(&dir.join("state.json"), &state)?;
+
+        append_event(
+            &dir,
+            "orphan_blocked",
+            serde_json::json!({
+                "daemon_pid": manifest.daemon_pid,
+                "lease_expires_at": state.lease_expires_at,
+                "now": now,
+            }),
+        )?;
+
+        queue_notification(
+            &dir,
+            &manifest,
+            "orphan_blocked",
+            format!(
+                "run blocked: daemon pid {} missing after lease expiry",
+                manifest.daemon_pid
+            ),
+        )?;
+
+        let _ = flush_notifications(&dir)?;
+        return Ok(Some("blocked_orphan"));
+    }
+
+    let _ = flush_notifications(&dir)?;
+    Ok(Some("ok"))
+}
+
+fn cmd_sweep(repo: PathBuf, run_id: Option<Uuid>) -> Result<()> {
+    let mut scanned = 0usize;
+    let mut blocked_orphan = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+
+    let mut run_ids: Vec<Uuid> = Vec::new();
+    if let Some(id) = run_id {
+        run_ids.push(id);
+    } else {
+        let root = runs_root(&repo);
+        if root.exists() {
+            for entry in fs::read_dir(root)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if let Ok(id) = Uuid::parse_str(&name) {
+                    run_ids.push(id);
+                }
+            }
+        }
+    }
+
+    for id in run_ids {
+        scanned += 1;
+        match reconcile_orphan_if_needed(&repo, id) {
+            Ok(Some("blocked_orphan")) => blocked_orphan += 1,
+            Ok(_) => {}
+            Err(err) => errors.push(format!("{}: {}", id, err)),
+        }
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "scanned": scanned,
+            "blocked_orphan": blocked_orphan,
+            "errors": errors,
+        }))?
+    );
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::compute_backoff_sec;
+    use super::{compute_backoff_sec, lease_window_sec};
 
     #[test]
     fn backoff_schedule_is_expected() {
@@ -827,6 +955,13 @@ mod tests {
         assert_eq!(compute_backoff_sec(2), 240);
         assert_eq!(compute_backoff_sec(3), 300);
         assert_eq!(compute_backoff_sec(99), 300);
+    }
+
+    #[test]
+    fn lease_window_defaults() {
+        assert_eq!(lease_window_sec(60), 90);
+        assert_eq!(lease_window_sec(30), 60);
+        assert_eq!(lease_window_sec(1), 45);
     }
 }
 
@@ -869,6 +1004,7 @@ fn main() -> Result<()> {
             pr,
             merge_method,
         } => cmd_track_pr(repo, run_id, gh_repo, pr, merge_method),
+        Commands::Sweep { repo, run_id } => cmd_sweep(repo, run_id),
     }
     .map_err(|e| {
         eprintln!("error: {e:?}");
