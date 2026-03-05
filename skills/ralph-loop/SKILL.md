@@ -17,6 +17,7 @@ Collect all of these before start:
 - dogfood runner command (`--task-runner-cmd`) ※未指定時は monitor_only
 - 推奨 runner: `scripts/rl-task-agent.sh`（PR作成→auto-merge→merge確認まで実施）
 - `--auto-check-on-success` default は `true`（runner成功時に自動チェック）
+- `--requester-user-id <discord_user_id>`（完了時メンション先。固定値は使わない）
 
 Never start without `thread_id` + `session_key`.
 
@@ -28,7 +29,7 @@ Never start without `thread_id` + `session_key`.
    - scope/constraints
    - if tasklist is not approved yet, run `ralph-planning-gate` first
 2. Start daemon:
-   - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --tick-sec 60 --deliver-openclaw --max-task-loops 10 --max-runtime-sec 3600 --task-runner-cmd './scripts/rl-task-agent.sh'`
+   - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --requester-user-id <discord_user_id> --tick-sec 60 --deliver-openclaw --max-task-loops 10 --max-runtime-sec 3600 --task-runner-cmd './scripts/rl-task-agent.sh'`
    - default: runner成功で自動チェックして次へ進む（`--auto-check-on-success=true`）
    - `--auto-check-on-success=false` で完了確認待ちモード（進行中タスクが完了チェックされるまで次は開始しない）
 3. Post `run_id` in-thread immediately.
