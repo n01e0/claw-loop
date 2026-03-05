@@ -15,8 +15,10 @@ Thread-bound monitored Ralph loop daemon (Rust).
 - Optional OpenClaw delivery bridge (`--deliver-openclaw`):
   - sends notifications via `openclaw message send`
   - keeps unsent events in queue for retry
-- Optional gh binary override for PR reducer tests:
+  - tracks attempts/backoff/last_error and delivery metrics
+- Optional binary overrides for deterministic tests:
   - `CLAW_LOOPD_GH_BIN=/path/to/mock-gh`
+  - `CLAW_LOOPD_OPENCLAW_BIN=/path/to/mock-openclaw`
 - PR tracking reducer in daemon tick:
   - polls only while `waiting`
   - backoff (60s -> 120s -> 240s -> 300s)
@@ -55,6 +57,9 @@ cargo run -- track-pr --repo . --run-id <RUN_ID> --gh-repo n01e0/dimpact --pr 24
 
 # 3) inspect status
 cargo run -- status --repo . --run-id <RUN_ID>
+
+# 3.1) event-level delivery report
+cargo run -- delivery-report --repo . --run-id <RUN_ID> --limit 20
 
 # (任意) delivery bridge を送信せず検証
 CLAW_LOOPD_OPENCLAW_DRY_RUN=1 cargo run -- start --repo . --session-key test --channel discord --thread-id thread-test --tick-sec 1 --deliver-openclaw

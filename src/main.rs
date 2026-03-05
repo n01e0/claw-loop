@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -54,6 +54,14 @@ enum Commands {
         repo: PathBuf,
         #[arg(long)]
         run_id: Uuid,
+    },
+    DeliveryReport {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        run_id: Uuid,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
     Notify {
         #[arg(long)]
@@ -163,6 +171,17 @@ struct DeliveryMetrics {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+struct DeliveryAttempt {
+    event_id: Uuid,
+    run_id: Uuid,
+    attempted_at: DateTime<Utc>,
+    success: bool,
+    attempts: u32,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct PrTracking {
     gh_repo: String,
     pr: u64,
@@ -266,6 +285,10 @@ fn pr_tracking_path(run_dir: &Path) -> PathBuf {
 
 fn delivery_metrics_path(run_dir: &Path) -> PathBuf {
     run_dir.join("notify-metrics.json")
+}
+
+fn delivery_attempts_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("notify-attempts.jsonl")
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -435,6 +458,7 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> {
 fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
     let queue_path = run_dir.join("notify-queue.jsonl");
     let dispatched_path = run_dir.join("notify-dispatched.jsonl");
+    let attempts_path = delivery_attempts_path(run_dir);
     let metrics_path = delivery_metrics_path(run_dir);
 
     let queued = read_jsonl::<Notification>(&queue_path)?;
@@ -481,6 +505,16 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
 
         match delivery_result {
             Ok(()) => {
+                let attempt = DeliveryAttempt {
+                    event_id: n.event_id,
+                    run_id: n.run_id,
+                    attempted_at: now,
+                    success: true,
+                    attempts: n.attempts,
+                    error: None,
+                };
+                append_jsonl(&attempts_path, &attempt)?;
+
                 let d = DispatchedNotification {
                     event_id: n.event_id,
                     run_id: n.run_id,
@@ -502,6 +536,16 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
             }
             Err(err) => {
                 let err_text = err.to_string();
+                let attempt = DeliveryAttempt {
+                    event_id: n.event_id,
+                    run_id: n.run_id,
+                    attempted_at: now,
+                    success: false,
+                    attempts: n.attempts,
+                    error: Some(err_text.clone()),
+                };
+                append_jsonl(&attempts_path, &attempt)?;
+
                 let backoff = delivery_retry_backoff_sec(n.attempts);
                 n.next_retry_at = Some(now + chrono::Duration::seconds(backoff));
                 n.last_error = Some(err_text.clone());
@@ -984,6 +1028,7 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
     let queued_items = read_jsonl::<Notification>(&dir.join("notify-queue.jsonl"))?;
     let dispatched_items =
         read_jsonl::<DispatchedNotification>(&dir.join("notify-dispatched.jsonl"))?;
+    let attempt_items = read_jsonl::<DeliveryAttempt>(&delivery_attempts_path(&dir))?;
 
     let mut seen = HashSet::new();
     for d in &dispatched_items {
@@ -996,6 +1041,8 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
 
     let queued_total = queued_items.len();
     let dispatched = dispatched_items.len();
+    let attempts_total = attempt_items.len();
+    let last_attempt_at = attempt_items.iter().map(|a| a.attempted_at).max();
     let next_retry_at = queued_items.iter().filter_map(|n| n.next_retry_at).min();
 
     let pr_tracking = if pr_tracking_path(&dir).exists() {
@@ -1024,6 +1071,8 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
             "queued_notifications_total": queued_total,
             "pending_notifications": pending,
             "dispatched_notifications": dispatched,
+            "delivery_attempts_total": attempts_total,
+            "last_attempt_at": last_attempt_at,
             "next_retry_at": next_retry_at,
             "daemon_pid": manifest.daemon_pid,
             "deliver_openclaw": manifest.deliver_openclaw,
@@ -1031,6 +1080,97 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
             "delivery_metrics": delivery_metrics
         }))?
     );
+    Ok(())
+}
+
+fn cmd_delivery_report(repo: PathBuf, run_id: Uuid, limit: usize) -> Result<()> {
+    let dir = run_dir(&repo, run_id);
+    if !dir.exists() {
+        bail!("run directory not found: {}", dir.display());
+    }
+
+    let queued_items = read_jsonl::<Notification>(&dir.join("notify-queue.jsonl"))?;
+    let dispatched_items =
+        read_jsonl::<DispatchedNotification>(&dir.join("notify-dispatched.jsonl"))?;
+    let attempt_items = read_jsonl::<DeliveryAttempt>(&delivery_attempts_path(&dir))?;
+
+    let mut latest_attempt: HashMap<Uuid, DeliveryAttempt> = HashMap::new();
+    for a in attempt_items {
+        match latest_attempt.get(&a.event_id) {
+            Some(prev) if prev.attempted_at >= a.attempted_at => {}
+            _ => {
+                latest_attempt.insert(a.event_id, a);
+            }
+        }
+    }
+
+    let mut rows: Vec<(DateTime<Utc>, serde_json::Value)> = Vec::new();
+    let mut seen: HashSet<Uuid> = HashSet::new();
+
+    for d in &dispatched_items {
+        seen.insert(d.event_id);
+        let last_attempt = latest_attempt.get(&d.event_id);
+        let last_activity = last_attempt
+            .map(|a| a.attempted_at)
+            .unwrap_or(d.dispatched_at);
+
+        rows.push((
+            last_activity,
+            serde_json::json!({
+                "event_id": d.event_id,
+                "status": "delivered",
+                "kind": d.kind,
+                "message": d.message,
+                "attempts": d.attempts,
+                "last_activity": last_activity,
+                "dispatched_at": d.dispatched_at,
+                "last_error": last_attempt.and_then(|a| a.error.clone()),
+            }),
+        ));
+    }
+
+    for q in &queued_items {
+        if seen.contains(&q.event_id) {
+            continue;
+        }
+
+        let last_attempt = latest_attempt.get(&q.event_id);
+        let last_activity = last_attempt.map(|a| a.attempted_at).unwrap_or(q.ts);
+
+        rows.push((
+            last_activity,
+            serde_json::json!({
+                "event_id": q.event_id,
+                "status": "pending",
+                "kind": q.kind,
+                "message": q.message,
+                "attempts": q.attempts,
+                "last_activity": last_activity,
+                "next_retry_at": q.next_retry_at,
+                "last_error": q.last_error,
+            }),
+        ));
+    }
+
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    let items: Vec<serde_json::Value> = rows.into_iter().take(limit).map(|(_, v)| v).collect();
+
+    let pending_count = queued_items
+        .iter()
+        .filter(|q| !dispatched_items.iter().any(|d| d.event_id == q.event_id))
+        .count();
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "run_id": run_id,
+            "pending_count": pending_count,
+            "delivered_count": dispatched_items.len(),
+            "attempt_count": latest_attempt.len(),
+            "items": items,
+        }))?
+    );
+
     Ok(())
 }
 
@@ -1273,6 +1413,11 @@ fn main() -> Result<()> {
         } => cmd_daemon(repo, run_id, tick_sec),
         Commands::Stop { repo, run_id } => cmd_stop(repo, run_id),
         Commands::Status { repo, run_id } => cmd_status(repo, run_id),
+        Commands::DeliveryReport {
+            repo,
+            run_id,
+            limit,
+        } => cmd_delivery_report(repo, run_id, limit),
         Commands::Notify {
             repo,
             run_id,
