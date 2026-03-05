@@ -181,17 +181,81 @@ if int(metrics.get("retried_total", 0)) < 1:
 if int(obj.get("pending_notifications", 0)) != 0:
     raise SystemExit(f"expected pending_notifications=0, got {obj.get('pending_notifications')}")
 PY
-REPORT5="$($BIN delivery-report --repo "$WORKDIR" --run-id "$RUN5" --limit 5)"
+REPORT5="$($BIN delivery-report --repo "$WORKDIR" --run-id "$RUN5" --limit 5 --status delivered)"
 python3 - <<'PY' "$REPORT5"
 import json, sys
 obj = json.loads(sys.argv[1])
 items = obj.get("items") or []
 if not items:
     raise SystemExit("expected non-empty delivery report items")
-if not any(it.get("status") == "delivered" for it in items):
-    raise SystemExit(f"expected delivered item in report: {items}")
+if not all(it.get("status") == "delivered" for it in items):
+    raise SystemExit(f"expected only delivered items in report: {items}")
 PY
 $BIN stop --repo "$WORKDIR" --run-id "$RUN5" >/dev/null || true
 sleep 1
+
+echo "[e2e-smoke] case6 dead-letter + report filter"
+cat > "$MOCKDIR/openclaw-fail" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "mock openclaw permanent failure" >&2
+exit 1
+EOF
+chmod +x "$MOCKDIR/openclaw-fail"
+
+OUT6="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-fail" CLAW_LOOPD_DELIVERY_MAX_ATTEMPTS=1 $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw)"
+RUN6="$(echo "$OUT6" | awk -F= '/^run_id=/{print $2}')"
+if [[ -z "$RUN6" ]]; then
+  echo "[e2e-smoke] failed to parse run6 id"
+  echo "$OUT6"
+  exit 1
+fi
+$BIN notify --repo "$WORKDIR" --run-id "$RUN6" --kind progress --message "should dead-letter" >/dev/null
+sleep 3
+STATUS6="$($BIN status --repo "$WORKDIR" --run-id "$RUN6")"
+python3 - <<'PY' "$STATUS6"
+import json, sys
+obj = json.loads(sys.argv[1])
+metrics = obj.get("delivery_metrics") or {}
+if int(obj.get("dead_letter_total", 0)) < 1:
+    raise SystemExit(f"expected dead_letter_total>=1, got {obj.get('dead_letter_total')}")
+if int(metrics.get("dead_letter_total", 0)) < 1:
+    raise SystemExit(f"expected metrics.dead_letter_total>=1, got {metrics}")
+if int(obj.get("pending_notifications", 0)) != 0:
+    raise SystemExit(f"expected pending_notifications=0, got {obj.get('pending_notifications')}")
+PY
+REPORT6="$($BIN delivery-report --repo "$WORKDIR" --run-id "$RUN6" --limit 5 --status failed)"
+python3 - <<'PY' "$REPORT6"
+import json, sys
+obj = json.loads(sys.argv[1])
+items = obj.get("items") or []
+if not items:
+    raise SystemExit("expected failed items in delivery-report")
+if not all(it.get("status") == "failed" for it in items):
+    raise SystemExit(f"expected only failed items: {items}")
+PY
+
+echo "[e2e-smoke] case7 dead-letter requeue"
+$BIN stop --repo "$WORKDIR" --run-id "$RUN6" >/dev/null || true
+sleep 1
+
+REQUEUE6="$($BIN requeue-dead-letter --repo "$WORKDIR" --run-id "$RUN6" --limit 1 --reset-attempts)"
+python3 - <<'PY' "$REQUEUE6"
+import json, sys
+obj = json.loads(sys.argv[1])
+if int(obj.get("requeued", 0)) < 1:
+    raise SystemExit(f"expected requeued>=1, got {obj}")
+PY
+
+REPORT6B="$($BIN delivery-report --repo "$WORKDIR" --run-id "$RUN6" --limit 5 --status pending)"
+python3 - <<'PY' "$REPORT6B"
+import json, sys
+obj = json.loads(sys.argv[1])
+items = obj.get("items") or []
+if not items:
+    raise SystemExit("expected pending items after dead-letter requeue")
+if not all(it.get("status") == "pending" for it in items):
+    raise SystemExit(f"expected only pending items: {items}")
+PY
 
 echo "[e2e-smoke] ok"
