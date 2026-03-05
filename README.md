@@ -8,7 +8,7 @@ Thread-bound monitored Ralph loop daemon (Rust).
 - Guarantee explicit stop/blocked/done visibility.
 
 ## Current status
-- Thread-bound CLI implemented (`start`, `daemon`, `stop`, `status`, `delivery-report`, `requeue-dead-letter`, `notify`, `track-pr`, `sweep`).
+- Thread-bound CLI implemented (`start`, `daemon`, `stop`, `status`, `delivery-report`, `requeue-dead-letter`, `notify`, `track-pr`, `sweep`, `task-next`, `task-check`).
 - Per-run isolated state under `.ralph/runs/<run_id>/`.
 - Event log and lease heartbeat in place.
 - Notification queue + dispatcher log (`notify-queue.jsonl` -> `notify-dispatched.jsonl`) in place.
@@ -35,7 +35,7 @@ Thread-bound monitored Ralph loop daemon (Rust).
 - Orphan/stale guard via `sweep` command:
   - checks lease expiry against daemon process ownership
   - marks run `blocked` when lease expired and daemon process is gone
-- Remaining TODO: OpenClaw delivery acknowledgement integration + long-run soak tests.
+- Remaining TODO: dead-letter/ack遷移の最終固定 (A2-3) + dogfood自走入口の拡張 + long-run soak tests.
 - Roadmap / tasklist: `docs/roadmaps/ack-integration-tasklist.md`
 - Ack contract: `docs/specs/ack-contract.md`
 - Ack retry policy: `docs/specs/ack-retry-policy.md`
@@ -85,6 +85,12 @@ cargo run -- requeue-dead-letter --repo . --run-id <RUN_ID> --event-id <EVENT_ID
 
 # 3.3) dry-run requeue (state変更なし)
 cargo run -- requeue-dead-letter --repo . --run-id <RUN_ID> --event-id <EVENT_ID> --limit 1 --reset-attempts --dry-run
+
+# 3.4) dogfood: 次の未完了タスクを取得
+cargo run -- task-next
+
+# 3.5) dogfood: タスクを完了チェック
+cargo run -- task-check --id A1-5 --done
 
 # (任意) delivery bridge を送信せず検証
 CLAW_LOOPD_OPENCLAW_DRY_RUN=1 cargo run -- start --repo . --session-key test --channel discord --thread-id thread-test --tick-sec 1 --deliver-openclaw
