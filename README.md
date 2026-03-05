@@ -51,6 +51,7 @@ cargo build
   - delivery retry/backoff metrics with mocked openclaw
   - dead-letter transition + failed-only report filter
   - dead-letter requeue back to pending queue
+  - requeue idempotency (`--event-id`) + dry-run behavior
 
 ## Quick test
 
@@ -69,7 +70,10 @@ cargo run -- delivery-report --repo . --run-id <RUN_ID> --limit 20 --status all
 # status: all|pending|delivered|failed
 
 # 3.2) requeue dead-letter entries
-cargo run -- requeue-dead-letter --repo . --run-id <RUN_ID> --limit 10 --reset-attempts
+cargo run -- requeue-dead-letter --repo . --run-id <RUN_ID> --event-id <EVENT_ID> --limit 1 --reset-attempts
+
+# 3.3) dry-run requeue (state変更なし)
+cargo run -- requeue-dead-letter --repo . --run-id <RUN_ID> --event-id <EVENT_ID> --limit 1 --reset-attempts --dry-run
 
 # (任意) delivery bridge を送信せず検証
 CLAW_LOOPD_OPENCLAW_DRY_RUN=1 cargo run -- start --repo . --session-key test --channel discord --thread-id thread-test --tick-sec 1 --deliver-openclaw
