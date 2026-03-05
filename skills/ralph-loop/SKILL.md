@@ -56,16 +56,18 @@ Never start without `thread_id` + `session_key`.
   - `claw-loopd stop --repo <repo> --run-id <run_id> --immediate` (kill switch)
 
 ## Notification contract (what arrives and when)
-Expect these kinds:
+Task-level notifications are single-channel from `scripts/rl-task-agent.sh`:
+- `🚀 <task> started`
+- `⏳ <task> waiting for merge`
+- `✅ <task> merged`
+- `❌ <task> blocked`
+
+Daemon notifications are lifecycle-level:
 - `run_started`: right after `start`
 - `pr_tracking_started`: right after `track-pr`
 - `pr_poll_error`: PR poll error first occurrence
 - `pr_merged`: tracked PR merged
 - `pr_closed`: tracked PR closed without merge
-- `task_started`: runner started a task
-- `task_waiting_merge`: runner is waiting for merge
-- `task_done`: task was marked done
-- `task_blocked`: runner/task is blocked
 - `all_tasks_completed`: tasklist has no open item
 - `orphan_blocked`: sweep detected expired lease + missing daemon
 - `auto_stopped`: max-task-loops / max-ticks / max-runtime に到達

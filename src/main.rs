@@ -1964,12 +1964,6 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                     "text": entry.text,
                                 }),
                             )?;
-                            queue_notification(
-                                &dir,
-                                &manifest,
-                                "task_done",
-                                format!("task completed: {}", entry.id),
-                            )?;
                             runner_state.last_task_id = Some(entry.id.clone());
                             runner_state.last_task_state = Some(RunnerTaskState::Done);
                             runner_state.last_task_at = Some(now);
@@ -2033,12 +2027,6 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                 runner_state.current_task_pr_url.clone();
                             write_runner_state(&dir, &runner_state)?;
                             write_json(&dir.join("state.json"), &state)?;
-                            queue_notification(
-                                &dir,
-                                &manifest,
-                                "task_blocked",
-                                format!("active task missing from tasklist: {active_id}"),
-                            )?;
                             let _ = flush_notifications(&dir, &manifest)?;
                             break;
                         }
@@ -2107,13 +2095,6 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                         runner_state.pause_reason = None;
                         write_runner_state(&dir, &runner_state)?;
 
-                        queue_notification(
-                            &dir,
-                            &manifest,
-                            "task_started",
-                            format!("task started: {}", queued_task.id),
-                        )?;
-
                         runner_state.current_task_state = Some(RunnerTaskState::Running);
                         write_runner_state(&dir, &runner_state)?;
 
@@ -2165,9 +2146,6 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                         if runner.exit_code == Some(10)
                             || first_stdout_line.starts_with("TASK_WAITING")
                         {
-                            let prev_status = state.status.clone();
-                            let prev_waiting_reason = state.waiting_reason.clone();
-
                             state.version += 1;
                             state.status = LoopStatus::Waiting;
                             state.summary = format!("task waiting_merge: {task_label}");
@@ -2183,17 +2161,6 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             runner_state.current_task_pr_url = first_line_pr_url.clone();
                             write_runner_state(&dir, &runner_state)?;
                             write_json(&dir.join("state.json"), &state)?;
-
-                            if prev_status != LoopStatus::Waiting
-                                || prev_waiting_reason != state.waiting_reason
-                            {
-                                queue_notification(
-                                    &dir,
-                                    &manifest,
-                                    "task_waiting_merge",
-                                    format!("{} ({})", state.waiting_reason, task_label),
-                                )?;
-                            }
                         } else if !runner.success {
                             state.version += 1;
                             state.status = LoopStatus::Blocked;
@@ -2217,12 +2184,6 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             write_runner_state(&dir, &runner_state)?;
 
                             write_json(&dir.join("state.json"), &state)?;
-                            queue_notification(
-                                &dir,
-                                &manifest,
-                                "task_blocked",
-                                format!("task blocked: {} ({})", task_label, state.waiting_reason),
-                            )?;
                             let _ = flush_notifications(&dir, &manifest)?;
                             break;
                         }
@@ -2248,12 +2209,6 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                 runner_state.current_task_blocked_reason = None;
                                 runner_state.current_task_pr_url = None;
 
-                                queue_notification(
-                                    &dir,
-                                    &manifest,
-                                    "task_done",
-                                    format!("task completed: {}", task.id),
-                                )?;
                                 task_done_now = task_checklist_done_count(&task_file_abs)?;
                                 task_loops_completed =
                                     task_done_now.saturating_sub(manifest.task_done_baseline);
