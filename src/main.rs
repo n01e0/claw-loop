@@ -193,7 +193,7 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let data = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    Ok(serde_json::from_slice(&data).with_context(|| format!("parse {}", path.display()))?)
+    serde_json::from_slice(&data).with_context(|| format!("parse {}", path.display()))
 }
 
 fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -573,7 +573,7 @@ fn reduce_pr_tracking(run_dir: &Path, manifest: &Manifest, state: &mut State) ->
                 format!("PR #{} merged: {}", tracking.pr, view.url),
             )?;
             fs::remove_file(&tracking_path)?;
-            return Ok(true);
+            Ok(true)
         }
         "CLOSED" => {
             state.version += 1;
@@ -598,24 +598,24 @@ fn reduce_pr_tracking(run_dir: &Path, manifest: &Manifest, state: &mut State) ->
                 format!("PR #{} closed without merge: {}", tracking.pr, view.url),
             )?;
             fs::remove_file(&tracking_path)?;
-            return Ok(true);
+            Ok(true)
         }
         "OPEN" => {
-            if view.auto_merge_request.is_none() && merge_state == "CLEAN" {
-                if gh_pr_arm_auto_merge(&tracking.gh_repo, tracking.pr, &tracking.merge_method)
+            if view.auto_merge_request.is_none()
+                && merge_state == "CLEAN"
+                && gh_pr_arm_auto_merge(&tracking.gh_repo, tracking.pr, &tracking.merge_method)
                     .is_ok()
-                {
-                    tracking.auto_merge_armed = true;
-                    append_event(
-                        run_dir,
-                        "pr_auto_merge_armed",
-                        serde_json::json!({
-                            "repo": tracking.gh_repo,
-                            "pr": tracking.pr,
-                            "merge_method": tracking.merge_method,
-                        }),
-                    )?;
-                }
+            {
+                tracking.auto_merge_armed = true;
+                append_event(
+                    run_dir,
+                    "pr_auto_merge_armed",
+                    serde_json::json!({
+                        "repo": tracking.gh_repo,
+                        "pr": tracking.pr,
+                        "merge_method": tracking.merge_method,
+                    }),
+                )?;
             }
 
             if observed_changed {
@@ -641,7 +641,7 @@ fn reduce_pr_tracking(run_dir: &Path, manifest: &Manifest, state: &mut State) ->
                     "unchanged_polls": tracking.unchanged_polls
                 }),
             )?;
-            return Ok(false);
+            Ok(false)
         }
         _ => {
             tracking.last_observed_state = Some(pr_state.to_string());
@@ -659,7 +659,7 @@ fn reduce_pr_tracking(run_dir: &Path, manifest: &Manifest, state: &mut State) ->
                     "url": view.url,
                 }),
             )?;
-            return Ok(false);
+            Ok(false)
         }
     }
 }
@@ -1040,27 +1040,6 @@ fn cmd_sweep(repo: PathBuf, run_id: Option<Uuid>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{compute_backoff_sec, lease_window_sec};
-
-    #[test]
-    fn backoff_schedule_is_expected() {
-        assert_eq!(compute_backoff_sec(0), 60);
-        assert_eq!(compute_backoff_sec(1), 120);
-        assert_eq!(compute_backoff_sec(2), 240);
-        assert_eq!(compute_backoff_sec(3), 300);
-        assert_eq!(compute_backoff_sec(99), 300);
-    }
-
-    #[test]
-    fn lease_window_defaults() {
-        assert_eq!(lease_window_sec(60), 90);
-        assert_eq!(lease_window_sec(30), 60);
-        assert_eq!(lease_window_sec(1), 45);
-    }
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -1108,4 +1087,25 @@ fn main() -> Result<()> {
         eprintln!("error: {e:?}");
         process::exit(1);
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_backoff_sec, lease_window_sec};
+
+    #[test]
+    fn backoff_schedule_is_expected() {
+        assert_eq!(compute_backoff_sec(0), 60);
+        assert_eq!(compute_backoff_sec(1), 120);
+        assert_eq!(compute_backoff_sec(2), 240);
+        assert_eq!(compute_backoff_sec(3), 300);
+        assert_eq!(compute_backoff_sec(99), 300);
+    }
+
+    #[test]
+    fn lease_window_defaults() {
+        assert_eq!(lease_window_sec(60), 90);
+        assert_eq!(lease_window_sec(30), 60);
+        assert_eq!(lease_window_sec(1), 45);
+    }
 }
