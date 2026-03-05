@@ -34,10 +34,14 @@ enum Commands {
         tick_sec: u64,
         #[arg(long, default_value_t = false)]
         deliver_openclaw: bool,
-        #[arg(long, default_value_t = 10)]
-        max_ticks: u64,
+        #[arg(long)]
+        max_ticks: Option<u64>,
         #[arg(long)]
         max_runtime_sec: Option<u64>,
+        #[arg(long, default_value_t = 10)]
+        max_task_loops: u64,
+        #[arg(long, default_value = "docs/roadmaps/ack-integration-tasklist.md")]
+        task_file: PathBuf,
     },
     Daemon {
         #[arg(long)]
@@ -143,6 +147,12 @@ struct Manifest {
     max_ticks: Option<u64>,
     #[serde(default)]
     max_runtime_sec: Option<u64>,
+    #[serde(default = "default_max_task_loops")]
+    max_task_loops: u64,
+    #[serde(default = "default_task_file")]
+    task_file: PathBuf,
+    #[serde(default)]
+    task_done_baseline: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -292,8 +302,26 @@ struct StartOptions {
     owner_message_id: Option<String>,
     tick_sec: u64,
     deliver_openclaw: bool,
-    max_ticks: u64,
+    max_ticks: Option<u64>,
     max_runtime_sec: Option<u64>,
+    max_task_loops: u64,
+    task_file: PathBuf,
+}
+
+fn default_max_task_loops() -> u64 {
+    10
+}
+
+fn default_task_file() -> PathBuf {
+    PathBuf::from("docs/roadmaps/ack-integration-tasklist.md")
+}
+
+fn resolve_task_file_path(repo: &Path, task_file: &Path) -> PathBuf {
+    if task_file.is_absolute() {
+        task_file.to_path_buf()
+    } else {
+        repo.join(task_file)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -574,6 +602,21 @@ fn parse_task_checklist_entry(line_no: usize, line: &str) -> Option<TaskChecklis
         id,
         text,
     })
+}
+
+fn task_checklist_done_count(file: &Path) -> Result<u64> {
+    if !file.exists() {
+        return Ok(0);
+    }
+
+    let content = fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+    let done = content
+        .lines()
+        .enumerate()
+        .filter_map(|(idx, line)| parse_task_checklist_entry(idx + 1, line))
+        .filter(|entry| entry.done)
+        .count() as u64;
+    Ok(done)
 }
 
 fn append_ack_idempotent(
@@ -1095,12 +1138,20 @@ fn classify_ack_failure_category(raw: Option<&str>) -> String {
 }
 
 fn compute_auto_stop_reason(
+    task_loops_completed: u64,
+    max_task_loops: u64,
     ticks: u64,
     max_ticks: Option<u64>,
     started_at: DateTime<Utc>,
     max_runtime_sec: Option<u64>,
     now: DateTime<Utc>,
 ) -> Option<String> {
+    if task_loops_completed >= max_task_loops {
+        return Some(format!(
+            "max_task_loops reached ({task_loops_completed}/{max_task_loops})"
+        ));
+    }
+
     if let Some(limit) = max_ticks
         && ticks >= limit
     {
@@ -1329,6 +1380,10 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
         .spawn()
         .context("spawn daemon")?;
 
+    let task_file = opts.task_file;
+    let task_file_abs = resolve_task_file_path(&opts.repo, &task_file);
+    let task_done_baseline = task_checklist_done_count(&task_file_abs)?;
+
     let now = Utc::now();
     let manifest = Manifest {
         run_id,
@@ -1340,8 +1395,11 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
         started_at: now,
         daemon_pid: child.id(),
         deliver_openclaw: opts.deliver_openclaw,
-        max_ticks: Some(opts.max_ticks),
+        max_ticks: opts.max_ticks,
         max_runtime_sec: opts.max_runtime_sec,
+        max_task_loops: opts.max_task_loops,
+        task_file,
+        task_done_baseline,
     };
     let state = State {
         version: 1,
@@ -1421,7 +1479,26 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
         let mut state: State = read_json(&dir.join("state.json"))?;
         let now = Utc::now();
 
+        let task_file_abs = resolve_task_file_path(&manifest.repo_path, &manifest.task_file);
+        let task_done_now = match task_checklist_done_count(&task_file_abs) {
+            Ok(v) => v,
+            Err(err) => {
+                append_event(
+                    &dir,
+                    "task_count_error",
+                    serde_json::json!({
+                        "task_file": task_file_abs,
+                        "error": err.to_string(),
+                    }),
+                )?;
+                manifest.task_done_baseline
+            }
+        };
+        let task_loops_completed = task_done_now.saturating_sub(manifest.task_done_baseline);
+
         if let Some(reason) = compute_auto_stop_reason(
+            task_loops_completed,
+            manifest.max_task_loops,
             state.ticks,
             manifest.max_ticks,
             manifest.started_at,
@@ -1440,6 +1517,10 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                 "daemon_auto_stopped",
                 serde_json::json!({
                     "reason": reason,
+                    "task_loops_completed": task_loops_completed,
+                    "max_task_loops": manifest.max_task_loops,
+                    "task_done_baseline": manifest.task_done_baseline,
+                    "task_done_now": task_done_now,
                     "ticks": state.ticks,
                     "max_ticks": manifest.max_ticks,
                     "max_runtime_sec": manifest.max_runtime_sec,
@@ -1486,7 +1567,13 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
         append_event(
             &dir,
             "tick",
-            serde_json::json!({"version": state.version, "ticks": state.ticks, "pr_changed": pr_changed}),
+            serde_json::json!({
+                "version": state.version,
+                "ticks": state.ticks,
+                "task_loops_completed": task_loops_completed,
+                "max_task_loops": manifest.max_task_loops,
+                "pr_changed": pr_changed,
+            }),
         )?;
 
         let _ = flush_notifications(&dir, &manifest)?;
@@ -1566,6 +1653,9 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
         None
     };
     let runtime_sec = (Utc::now() - manifest.started_at).num_seconds().max(0);
+    let task_file_abs = resolve_task_file_path(&manifest.repo_path, &manifest.task_file);
+    let task_done_current = task_checklist_done_count(&task_file_abs).unwrap_or(0);
+    let task_loops_completed = task_done_current.saturating_sub(manifest.task_done_baseline);
 
     println!(
         "{}",
@@ -1582,6 +1672,11 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
             "max_ticks": manifest.max_ticks,
             "max_runtime_sec": manifest.max_runtime_sec,
             "runtime_sec": runtime_sec,
+            "task_file": manifest.task_file,
+            "max_task_loops": manifest.max_task_loops,
+            "task_done_baseline": manifest.task_done_baseline,
+            "task_done_current": task_done_current,
+            "task_loops_completed": task_loops_completed,
             "queued_notifications_total": queued_total,
             "pending_notifications": pending,
             "dispatched_notifications": dispatched,
@@ -2296,6 +2391,8 @@ fn main() -> Result<()> {
             deliver_openclaw,
             max_ticks,
             max_runtime_sec,
+            max_task_loops,
+            task_file,
         } => cmd_start(StartOptions {
             repo,
             session_key,
@@ -2306,6 +2403,8 @@ fn main() -> Result<()> {
             deliver_openclaw,
             max_ticks,
             max_runtime_sec,
+            max_task_loops,
+            task_file,
         }),
         Commands::Daemon {
             repo,
@@ -2450,19 +2549,19 @@ mod tests {
     }
 
     #[test]
-    fn auto_stop_reason_prefers_max_ticks() {
+    fn auto_stop_reason_prefers_max_task_loops() {
         let started_at = chrono::Utc::now() - chrono::Duration::seconds(1);
         let now = chrono::Utc::now();
-        let reason = compute_auto_stop_reason(3, Some(3), started_at, Some(3600), now)
+        let reason = compute_auto_stop_reason(3, 3, 0, Some(100), started_at, Some(3600), now)
             .expect("expected auto stop");
-        assert!(reason.contains("max_ticks"));
+        assert!(reason.contains("max_task_loops"));
     }
 
     #[test]
     fn auto_stop_reason_hits_runtime_limit() {
         let started_at = chrono::Utc::now() - chrono::Duration::seconds(11);
         let now = chrono::Utc::now();
-        let reason = compute_auto_stop_reason(2, None, started_at, Some(10), now)
+        let reason = compute_auto_stop_reason(0, 10, 2, None, started_at, Some(10), now)
             .expect("expected runtime auto stop");
         assert!(reason.contains("max_runtime_sec"));
     }
