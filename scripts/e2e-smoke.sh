@@ -151,7 +151,7 @@ TASKFILE_W="$WORKDIR/docs/roadmaps/waiting-tasklist.md"
 cat > "$TASKFILE_W" <<'EOF'
 - [ ] W1: wait merge
 EOF
-OUT1D="$($BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --task-file "$TASKFILE_W" --task-runner-cmd 'echo "TASK_WAITING_MERGE PR_URL=https://example.invalid/pr/1"; exit 10' --auto-check-on-success true --max-task-loops 10)"
+OUT1D="$(CLAW_LOOPD_STUCK_WAIT_TICKS=2 $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --task-file "$TASKFILE_W" --task-runner-cmd 'echo "TASK_WAITING_MERGE PR_URL=https://example.invalid/pr/1"; exit 10' --auto-check-on-success true --max-task-loops 10)"
 RUN1D="$(echo "$OUT1D" | awk -F= '/^run_id=/{print $2}')"
 if [[ -z "$RUN1D" ]]; then
   echo "[e2e-smoke] failed to parse run1d id"
@@ -172,6 +172,17 @@ if int(runner.get("task_loops_started", 0)) != 0:
     raise SystemExit(f"expected loops_started=0, got {runner}")
 if int(obj.get("task_done_current", 0)) != 0:
     raise SystemExit(f"expected task_done_current=0, got {obj.get('task_done_current')}")
+if int(runner.get("waiting_unchanged_ticks", 0)) < 2:
+    raise SystemExit(f"expected waiting_unchanged_ticks>=2, got {runner}")
+if int(runner.get("waiting_last_notified_ticks", 0)) < 2:
+    raise SystemExit(f"expected waiting_last_notified_ticks>=2, got {runner}")
+PY
+python3 - <<'PY' "$WORKDIR/.ralph/runs/$RUN1D/events.jsonl"
+import json, sys
+path = sys.argv[1]
+events = [json.loads(line) for line in open(path) if line.strip()]
+if not any(e.get("kind") == "task_waiting_stuck" for e in events):
+    raise SystemExit(f"expected task_waiting_stuck event, got kinds={[e.get('kind') for e in events][-10:]}")
 PY
 $BIN stop --repo "$WORKDIR" --run-id "$RUN1D" --immediate >/dev/null || true
 sleep 1
