@@ -31,6 +31,12 @@ Thread-bound monitored Ralph loop daemon (Rust).
 cargo build
 ```
 
+## CI
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all --all-features`
+- `./scripts/e2e-smoke.sh ./target/debug/claw-loopd`
+
 ## Quick test
 
 ```bash
