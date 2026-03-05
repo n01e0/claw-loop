@@ -90,6 +90,49 @@ if int(obj.get("ticks", 0)) < 1:
 PY
 
 
+echo "[e2e-smoke] case1c dogfood runner sequential gate"
+TASKFILE="$WORKDIR/docs/roadmaps/ack-integration-tasklist.md"
+mkdir -p "$(dirname "$TASKFILE")"
+cat > "$TASKFILE" <<'EOF'
+- [ ] R1: first
+- [ ] R2: second
+EOF
+OUT1C="$($BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --task-runner-cmd 'echo start:$CLAW_TASK_ID' --max-task-loops 10)"
+RUN1C="$(echo "$OUT1C" | awk -F= '/^run_id=/{print $2}')"
+if [[ -z "$RUN1C" ]]; then
+  echo "[e2e-smoke] failed to parse run1c id"
+  echo "$OUT1C"
+  exit 1
+fi
+sleep 3
+STATUS1D="$($BIN status --repo "$WORKDIR" --run-id "$RUN1C")"
+python3 - <<'PY' "$STATUS1D"
+import json, sys
+obj = json.loads(sys.argv[1])
+runner = obj.get("runner") or {}
+if obj.get("status") != "waiting":
+    raise SystemExit(f"expected waiting, got {obj.get('status')!r}")
+if int(runner.get("task_loops_started", 0)) != 1:
+    raise SystemExit(f"expected loops_started=1, got {runner}")
+if runner.get("active_task_id") != "R1":
+    raise SystemExit(f"expected active_task_id=R1, got {runner}")
+PY
+$BIN task-check --file "$TASKFILE" --id R1 --done true >/dev/null
+sleep 3
+STATUS1E="$($BIN status --repo "$WORKDIR" --run-id "$RUN1C")"
+python3 - <<'PY' "$STATUS1E"
+import json, sys
+obj = json.loads(sys.argv[1])
+runner = obj.get("runner") or {}
+if int(runner.get("task_loops_started", 0)) < 2:
+    raise SystemExit(f"expected loops_started>=2, got {runner}")
+if runner.get("active_task_id") != "R2":
+    raise SystemExit(f"expected active_task_id=R2, got {runner}")
+PY
+$BIN stop --repo "$WORKDIR" --run-id "$RUN1C" --immediate >/dev/null || true
+sleep 1
+
+
 echo "[e2e-smoke] case2 orphan sweep start"
 IFS='|' read -r RUN2 PID2 <<<"$(run_start 60)"
 kill -9 "$PID2" >/dev/null 2>&1 || true

@@ -44,7 +44,7 @@ enum Commands {
         task_file: PathBuf,
         #[arg(long)]
         task_runner_cmd: Option<String>,
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         auto_check_on_success: bool,
     },
     Daemon {
@@ -199,6 +199,24 @@ struct State {
     ticks: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+struct RunnerState {
+    #[serde(default)]
+    active_task_id: Option<String>,
+    #[serde(default)]
+    active_task_text: Option<String>,
+    #[serde(default)]
+    active_task_line: Option<usize>,
+    #[serde(default)]
+    active_task_started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    task_loops_started: u64,
+    #[serde(default)]
+    paused: bool,
+    #[serde(default)]
+    pause_reason: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Notification {
     event_id: Uuid,
@@ -335,7 +353,7 @@ fn default_max_task_loops() -> u64 {
 }
 
 fn default_auto_check_on_success() -> bool {
-    true
+    false
 }
 
 fn default_task_file() -> PathBuf {
@@ -439,6 +457,22 @@ fn delivery_ack_path(run_dir: &Path) -> PathBuf {
 
 fn dead_letter_path(run_dir: &Path) -> PathBuf {
     run_dir.join("notify-dead-letter.jsonl")
+}
+
+fn runner_state_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("runner-state.json")
+}
+
+fn read_runner_state(run_dir: &Path) -> Result<RunnerState> {
+    let path = runner_state_path(run_dir);
+    if !path.exists() {
+        return Ok(RunnerState::default());
+    }
+    read_json(&path)
+}
+
+fn write_runner_state(run_dir: &Path, runner: &RunnerState) -> Result<()> {
+    write_json(&runner_state_path(run_dir), runner)
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -1308,20 +1342,12 @@ fn classify_ack_failure_category(raw: Option<&str>) -> String {
 }
 
 fn compute_auto_stop_reason(
-    task_loops_completed: u64,
-    max_task_loops: u64,
     ticks: u64,
     max_ticks: Option<u64>,
     started_at: DateTime<Utc>,
     max_runtime_sec: Option<u64>,
     now: DateTime<Utc>,
 ) -> Option<String> {
-    if task_loops_completed >= max_task_loops {
-        return Some(format!(
-            "max_task_loops reached ({task_loops_completed}/{max_task_loops})"
-        ));
-    }
-
     if let Some(limit) = max_ticks
         && ticks >= limit
     {
@@ -1606,6 +1632,7 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
 
     write_json(&dir.join("manifest.json"), &manifest)?;
     write_json(&dir.join("state.json"), &state)?;
+    write_runner_state(&dir, &RunnerState::default())?;
     write_json(
         &dir.join("daemon.pid"),
         &serde_json::json!({"pid": child.id()}),
@@ -1688,94 +1715,210 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
             }
         };
         let mut task_loops_completed = task_done_now.saturating_sub(manifest.task_done_baseline);
+        let mut runner_state = read_runner_state(&dir)?;
 
         if let Some(cmd) = manifest.task_runner_cmd.as_deref() {
-            let runner = run_task_once(
-                &task_file_abs,
-                cmd,
-                manifest.auto_check_on_success,
-                false,
-                Some(&manifest.repo_path),
-                Some(run_id),
-            )?;
+            if runner_state.paused {
+                state.status = LoopStatus::Waiting;
+                state.summary = "runner paused".into();
+                state.waiting_reason = runner_state
+                    .pause_reason
+                    .clone()
+                    .unwrap_or_else(|| "runner paused".to_string());
+            } else {
+                if let Some(active_id) = runner_state.active_task_id.clone() {
+                    let (_, _, entries) = load_task_checklist(&task_file_abs)?;
+                    match entries.iter().find(|entry| entry.id == active_id) {
+                        Some(entry) if entry.done => {
+                            append_event(
+                                &dir,
+                                "task_completed_detected",
+                                serde_json::json!({
+                                    "task_id": entry.id,
+                                    "line": entry.line_no,
+                                    "text": entry.text,
+                                }),
+                            )?;
+                            queue_notification(
+                                &dir,
+                                &manifest,
+                                "task_completed",
+                                format!("task completed: {}", entry.id),
+                            )?;
+                            runner_state.active_task_id = None;
+                            runner_state.active_task_text = None;
+                            runner_state.active_task_line = None;
+                            runner_state.active_task_started_at = None;
+                            write_runner_state(&dir, &runner_state)?;
+                            task_done_now = task_checklist_done_count(&task_file_abs)?;
+                            task_loops_completed =
+                                task_done_now.saturating_sub(manifest.task_done_baseline);
+                        }
+                        Some(entry) => {
+                            state.status = LoopStatus::Waiting;
+                            state.summary = format!("task in progress: {}", entry.id);
+                            state.waiting_reason =
+                                format!("waiting for task completion: {}", entry.id);
+                        }
+                        None => {
+                            state.status = LoopStatus::Blocked;
+                            state.summary =
+                                format!("active task missing from tasklist: {active_id}");
+                            state.waiting_reason = "runner state is inconsistent".into();
+                            state.updated_at = now;
+                            state.version += 1;
+                            write_json(&dir.join("state.json"), &state)?;
+                            queue_notification(
+                                &dir,
+                                &manifest,
+                                "runner_failed",
+                                format!("active task missing from tasklist: {active_id}"),
+                            )?;
+                            let _ = flush_notifications(&dir, &manifest)?;
+                            break;
+                        }
+                    }
+                }
 
-            append_event(
-                &dir,
-                "task_runner_tick",
-                serde_json::json!({
-                    "task": runner.task.as_ref().map(|t| serde_json::json!({
-                        "id": t.id,
-                        "line": t.line_no,
-                        "text": t.text,
-                    })),
-                    "command": runner.command,
-                    "executed": runner.executed,
-                    "success": runner.success,
-                    "exit_code": runner.exit_code,
-                    "auto_check_on_success": manifest.auto_check_on_success,
-                    "check_result": runner.check_result,
-                    "stdout": clip_text(&runner.stdout, 1000),
-                    "stderr": clip_text(&runner.stderr, 1000),
-                }),
-            )?;
+                if runner_state.active_task_id.is_none() {
+                    let (_, _, entries) = load_task_checklist(&task_file_abs)?;
+                    let next = entries.iter().find(|entry| !entry.done).cloned();
 
-            if runner.task.is_none() {
-                state.version += 1;
-                state.status = LoopStatus::Done;
-                state.summary = "all tasklist items completed".into();
-                state.waiting_reason.clear();
-                state.updated_at = now;
-                write_json(&dir.join("state.json"), &state)?;
-                queue_notification(&dir, &manifest, "done", "all tasklist items completed")?;
-                let _ = flush_notifications(&dir, &manifest)?;
-                break;
+                    if runner_state.task_loops_started >= manifest.max_task_loops {
+                        runner_state.paused = true;
+                        runner_state.pause_reason = Some(format!(
+                            "max_task_loops reached ({}/{})",
+                            runner_state.task_loops_started, manifest.max_task_loops
+                        ));
+                        write_runner_state(&dir, &runner_state)?;
+                        state.status = LoopStatus::Waiting;
+                        state.summary = "runner paused at max_task_loops".into();
+                        state.waiting_reason = runner_state
+                            .pause_reason
+                            .clone()
+                            .unwrap_or_else(|| "max_task_loops reached".to_string());
+                        queue_notification(
+                            &dir,
+                            &manifest,
+                            "loop_limit_reached",
+                            state.waiting_reason.clone(),
+                        )?;
+                    } else if next.is_none() {
+                        runner_state.paused = true;
+                        runner_state.pause_reason = Some("all tasklist items completed".into());
+                        write_runner_state(&dir, &runner_state)?;
+                        state.status = LoopStatus::Waiting;
+                        state.summary = "all tasklist items completed".into();
+                        state.waiting_reason =
+                            "all tasklist items completed; waiting for new instruction".into();
+                        queue_notification(
+                            &dir,
+                            &manifest,
+                            "all_tasks_completed",
+                            "all tasklist items completed; waiting for instruction",
+                        )?;
+                    } else {
+                        let runner = run_task_once(
+                            &task_file_abs,
+                            cmd,
+                            manifest.auto_check_on_success,
+                            false,
+                            Some(&manifest.repo_path),
+                            Some(run_id),
+                        )?;
+
+                        append_event(
+                            &dir,
+                            "task_runner_tick",
+                            serde_json::json!({
+                                "task": runner.task.as_ref().map(|t| serde_json::json!({
+                                    "id": t.id,
+                                    "line": t.line_no,
+                                    "text": t.text,
+                                })),
+                                "command": runner.command,
+                                "executed": runner.executed,
+                                "success": runner.success,
+                                "exit_code": runner.exit_code,
+                                "auto_check_on_success": manifest.auto_check_on_success,
+                                "check_result": runner.check_result,
+                                "stdout": clip_text(&runner.stdout, 1000),
+                                "stderr": clip_text(&runner.stderr, 1000),
+                            }),
+                        )?;
+
+                        if !runner.success {
+                            state.version += 1;
+                            state.status = LoopStatus::Blocked;
+                            state.summary = format!(
+                                "task runner failed: {}",
+                                runner
+                                    .task
+                                    .as_ref()
+                                    .map(|t| t.id.clone())
+                                    .unwrap_or_else(|| "unknown".to_string())
+                            );
+                            state.waiting_reason = format!(
+                                "runner exit={:?}: {}",
+                                runner.exit_code,
+                                clip_text(&runner.stderr, 200)
+                            );
+                            state.updated_at = now;
+                            write_json(&dir.join("state.json"), &state)?;
+                            queue_notification(
+                                &dir,
+                                &manifest,
+                                "runner_failed",
+                                format!(
+                                    "task runner failed for {}",
+                                    runner
+                                        .task
+                                        .as_ref()
+                                        .map(|t| t.id.clone())
+                                        .unwrap_or_else(|| "unknown".to_string())
+                                ),
+                            )?;
+                            let _ = flush_notifications(&dir, &manifest)?;
+                            break;
+                        }
+
+                        if let Some(task) = runner.task {
+                            runner_state.task_loops_started =
+                                runner_state.task_loops_started.saturating_add(1);
+                            if manifest.auto_check_on_success {
+                                queue_notification(
+                                    &dir,
+                                    &manifest,
+                                    "task_completed",
+                                    format!("task completed: {}", task.id),
+                                )?;
+                                task_done_now = task_checklist_done_count(&task_file_abs)?;
+                                task_loops_completed =
+                                    task_done_now.saturating_sub(manifest.task_done_baseline);
+                            } else {
+                                runner_state.active_task_id = Some(task.id.clone());
+                                runner_state.active_task_text = Some(task.text.clone());
+                                runner_state.active_task_line = Some(task.line_no);
+                                runner_state.active_task_started_at = Some(now);
+                                state.status = LoopStatus::Waiting;
+                                state.summary = format!("task in progress: {}", task.id);
+                                state.waiting_reason =
+                                    format!("waiting for task completion: {}", task.id);
+                                queue_notification(
+                                    &dir,
+                                    &manifest,
+                                    "task_started",
+                                    format!("task started: {}", task.id),
+                                )?;
+                            }
+                            write_runner_state(&dir, &runner_state)?;
+                        }
+                    }
+                }
             }
-
-            if !runner.success {
-                state.version += 1;
-                state.status = LoopStatus::Blocked;
-                state.summary = format!(
-                    "task runner failed: {}",
-                    runner
-                        .task
-                        .as_ref()
-                        .map(|t| t.id.clone())
-                        .unwrap_or_else(|| "unknown".to_string())
-                );
-                state.waiting_reason = format!(
-                    "runner exit={:?}: {}",
-                    runner.exit_code,
-                    clip_text(&runner.stderr, 200)
-                );
-                state.updated_at = now;
-                write_json(&dir.join("state.json"), &state)?;
-                queue_notification(
-                    &dir,
-                    &manifest,
-                    "runner_failed",
-                    format!(
-                        "task runner failed for {}",
-                        runner
-                            .task
-                            .as_ref()
-                            .map(|t| t.id.clone())
-                            .unwrap_or_else(|| "unknown".to_string())
-                    ),
-                )?;
-                let _ = flush_notifications(&dir, &manifest)?;
-                break;
-            }
-
-            task_done_now = match task_checklist_done_count(&task_file_abs) {
-                Ok(v) => v,
-                Err(_) => task_done_now,
-            };
-            task_loops_completed = task_done_now.saturating_sub(manifest.task_done_baseline);
         }
 
         if let Some(reason) = compute_auto_stop_reason(
-            task_loops_completed,
-            manifest.max_task_loops,
             state.ticks,
             manifest.max_ticks,
             manifest.started_at,
@@ -1975,6 +2118,24 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
     let task_file_abs = resolve_task_file_path(&manifest.repo_path, &manifest.task_file);
     let task_done_current = task_checklist_done_count(&task_file_abs).unwrap_or(0);
     let task_loops_completed = task_done_current.saturating_sub(manifest.task_done_baseline);
+    let runner_state = read_runner_state(&dir).unwrap_or_default();
+    let runner_mode = if manifest.task_runner_cmd.is_some() {
+        "dogfood"
+    } else {
+        "monitor_only"
+    };
+    let runner_view = serde_json::json!({
+        "mode": runner_mode,
+        "task_runner_cmd": manifest.task_runner_cmd,
+        "auto_check_on_success": manifest.auto_check_on_success,
+        "task_loops_started": runner_state.task_loops_started,
+        "active_task_id": runner_state.active_task_id,
+        "active_task_text": runner_state.active_task_text,
+        "active_task_line": runner_state.active_task_line,
+        "active_task_started_at": runner_state.active_task_started_at,
+        "paused": runner_state.paused,
+        "pause_reason": runner_state.pause_reason,
+    });
 
     println!(
         "{}",
@@ -1996,9 +2157,7 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
             "task_done_baseline": manifest.task_done_baseline,
             "task_done_current": task_done_current,
             "task_loops_completed": task_loops_completed,
-            "task_runner_cmd": manifest.task_runner_cmd,
-            "auto_check_on_success": manifest.auto_check_on_success,
-            "runner_mode": if manifest.task_runner_cmd.is_some() { "dogfood" } else { "monitor_only" },
+            "runner": runner_view,
             "queued_notifications_total": queued_total,
             "pending_notifications": pending,
             "dispatched_notifications": dispatched,
@@ -2858,19 +3017,19 @@ mod tests {
     }
 
     #[test]
-    fn auto_stop_reason_prefers_max_task_loops() {
+    fn auto_stop_reason_hits_max_ticks() {
         let started_at = chrono::Utc::now() - chrono::Duration::seconds(1);
         let now = chrono::Utc::now();
-        let reason = compute_auto_stop_reason(3, 3, 0, Some(100), started_at, Some(3600), now)
+        let reason = compute_auto_stop_reason(3, Some(3), started_at, Some(3600), now)
             .expect("expected auto stop");
-        assert!(reason.contains("max_task_loops"));
+        assert!(reason.contains("max_ticks"));
     }
 
     #[test]
     fn auto_stop_reason_hits_runtime_limit() {
         let started_at = chrono::Utc::now() - chrono::Duration::seconds(11);
         let now = chrono::Utc::now();
-        let reason = compute_auto_stop_reason(0, 10, 2, None, started_at, Some(10), now)
+        let reason = compute_auto_stop_reason(2, None, started_at, Some(10), now)
             .expect("expected runtime auto stop");
         assert!(reason.contains("max_runtime_sec"));
     }

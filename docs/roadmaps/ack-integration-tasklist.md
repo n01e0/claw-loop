@@ -24,7 +24,7 @@
 - [x] D0-3: runaway guard を追加（`--max-ticks` / `--max-runtime-sec`）
 - [x] D0-4: taskループ数ベースの上限を追加（`--max-task-loops`, default 10）
 - [x] D1-1: tasklistの「次の未完了」を自動実行する runner エントリ
-  - `start --task-runner-cmd` で1tickあたり1タスクを実行
+  - `start --task-runner-cmd` で1タスクずつ実行（進行中タスク完了まで次を開始しない）
   - `task-run-once` で単発実行も可能
 
 ## Ack Integration TODO
