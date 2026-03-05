@@ -170,6 +170,69 @@ struct GhPrView {
     auto_merge_request: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct DaemonLockMeta {
+    pid: u32,
+    run_id: Uuid,
+    acquired_at: DateTime<Utc>,
+}
+
+struct DaemonLockGuard {
+    path: PathBuf,
+    _file: fs::File,
+}
+
+impl Drop for DaemonLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn daemon_lock_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("daemon.lock")
+}
+
+fn acquire_daemon_lock(run_dir: &Path, run_id: Uuid) -> Result<DaemonLockGuard> {
+    let path = daemon_lock_path(run_dir);
+
+    for _ in 0..2 {
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                let meta = DaemonLockMeta {
+                    pid: process::id(),
+                    run_id,
+                    acquired_at: Utc::now(),
+                };
+                writeln!(file, "{}", serde_json::to_string(&meta)?)?;
+                return Ok(DaemonLockGuard { path, _file: file });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = match read_json::<DaemonLockMeta>(&path) {
+                    Ok(meta) => !process_matches_run(meta.pid, run_id),
+                    Err(_) => true,
+                };
+
+                if stale {
+                    fs::remove_file(&path)
+                        .with_context(|| format!("remove stale {}", path.display()))?;
+                    continue;
+                }
+
+                bail!("daemon lock already held for run {}", run_id);
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("open {}", path.display()));
+            }
+        }
+    }
+
+    bail!("failed to acquire daemon lock for run {}", run_id)
+}
+
 fn runs_root(repo: &Path) -> PathBuf {
     repo.join(".ralph").join("runs")
 }
@@ -739,7 +802,26 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
         bail!("run directory not found: {}", dir.display());
     }
 
-    let manifest: Manifest = read_json(&dir.join("manifest.json"))?;
+    let mut manifest: Manifest = read_json(&dir.join("manifest.json"))?;
+    let _daemon_lock = acquire_daemon_lock(&dir, run_id)?;
+
+    if manifest.daemon_pid != process::id() {
+        let old_pid = manifest.daemon_pid;
+        manifest.daemon_pid = process::id();
+        write_json(&dir.join("manifest.json"), &manifest)?;
+        append_event(
+            &dir,
+            "daemon_pid_rebound",
+            serde_json::json!({"old_pid": old_pid, "new_pid": manifest.daemon_pid}),
+        )?;
+    }
+
+    append_event(
+        &dir,
+        "daemon_lock_acquired",
+        serde_json::json!({"pid": process::id()}),
+    )?;
+
     let control_stop = dir.join("control.stop");
 
     loop {
