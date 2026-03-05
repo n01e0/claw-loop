@@ -62,6 +62,20 @@ enum Commands {
         run_id: Uuid,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        #[arg(long, default_value = "all")]
+        status: String,
+    },
+    RequeueDeadLetter {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        run_id: Uuid,
+        #[arg(long)]
+        event_id: Option<Uuid>,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long, default_value_t = true)]
+        reset_attempts: bool,
     },
     Notify {
         #[arg(long)]
@@ -164,8 +178,12 @@ struct DeliveryMetrics {
     delivered_total: u64,
     failed_total: u64,
     retried_total: u64,
+    dead_letter_total: u64,
+    requeued_total: u64,
     last_delivered_at: Option<DateTime<Utc>>,
     last_failed_at: Option<DateTime<Utc>>,
+    last_dead_letter_at: Option<DateTime<Utc>>,
+    last_requeued_at: Option<DateTime<Utc>>,
     #[serde(default)]
     last_error: Option<String>,
 }
@@ -179,6 +197,18 @@ struct DeliveryAttempt {
     attempts: u32,
     #[serde(default)]
     error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct DeadLetterEntry {
+    event_id: Uuid,
+    run_id: Uuid,
+    moved_at: DateTime<Utc>,
+    attempts: u32,
+    kind: String,
+    message: String,
+    #[serde(default)]
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -289,6 +319,10 @@ fn delivery_metrics_path(run_dir: &Path) -> PathBuf {
 
 fn delivery_attempts_path(run_dir: &Path) -> PathBuf {
     run_dir.join("notify-attempts.jsonl")
+}
+
+fn dead_letter_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("notify-dead-letter.jsonl")
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -459,7 +493,9 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
     let queue_path = run_dir.join("notify-queue.jsonl");
     let dispatched_path = run_dir.join("notify-dispatched.jsonl");
     let attempts_path = delivery_attempts_path(run_dir);
+    let dead_letter_file = dead_letter_path(run_dir);
     let metrics_path = delivery_metrics_path(run_dir);
+    let max_attempts = delivery_max_attempts();
 
     let queued = read_jsonl::<Notification>(&queue_path)?;
     if queued.is_empty() {
@@ -546,26 +582,53 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
                 };
                 append_jsonl(&attempts_path, &attempt)?;
 
-                let backoff = delivery_retry_backoff_sec(n.attempts);
-                n.next_retry_at = Some(now + chrono::Duration::seconds(backoff));
-                n.last_error = Some(err_text.clone());
-                kept.push(n.clone());
-
                 metrics.failed_total = metrics.failed_total.saturating_add(1);
                 metrics.last_failed_at = Some(now);
                 metrics.last_error = Some(err_text.clone());
 
-                append_event(
-                    run_dir,
-                    "notify_delivery_error",
-                    serde_json::json!({
-                        "event_id": n.event_id,
-                        "error": err_text,
-                        "attempts": n.attempts,
-                        "next_retry_at": n.next_retry_at,
-                        "will_retry": true,
-                    }),
-                )?;
+                if n.attempts >= max_attempts {
+                    let dead = DeadLetterEntry {
+                        event_id: n.event_id,
+                        run_id: n.run_id,
+                        moved_at: now,
+                        attempts: n.attempts,
+                        kind: n.kind,
+                        message: n.message,
+                        last_error: Some(err_text.clone()),
+                    };
+                    append_jsonl(&dead_letter_file, &dead)?;
+
+                    metrics.dead_letter_total = metrics.dead_letter_total.saturating_add(1);
+                    metrics.last_dead_letter_at = Some(now);
+
+                    append_event(
+                        run_dir,
+                        "notify_dead_letter",
+                        serde_json::json!({
+                            "event_id": dead.event_id,
+                            "attempts": dead.attempts,
+                            "error": dead.last_error,
+                            "max_attempts": max_attempts,
+                        }),
+                    )?;
+                } else {
+                    let backoff = delivery_retry_backoff_sec(n.attempts);
+                    n.next_retry_at = Some(now + chrono::Duration::seconds(backoff));
+                    n.last_error = Some(err_text.clone());
+                    kept.push(n.clone());
+
+                    append_event(
+                        run_dir,
+                        "notify_delivery_error",
+                        serde_json::json!({
+                            "event_id": n.event_id,
+                            "error": err_text,
+                            "attempts": n.attempts,
+                            "next_retry_at": n.next_retry_at,
+                            "will_retry": true,
+                        }),
+                    )?;
+                }
             }
         }
     }
@@ -662,6 +725,14 @@ fn delivery_retry_backoff_sec(attempts: u32) -> i64 {
         3 => 30,
         _ => 60,
     }
+}
+
+fn delivery_max_attempts() -> u32 {
+    std::env::var("CLAW_LOOPD_DELIVERY_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(5)
 }
 
 fn lease_window_sec(tick_sec: u64) -> i64 {
@@ -1029,6 +1100,7 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
     let dispatched_items =
         read_jsonl::<DispatchedNotification>(&dir.join("notify-dispatched.jsonl"))?;
     let attempt_items = read_jsonl::<DeliveryAttempt>(&delivery_attempts_path(&dir))?;
+    let dead_letter_items = read_jsonl::<DeadLetterEntry>(&dead_letter_path(&dir))?;
 
     let mut seen = HashSet::new();
     for d in &dispatched_items {
@@ -1042,6 +1114,7 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
     let queued_total = queued_items.len();
     let dispatched = dispatched_items.len();
     let attempts_total = attempt_items.len();
+    let dead_letter_total = dead_letter_items.len();
     let last_attempt_at = attempt_items.iter().map(|a| a.attempted_at).max();
     let next_retry_at = queued_items.iter().filter_map(|n| n.next_retry_at).min();
 
@@ -1072,6 +1145,7 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
             "pending_notifications": pending,
             "dispatched_notifications": dispatched,
             "delivery_attempts_total": attempts_total,
+            "dead_letter_total": dead_letter_total,
             "last_attempt_at": last_attempt_at,
             "next_retry_at": next_retry_at,
             "daemon_pid": manifest.daemon_pid,
@@ -1083,16 +1157,25 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
     Ok(())
 }
 
-fn cmd_delivery_report(repo: PathBuf, run_id: Uuid, limit: usize) -> Result<()> {
+fn cmd_delivery_report(repo: PathBuf, run_id: Uuid, limit: usize, status: String) -> Result<()> {
     let dir = run_dir(&repo, run_id);
     if !dir.exists() {
         bail!("run directory not found: {}", dir.display());
+    }
+
+    let status_filter = status.to_ascii_lowercase();
+    if !matches!(
+        status_filter.as_str(),
+        "all" | "pending" | "delivered" | "failed"
+    ) {
+        bail!("invalid status filter: {status_filter} (use all|pending|delivered|failed)");
     }
 
     let queued_items = read_jsonl::<Notification>(&dir.join("notify-queue.jsonl"))?;
     let dispatched_items =
         read_jsonl::<DispatchedNotification>(&dir.join("notify-dispatched.jsonl"))?;
     let attempt_items = read_jsonl::<DeliveryAttempt>(&delivery_attempts_path(&dir))?;
+    let dead_letter_items = read_jsonl::<DeadLetterEntry>(&dead_letter_path(&dir))?;
 
     let mut latest_attempt: HashMap<Uuid, DeliveryAttempt> = HashMap::new();
     for a in attempt_items {
@@ -1152,8 +1235,32 @@ fn cmd_delivery_report(repo: PathBuf, run_id: Uuid, limit: usize) -> Result<()> 
         ));
     }
 
+    for dlq in &dead_letter_items {
+        rows.push((
+            dlq.moved_at,
+            serde_json::json!({
+                "event_id": dlq.event_id,
+                "status": "failed",
+                "kind": dlq.kind,
+                "message": dlq.message,
+                "attempts": dlq.attempts,
+                "last_activity": dlq.moved_at,
+                "dead_letter_at": dlq.moved_at,
+                "last_error": dlq.last_error,
+            }),
+        ));
+    }
+
     rows.sort_by(|a, b| b.0.cmp(&a.0));
-    let items: Vec<serde_json::Value> = rows.into_iter().take(limit).map(|(_, v)| v).collect();
+    let items: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(_, v)| v)
+        .filter(|v| {
+            status_filter == "all"
+                || v.get("status").and_then(|s| s.as_str()) == Some(status_filter.as_str())
+        })
+        .take(limit)
+        .collect();
 
     let pending_count = queued_items
         .iter()
@@ -1164,10 +1271,116 @@ fn cmd_delivery_report(repo: PathBuf, run_id: Uuid, limit: usize) -> Result<()> 
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "run_id": run_id,
+            "filter": status_filter,
             "pending_count": pending_count,
             "delivered_count": dispatched_items.len(),
+            "failed_count": dead_letter_items.len(),
             "attempt_count": latest_attempt.len(),
             "items": items,
+        }))?
+    );
+
+    Ok(())
+}
+
+fn cmd_requeue_dead_letter(
+    repo: PathBuf,
+    run_id: Uuid,
+    event_id: Option<Uuid>,
+    limit: usize,
+    reset_attempts: bool,
+) -> Result<()> {
+    let dir = run_dir(&repo, run_id);
+    if !dir.exists() {
+        bail!("run directory not found: {}", dir.display());
+    }
+
+    let manifest: Manifest = read_json(&dir.join("manifest.json"))?;
+    let queue_path = dir.join("notify-queue.jsonl");
+    let dead_letter_file = dead_letter_path(&dir);
+    let metrics_path = delivery_metrics_path(&dir);
+
+    let queue_items = read_jsonl::<Notification>(&queue_path)?;
+    let dispatched_items =
+        read_jsonl::<DispatchedNotification>(&dir.join("notify-dispatched.jsonl"))?;
+    let dead_letter_items = read_jsonl::<DeadLetterEntry>(&dead_letter_file)?;
+
+    let mut occupied: HashSet<Uuid> = queue_items.iter().map(|n| n.event_id).collect();
+    for d in &dispatched_items {
+        occupied.insert(d.event_id);
+    }
+
+    let mut selected = 0usize;
+    let mut requeued = 0usize;
+    let now = Utc::now();
+    let mut keep_dead: Vec<DeadLetterEntry> = Vec::new();
+
+    for entry in dead_letter_items {
+        if selected >= limit {
+            keep_dead.push(entry);
+            continue;
+        }
+
+        if let Some(target) = event_id
+            && entry.event_id != target
+        {
+            keep_dead.push(entry);
+            continue;
+        }
+
+        selected += 1;
+
+        if occupied.contains(&entry.event_id) {
+            keep_dead.push(entry);
+            continue;
+        }
+
+        let notification = Notification {
+            event_id: entry.event_id,
+            run_id,
+            ts: now,
+            channel: manifest.channel.clone(),
+            thread_id: manifest.thread_id.clone(),
+            kind: entry.kind,
+            message: entry.message,
+            attempts: if reset_attempts { 0 } else { entry.attempts },
+            next_retry_at: None,
+            last_error: entry.last_error,
+        };
+
+        append_jsonl(&queue_path, &notification)?;
+        append_event(
+            &dir,
+            "notify_requeued",
+            serde_json::json!({
+                "event_id": notification.event_id,
+                "reset_attempts": reset_attempts,
+                "attempts": notification.attempts,
+            }),
+        )?;
+        requeued += 1;
+    }
+
+    rewrite_jsonl(&dead_letter_file, &keep_dead)?;
+
+    let mut metrics = if metrics_path.exists() {
+        read_json::<DeliveryMetrics>(&metrics_path)?
+    } else {
+        DeliveryMetrics::default()
+    };
+    if requeued > 0 {
+        metrics.requeued_total = metrics.requeued_total.saturating_add(requeued as u64);
+        metrics.last_requeued_at = Some(now);
+        write_json(&metrics_path, &metrics)?;
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "run_id": run_id,
+            "selected": selected,
+            "requeued": requeued,
+            "remaining_dead_letter": keep_dead.len(),
         }))?
     );
 
@@ -1417,7 +1630,15 @@ fn main() -> Result<()> {
             repo,
             run_id,
             limit,
-        } => cmd_delivery_report(repo, run_id, limit),
+            status,
+        } => cmd_delivery_report(repo, run_id, limit, status),
+        Commands::RequeueDeadLetter {
+            repo,
+            run_id,
+            event_id,
+            limit,
+            reset_attempts,
+        } => cmd_requeue_dead_letter(repo, run_id, event_id, limit, reset_attempts),
         Commands::Notify {
             repo,
             run_id,
