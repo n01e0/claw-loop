@@ -130,6 +130,12 @@ struct Notification {
     thread_id: String,
     kind: String,
     message: String,
+    #[serde(default)]
+    attempts: u32,
+    #[serde(default)]
+    next_retry_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -141,6 +147,19 @@ struct DispatchedNotification {
     thread_id: String,
     kind: String,
     message: String,
+    #[serde(default)]
+    attempts: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct DeliveryMetrics {
+    delivered_total: u64,
+    failed_total: u64,
+    retried_total: u64,
+    last_delivered_at: Option<DateTime<Utc>>,
+    last_failed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -245,6 +264,10 @@ fn pr_tracking_path(run_dir: &Path) -> PathBuf {
     run_dir.join("pr-tracking.json")
 }
 
+fn delivery_metrics_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("notify-metrics.json")
+}
+
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
@@ -269,6 +292,25 @@ fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .open(path)
         .with_context(|| format!("open {}", path.display()))?;
     writeln!(f, "{}", serde_json::to_string(value)?)?;
+    Ok(())
+}
+
+fn rewrite_jsonl<T: Serialize>(path: &Path, values: &[T]) -> Result<()> {
+    if values.is_empty() {
+        if path.exists() {
+            fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+        }
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut f = fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+    for v in values {
+        writeln!(f, "{}", serde_json::to_string(v)?)?;
+    }
     Ok(())
 }
 
@@ -297,6 +339,10 @@ fn run_with_timeout_cmd(
     }
 }
 
+fn openclaw_bin() -> String {
+    std::env::var("CLAW_LOOPD_OPENCLAW_BIN").unwrap_or_else(|_| "openclaw".to_string())
+}
+
 fn deliver_via_openclaw(notification: &Notification) -> Result<()> {
     let mut args: Vec<String> = vec![
         "message".into(),
@@ -317,7 +363,8 @@ fn deliver_via_openclaw(notification: &Notification) -> Result<()> {
         args.push("--dry-run".into());
     }
 
-    let output = run_with_timeout_cmd("openclaw", &args, 5)?;
+    let openclaw = openclaw_bin();
+    let output = run_with_timeout_cmd(&openclaw, &args, 5)?;
     if !output.status.success() {
         bail!(
             "openclaw message send failed: status={:?} stderr={}",
@@ -353,6 +400,9 @@ fn queue_notification(
         thread_id: manifest.thread_id.clone(),
         kind: kind.into(),
         message: message.into(),
+        attempts: 0,
+        next_retry_at: None,
+        last_error: None,
     };
     append_jsonl(&run_dir.join("notify-queue.jsonl"), &n)?;
     append_event(
@@ -385,6 +435,7 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> {
 fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
     let queue_path = run_dir.join("notify-queue.jsonl");
     let dispatched_path = run_dir.join("notify-dispatched.jsonl");
+    let metrics_path = delivery_metrics_path(run_dir);
 
     let queued = read_jsonl::<Notification>(&queue_path)?;
     if queued.is_empty() {
@@ -397,12 +448,30 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
         seen.insert(d.event_id);
     }
 
-    let mut delivered = 0usize;
+    let mut metrics = if metrics_path.exists() {
+        read_json::<DeliveryMetrics>(&metrics_path)?
+    } else {
+        DeliveryMetrics::default()
+    };
 
-    for n in queued {
+    let now = Utc::now();
+    let mut delivered = 0usize;
+    let mut kept: Vec<Notification> = Vec::new();
+
+    for mut n in queued {
         if seen.contains(&n.event_id) {
             continue;
         }
+
+        if let Some(next_retry_at) = n.next_retry_at
+            && now < next_retry_at
+        {
+            kept.push(n);
+            continue;
+        }
+
+        let previous_attempts = n.attempts;
+        n.attempts = n.attempts.saturating_add(1);
 
         let delivery_result = if manifest.deliver_openclaw {
             deliver_via_openclaw(&n)
@@ -415,28 +484,50 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
                 let d = DispatchedNotification {
                     event_id: n.event_id,
                     run_id: n.run_id,
-                    dispatched_at: Utc::now(),
+                    dispatched_at: now,
                     channel: n.channel,
                     thread_id: n.thread_id,
                     kind: n.kind,
                     message: n.message,
+                    attempts: n.attempts,
                 };
                 append_jsonl(&dispatched_path, &d)?;
                 delivered += 1;
+
+                metrics.delivered_total = metrics.delivered_total.saturating_add(1);
+                metrics.last_delivered_at = Some(now);
+                if previous_attempts > 0 {
+                    metrics.retried_total = metrics.retried_total.saturating_add(1);
+                }
             }
             Err(err) => {
+                let err_text = err.to_string();
+                let backoff = delivery_retry_backoff_sec(n.attempts);
+                n.next_retry_at = Some(now + chrono::Duration::seconds(backoff));
+                n.last_error = Some(err_text.clone());
+                kept.push(n.clone());
+
+                metrics.failed_total = metrics.failed_total.saturating_add(1);
+                metrics.last_failed_at = Some(now);
+                metrics.last_error = Some(err_text.clone());
+
                 append_event(
                     run_dir,
                     "notify_delivery_error",
                     serde_json::json!({
                         "event_id": n.event_id,
-                        "error": err.to_string(),
+                        "error": err_text,
+                        "attempts": n.attempts,
+                        "next_retry_at": n.next_retry_at,
                         "will_retry": true,
                     }),
                 )?;
             }
         }
     }
+
+    rewrite_jsonl(&queue_path, &kept)?;
+    write_json(&metrics_path, &metrics)?;
 
     if delivered > 0 {
         append_event(
@@ -517,6 +608,15 @@ fn compute_backoff_sec(unchanged_polls: u32) -> i64 {
         1 => 120,
         2 => 240,
         _ => 300,
+    }
+}
+
+fn delivery_retry_backoff_sec(attempts: u32) -> i64 {
+    match attempts {
+        0 | 1 => 5,
+        2 => 15,
+        3 => 30,
+        _ => 60,
     }
 }
 
@@ -896,9 +996,16 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
 
     let queued_total = queued_items.len();
     let dispatched = dispatched_items.len();
+    let next_retry_at = queued_items.iter().filter_map(|n| n.next_retry_at).min();
 
     let pr_tracking = if pr_tracking_path(&dir).exists() {
         Some(read_json::<PrTracking>(&pr_tracking_path(&dir))?)
+    } else {
+        None
+    };
+
+    let delivery_metrics = if delivery_metrics_path(&dir).exists() {
+        Some(read_json::<DeliveryMetrics>(&delivery_metrics_path(&dir))?)
     } else {
         None
     };
@@ -917,9 +1024,11 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
             "queued_notifications_total": queued_total,
             "pending_notifications": pending,
             "dispatched_notifications": dispatched,
+            "next_retry_at": next_retry_at,
             "daemon_pid": manifest.daemon_pid,
             "deliver_openclaw": manifest.deliver_openclaw,
-            "pr_tracking": pr_tracking
+            "pr_tracking": pr_tracking,
+            "delivery_metrics": delivery_metrics
         }))?
     );
     Ok(())
@@ -1187,7 +1296,7 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_backoff_sec, lease_window_sec};
+    use super::{compute_backoff_sec, delivery_retry_backoff_sec, lease_window_sec};
 
     #[test]
     fn backoff_schedule_is_expected() {
@@ -1203,5 +1312,14 @@ mod tests {
         assert_eq!(lease_window_sec(60), 90);
         assert_eq!(lease_window_sec(30), 60);
         assert_eq!(lease_window_sec(1), 45);
+    }
+
+    #[test]
+    fn delivery_retry_backoff_schedule() {
+        assert_eq!(delivery_retry_backoff_sec(0), 5);
+        assert_eq!(delivery_retry_backoff_sec(1), 5);
+        assert_eq!(delivery_retry_backoff_sec(2), 15);
+        assert_eq!(delivery_retry_backoff_sec(3), 30);
+        assert_eq!(delivery_retry_backoff_sec(9), 60);
     }
 }

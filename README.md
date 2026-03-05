@@ -42,6 +42,7 @@ cargo build
   - orphan sweep block
   - single-writer lock rejection
   - PR reducer merge transition using mocked gh
+  - delivery retry/backoff metrics with mocked openclaw
 
 ## Quick test
 
