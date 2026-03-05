@@ -80,10 +80,11 @@ No periodic OpenClaw agent turn for monitoring.
 5. Tick loop avg CPU and I/O remain low under idle conditions.
 
 ## Next steps
-1. implement stale daemon/orphan detection
-2. add OpenClaw delivery bridge (thread-targeted send/wake)
-3. add integration tests (start -> wait PR -> merged -> next -> done)
+1. add OpenClaw delivery bridge (thread-targeted send/wake)
+2. add integration tests (start -> wait PR -> merged -> next -> done)
+3. add run lock + CAS guard for multi-writer hardening
 
 ## Progress note
 - notify queue + local dispatcher has been implemented.
 - PR tracking reducer has been implemented with low-load polling + backoff + merged/closed transitions.
+- stale/orphan guard has been implemented via `sweep` command (lease expiry + daemon ownership check).
