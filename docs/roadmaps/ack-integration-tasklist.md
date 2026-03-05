@@ -26,8 +26,9 @@
 - [x] T5: docs/tasklist最終更新＋完了報告
 
 ## Current Execution Plan v2 (approved: visibility/safety first)
-- [ ] S1-1: タスク状態モデルを固定（`queued/running/waiting_merge/blocked/done`）
-- [ ] S1-2: スレ通知契約を固定（`task_started/task_waiting_merge/task_done/task_blocked` 必須）
+- [x] S1-1: タスク状態モデルを固定（`queued/running/waiting_merge/blocked/done`）
+  - `runner-state.json` に `current_task_state` / `current_task_blocked_reason` / `last_task_*` を追加
+- [x] S1-2: スレ通知契約を固定（`task_started/task_waiting_merge/task_done/task_blocked` 必須）
 - [ ] S1-3: `status` 可視化強化（current/last/blocked reason/last PR URL）
 - [ ] S1-4: 完了判定ガードの回帰強化（`TASK_DONE + PR_URL + merged` 必須）
 - [ ] S1-5: stuck検知（状態変化なしの待機を通知）
@@ -101,9 +102,7 @@
   - `./scripts/e2e-smoke.sh ./target/debug/claw-loopd`
 
 ## 次の1手（着手順）
-1. S1-1: タスク状態モデル固定
-2. S1-2: スレ通知契約固定
-3. S1-3: status可視化強化
-4. S1-4: 完了判定ガード回帰強化
-5. S1-5: stuck検知
-6. S1-6: runbook更新
+1. S1-3: status可視化強化
+2. S1-4: 完了判定ガード回帰強化
+3. S1-5: stuck検知
+4. S1-6: runbook更新

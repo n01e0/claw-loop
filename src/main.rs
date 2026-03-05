@@ -199,16 +199,38 @@ struct State {
     ticks: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RunnerTaskState {
+    Queued,
+    Running,
+    WaitingMerge,
+    Blocked,
+    Done,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 struct RunnerState {
+    #[serde(default, alias = "active_task_id")]
+    current_task_id: Option<String>,
+    #[serde(default, alias = "active_task_text")]
+    current_task_text: Option<String>,
+    #[serde(default, alias = "active_task_line")]
+    current_task_line: Option<usize>,
+    #[serde(default, alias = "active_task_started_at")]
+    current_task_started_at: Option<DateTime<Utc>>,
     #[serde(default)]
-    active_task_id: Option<String>,
+    current_task_state: Option<RunnerTaskState>,
     #[serde(default)]
-    active_task_text: Option<String>,
+    current_task_blocked_reason: Option<String>,
     #[serde(default)]
-    active_task_line: Option<usize>,
+    last_task_id: Option<String>,
     #[serde(default)]
-    active_task_started_at: Option<DateTime<Utc>>,
+    last_task_state: Option<RunnerTaskState>,
+    #[serde(default)]
+    last_task_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    last_task_reason: Option<String>,
     #[serde(default)]
     task_loops_started: u64,
     #[serde(default)]
@@ -1749,7 +1771,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                     .clone()
                     .unwrap_or_else(|| "runner paused".to_string());
             } else {
-                if let Some(active_id) = runner_state.active_task_id.clone() {
+                if let Some(active_id) = runner_state.current_task_id.clone() {
                     let (_, _, entries) = load_task_checklist(&task_file_abs)?;
                     match entries.iter().find(|entry| entry.id == active_id) {
                         Some(entry) if entry.done => {
@@ -1765,13 +1787,19 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             queue_notification(
                                 &dir,
                                 &manifest,
-                                "task_completed",
+                                "task_done",
                                 format!("task completed: {}", entry.id),
                             )?;
-                            runner_state.active_task_id = None;
-                            runner_state.active_task_text = None;
-                            runner_state.active_task_line = None;
-                            runner_state.active_task_started_at = None;
+                            runner_state.last_task_id = Some(entry.id.clone());
+                            runner_state.last_task_state = Some(RunnerTaskState::Done);
+                            runner_state.last_task_at = Some(now);
+                            runner_state.last_task_reason = Some("checklist marked done".into());
+                            runner_state.current_task_id = None;
+                            runner_state.current_task_text = None;
+                            runner_state.current_task_line = None;
+                            runner_state.current_task_started_at = None;
+                            runner_state.current_task_state = None;
+                            runner_state.current_task_blocked_reason = None;
                             write_runner_state(&dir, &runner_state)?;
                             task_done_now = task_checklist_done_count(&task_file_abs)?;
                             task_loops_completed =
@@ -1779,9 +1807,29 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                         }
                         Some(entry) => {
                             state.status = LoopStatus::Waiting;
-                            state.summary = format!("task in progress: {}", entry.id);
-                            state.waiting_reason =
-                                format!("waiting for task completion: {}", entry.id);
+                            match runner_state.current_task_state {
+                                Some(RunnerTaskState::WaitingMerge) => {
+                                    state.summary = format!("task waiting_merge: {}", entry.id);
+                                    if state.waiting_reason.is_empty() {
+                                        state.waiting_reason =
+                                            format!("TASK_WAITING_MERGE ({})", entry.id);
+                                    }
+                                }
+                                Some(RunnerTaskState::Blocked) => {
+                                    state.summary = format!("task blocked: {}", entry.id);
+                                    state.waiting_reason = runner_state
+                                        .current_task_blocked_reason
+                                        .clone()
+                                        .unwrap_or_else(|| {
+                                            format!("task blocked without reason: {}", entry.id)
+                                        });
+                                }
+                                _ => {
+                                    state.summary = format!("task running: {}", entry.id);
+                                    state.waiting_reason =
+                                        format!("waiting for task completion: {}", entry.id);
+                                }
+                            }
                         }
                         None => {
                             state.status = LoopStatus::Blocked;
@@ -1790,11 +1838,20 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             state.waiting_reason = "runner state is inconsistent".into();
                             state.updated_at = now;
                             state.version += 1;
+                            runner_state.current_task_state = Some(RunnerTaskState::Blocked);
+                            runner_state.current_task_blocked_reason =
+                                Some("task missing from checklist".into());
+                            runner_state.last_task_id = Some(active_id.clone());
+                            runner_state.last_task_state = Some(RunnerTaskState::Blocked);
+                            runner_state.last_task_at = Some(now);
+                            runner_state.last_task_reason =
+                                Some("task missing from checklist".into());
+                            write_runner_state(&dir, &runner_state)?;
                             write_json(&dir.join("state.json"), &state)?;
                             queue_notification(
                                 &dir,
                                 &manifest,
-                                "runner_failed",
+                                "task_blocked",
                                 format!("active task missing from tasklist: {active_id}"),
                             )?;
                             let _ = flush_notifications(&dir, &manifest)?;
@@ -1803,12 +1860,13 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                     }
                 }
 
-                if runner_state.active_task_id.is_none() {
+                if runner_state.current_task_id.is_none() {
                     let (_, _, entries) = load_task_checklist(&task_file_abs)?;
                     let next = entries.iter().find(|entry| !entry.done).cloned();
 
                     if runner_state.task_loops_started >= manifest.max_task_loops {
                         runner_state.paused = true;
+                        runner_state.current_task_state = None;
                         runner_state.pause_reason = Some(format!(
                             "max_task_loops reached ({}/{})",
                             runner_state.task_loops_started, manifest.max_task_loops
@@ -1828,6 +1886,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                         )?;
                     } else if next.is_none() {
                         runner_state.paused = true;
+                        runner_state.current_task_state = None;
                         runner_state.pause_reason = Some("all tasklist items completed".into());
                         write_runner_state(&dir, &runner_state)?;
                         state.status = LoopStatus::Waiting;
@@ -1841,6 +1900,27 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             "all tasklist items completed; waiting for instruction",
                         )?;
                     } else {
+                        let queued_task = next.clone().expect("checked next.is_some");
+                        runner_state.current_task_id = Some(queued_task.id.clone());
+                        runner_state.current_task_text = Some(queued_task.text.clone());
+                        runner_state.current_task_line = Some(queued_task.line_no);
+                        runner_state.current_task_started_at = Some(now);
+                        runner_state.current_task_state = Some(RunnerTaskState::Queued);
+                        runner_state.current_task_blocked_reason = None;
+                        runner_state.paused = false;
+                        runner_state.pause_reason = None;
+                        write_runner_state(&dir, &runner_state)?;
+
+                        queue_notification(
+                            &dir,
+                            &manifest,
+                            "task_started",
+                            format!("task started: {}", queued_task.id),
+                        )?;
+
+                        runner_state.current_task_state = Some(RunnerTaskState::Running);
+                        write_runner_state(&dir, &runner_state)?;
+
                         let runner = run_task_once(TaskRunOptions {
                             task_file: &task_file_abs,
                             cmd,
@@ -1893,13 +1973,17 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
 
                             state.version += 1;
                             state.status = LoopStatus::Waiting;
-                            state.summary = format!("task waiting: {task_label}");
+                            state.summary = format!("task waiting_merge: {task_label}");
                             state.waiting_reason = if first_stdout_line.is_empty() {
-                                format!("task waiting: {task_label}")
+                                format!("task waiting_merge: {task_label}")
                             } else {
                                 clip_text(&first_stdout_line, 200)
                             };
                             state.updated_at = now;
+
+                            runner_state.current_task_state = Some(RunnerTaskState::WaitingMerge);
+                            runner_state.current_task_blocked_reason = None;
+                            write_runner_state(&dir, &runner_state)?;
                             write_json(&dir.join("state.json"), &state)?;
 
                             if prev_status != LoopStatus::Waiting
@@ -1908,7 +1992,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                 queue_notification(
                                     &dir,
                                     &manifest,
-                                    "task_waiting",
+                                    "task_waiting_merge",
                                     format!("{} ({})", state.waiting_reason, task_label),
                                 )?;
                             }
@@ -1922,12 +2006,22 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                 clip_text(&runner.stderr, 200)
                             );
                             state.updated_at = now;
+
+                            runner_state.current_task_state = Some(RunnerTaskState::Blocked);
+                            runner_state.current_task_blocked_reason =
+                                Some(state.waiting_reason.clone());
+                            runner_state.last_task_id = Some(task_label.clone());
+                            runner_state.last_task_state = Some(RunnerTaskState::Blocked);
+                            runner_state.last_task_at = Some(now);
+                            runner_state.last_task_reason = Some(state.waiting_reason.clone());
+                            write_runner_state(&dir, &runner_state)?;
+
                             write_json(&dir.join("state.json"), &state)?;
                             queue_notification(
                                 &dir,
                                 &manifest,
-                                "runner_failed",
-                                format!("task runner failed for {}", task_label),
+                                "task_blocked",
+                                format!("task blocked: {} ({})", task_label, state.waiting_reason),
                             )?;
                             let _ = flush_notifications(&dir, &manifest)?;
                             break;
@@ -1938,31 +2032,40 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                         {
                             runner_state.task_loops_started =
                                 runner_state.task_loops_started.saturating_add(1);
+
                             if manifest.auto_check_on_success {
+                                runner_state.last_task_id = Some(task.id.clone());
+                                runner_state.last_task_state = Some(RunnerTaskState::Done);
+                                runner_state.last_task_at = Some(now);
+                                runner_state.last_task_reason =
+                                    Some("runner success + auto-check".into());
+                                runner_state.current_task_id = None;
+                                runner_state.current_task_text = None;
+                                runner_state.current_task_line = None;
+                                runner_state.current_task_started_at = None;
+                                runner_state.current_task_state = None;
+                                runner_state.current_task_blocked_reason = None;
+
                                 queue_notification(
                                     &dir,
                                     &manifest,
-                                    "task_completed",
+                                    "task_done",
                                     format!("task completed: {}", task.id),
                                 )?;
                                 task_done_now = task_checklist_done_count(&task_file_abs)?;
                                 task_loops_completed =
                                     task_done_now.saturating_sub(manifest.task_done_baseline);
                             } else {
-                                runner_state.active_task_id = Some(task.id.clone());
-                                runner_state.active_task_text = Some(task.text.clone());
-                                runner_state.active_task_line = Some(task.line_no);
-                                runner_state.active_task_started_at = Some(now);
+                                runner_state.current_task_id = Some(task.id.clone());
+                                runner_state.current_task_text = Some(task.text.clone());
+                                runner_state.current_task_line = Some(task.line_no);
+                                runner_state.current_task_started_at = Some(now);
+                                runner_state.current_task_state = Some(RunnerTaskState::Running);
+                                runner_state.current_task_blocked_reason = None;
                                 state.status = LoopStatus::Waiting;
-                                state.summary = format!("task in progress: {}", task.id);
+                                state.summary = format!("task running: {}", task.id);
                                 state.waiting_reason =
                                     format!("waiting for task completion: {}", task.id);
-                                queue_notification(
-                                    &dir,
-                                    &manifest,
-                                    "task_started",
-                                    format!("task started: {}", task.id),
-                                )?;
                             }
                             write_runner_state(&dir, &runner_state)?;
                         }
@@ -2182,10 +2285,16 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
         "task_runner_cmd": manifest.task_runner_cmd,
         "auto_check_on_success": manifest.auto_check_on_success,
         "task_loops_started": runner_state.task_loops_started,
-        "active_task_id": runner_state.active_task_id,
-        "active_task_text": runner_state.active_task_text,
-        "active_task_line": runner_state.active_task_line,
-        "active_task_started_at": runner_state.active_task_started_at,
+        "current_task_id": runner_state.current_task_id,
+        "current_task_text": runner_state.current_task_text,
+        "current_task_line": runner_state.current_task_line,
+        "current_task_started_at": runner_state.current_task_started_at,
+        "current_task_state": runner_state.current_task_state,
+        "current_task_blocked_reason": runner_state.current_task_blocked_reason,
+        "last_task_id": runner_state.last_task_id,
+        "last_task_state": runner_state.last_task_state,
+        "last_task_at": runner_state.last_task_at,
+        "last_task_reason": runner_state.last_task_reason,
         "paused": runner_state.paused,
         "pause_reason": runner_state.pause_reason,
     });
