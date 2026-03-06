@@ -1916,7 +1916,13 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
             state.updated_at = Utc::now();
             write_json(&dir.join("state.json"), &state)?;
             append_event(&dir, "daemon_stopped", serde_json::json!({}))?;
-            queue_notification(&dir, &manifest, "stopped", "loop daemon stopped")?;
+            let mention = completion_mention_prefix(&manifest);
+            queue_notification(
+                &dir,
+                &manifest,
+                "stopped",
+                format!("{mention}loop daemon stopped"),
+            )?;
             let _ = flush_notifications(&dir, &manifest)?;
             break;
         }
@@ -2260,11 +2266,15 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                     "max_runtime_sec": manifest.max_runtime_sec,
                 }),
             )?;
+            let mention = completion_mention_prefix(&manifest);
             queue_notification(
                 &dir,
                 &manifest,
                 "auto_stopped",
-                format!("loop daemon auto-stopped: {}", state.waiting_reason),
+                format!(
+                    "{mention}loop daemon auto-stopped: {}",
+                    state.waiting_reason
+                ),
             )?;
             let _ = flush_notifications(&dir, &manifest)?;
             break;
@@ -2401,11 +2411,12 @@ fn cmd_stop(repo: PathBuf, run_id: Uuid, immediate: bool) -> Result<()> {
                 "state_version": state.version,
             }),
         )?;
+        let mention = completion_mention_prefix(&manifest);
         queue_notification(
             &dir,
             &manifest,
             "stopped",
-            "loop daemon stopped immediately by kill switch".to_string(),
+            format!("{mention}loop daemon stopped immediately by kill switch"),
         )?;
     }
 
