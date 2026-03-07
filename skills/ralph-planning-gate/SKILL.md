@@ -61,13 +61,13 @@ claw-loopd start \
   --tick-sec 60 \
   --deliver-openclaw \
   --max-task-loops 10 \
-  --max-runtime-sec 3600 \
   --task-file <tasklist_path> \
   --task-runner-cmd './scripts/rl-task-agent.sh' \
   --auto-check-on-success true
 ```
 
 If strict manual completion is requested, use `--auto-check-on-success false`.
+Use `--max-runtime-sec` only when you explicitly want time-bounded execution.
 
 ## Report policy after start
 - Report task start, completion, failure, and limit reached.

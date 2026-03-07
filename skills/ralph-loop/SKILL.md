@@ -13,7 +13,8 @@ Collect all of these before start:
 - `thread_id` (current Discord thread id)
 - `tick_sec` (default 60)
 - delivery mode (`--deliver-openclaw` on/off)
-- safety guard (`--max-task-loops` / `--max-ticks` / `--max-runtime-sec`) ※`max_task_loops` のデフォルトは 10
+- safety guard (`--max-task-loops` / `--max-ticks`) ※`max_task_loops` のデフォルトは 10
+- `--max-runtime-sec` は必要時のみ指定（長時間pause運用では未指定推奨）
 - dogfood runner command (`--task-runner-cmd`) ※未指定時は monitor_only
 - 推奨 runner: `scripts/rl-task-agent.sh`（PR作成→auto-merge→merge確認まで実施）
 - `--auto-check-on-success` default は `true`（runner成功時に自動チェック）
@@ -32,7 +33,7 @@ Never start without `thread_id` + `session_key`.
 2. Resolve requester id from inbound metadata:
    - use current message `sender_id` as `<discord_user_id>`
 3. Start daemon:
-   - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --requester-user-id <discord_user_id> --tick-sec 60 --deliver-openclaw --max-task-loops 10 --max-runtime-sec 3600 --task-runner-cmd './scripts/rl-task-agent.sh'`
+   - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --requester-user-id <discord_user_id> --tick-sec 60 --deliver-openclaw --max-task-loops 10 --task-runner-cmd './scripts/rl-task-agent.sh'`
    - default: runner成功で自動チェックして次へ進む（`--auto-check-on-success=true`）
    - `--auto-check-on-success=false` で完了確認待ちモード（進行中タスクが完了チェックされるまで次は開始しない）
 4. Post `run_id` in-thread immediately.
