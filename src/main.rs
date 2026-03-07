@@ -825,6 +825,11 @@ fn completion_mention_prefix(manifest: &Manifest) -> String {
     String::new()
 }
 
+fn should_suppress_waiting_stuck(runner_state: &RunnerState) -> bool {
+    runner_state.paused
+        && runner_state.pause_reason.as_deref() == Some("all tasklist items completed")
+}
+
 fn update_waiting_stuck_tracker(
     runner_state: &mut RunnerState,
     status: &LoopStatus,
@@ -2308,7 +2313,9 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
         let pr_changed = reduce_pr_tracking(&dir, &manifest, &mut state)?;
         let mut stuck_notified_ticks = None;
         let stuck_threshold = stuck_wait_ticks_threshold();
-        if manifest.task_runner_cmd.is_some() {
+        let suppress_waiting_stuck = should_suppress_waiting_stuck(&runner_state);
+
+        if manifest.task_runner_cmd.is_some() && !suppress_waiting_stuck {
             stuck_notified_ticks = update_waiting_stuck_tracker(
                 &mut runner_state,
                 &state.status,
@@ -2364,6 +2371,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                 "waiting_unchanged_ticks": runner_state.waiting_unchanged_ticks,
                 "waiting_stuck_threshold": stuck_threshold,
                 "waiting_stuck_notified": stuck_notified_ticks,
+                "waiting_stuck_suppressed": suppress_waiting_stuck,
             }),
         )?;
 
@@ -3341,8 +3349,8 @@ mod tests {
         classify_ack_failure_category, compute_auto_stop_reason, compute_backoff_sec,
         dead_letter_path, delivery_ack_path, delivery_attempts_path, delivery_retry_backoff_sec,
         extract_pr_url, flush_notifications, lease_window_sec, normalize_error_reason,
-        parse_task_checklist_entry, read_jsonl, update_waiting_stuck_tracker,
-        validate_task_done_contract_with,
+        parse_task_checklist_entry, read_jsonl, should_suppress_waiting_stuck,
+        update_waiting_stuck_tracker, validate_task_done_contract_with,
     };
     use chrono::{Duration, Utc};
     use std::{
@@ -3832,5 +3840,25 @@ mod tests {
         assert_eq!(runner.waiting_unchanged_ticks, 0);
         assert!(runner.waiting_last_summary.is_none());
         assert!(runner.waiting_last_reason.is_none());
+    }
+
+    #[test]
+    fn waiting_stuck_is_suppressed_when_paused_all_tasks_completed() {
+        let runner = RunnerState {
+            paused: true,
+            pause_reason: Some("all tasklist items completed".into()),
+            ..RunnerState::default()
+        };
+        assert!(should_suppress_waiting_stuck(&runner));
+    }
+
+    #[test]
+    fn waiting_stuck_is_not_suppressed_for_other_pause_reason() {
+        let runner = RunnerState {
+            paused: true,
+            pause_reason: Some("max_task_loops reached (10/10)".into()),
+            ..RunnerState::default()
+        };
+        assert!(!should_suppress_waiting_stuck(&runner));
     }
 }

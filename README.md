@@ -84,7 +84,7 @@ cargo build
 # 1) start daemon (OpenClaw delivery有効化するなら --deliver-openclaw を付ける)
 # max-task-loops はデフォルト10（task_fileのdone増分ベース）
 # task-runner-cmd を付けると dogfood 実行モード（defaultはagent判定で自動チェック）
-cargo run -- start --repo . --session-key test --channel discord --thread-id thread-test --requester-user-id 123456789012345678 --tick-sec 1 --deliver-openclaw --max-runtime-sec 3600 --task-runner-cmd './scripts/rl-task-agent.sh'
+cargo run -- start --repo . --session-key test --channel discord --thread-id thread-test --requester-user-id 123456789012345678 --tick-sec 1 --deliver-openclaw --task-runner-cmd './scripts/rl-task-agent.sh'
 
 # 2) bind PR tracking (example)
 cargo run -- track-pr --repo . --run-id <RUN_ID> --gh-repo n01e0/dimpact --pr 24 --merge-method merge
