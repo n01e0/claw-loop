@@ -10,6 +10,9 @@ repo_path="$(pwd)"
 thread_id="${CLAW_THREAD_ID:-}"
 channel="${CLAW_CHANNEL:-discord}"
 run_id="${CLAW_RUN_ID:-local}"
+agent_id="${CLAW_AGENT_ID:-main}"
+agent_session_id="rl-${run_id}-${CLAW_TASK_ID}"
+agent_timeout_sec="${CLAW_AGENT_TIMEOUT_SEC:-1800}"
 
 state_root="${repo_path}/.ralph/runner-agent-state/${run_id}"
 mkdir -p "$state_root"
@@ -114,14 +117,19 @@ PROMPT+="Task file: ${CLAW_TASK_FILE:-}"$'\n'
 PROMPT+="Run ID: ${run_id}"$'\n'
 
 set +e
-raw_out="$(openclaw agent --local --agent main --timeout 1800 --message "$PROMPT" --json 2>&1)"
+raw_out="$(openclaw agent --local --agent "$agent_id" --session-id "$agent_session_id" --timeout "$agent_timeout_sec" --message "$PROMPT" --json 2>&1)"
 rc=$?
 set -e
 
 if [[ "$rc" -ne 0 ]]; then
+  if printf '%s' "$raw_out" | grep -qi "session file locked"; then
+    notify_thread "⏳ ${CLAW_TASK_ID} waiting: agent(${agent_id}) session lock"
+    echo "TASK_WAITING_AGENT_LOCK"
+    exit 10
+  fi
   echo "TASK_BLOCKED: openclaw agent command failed (rc=$rc)" >&2
   printf '%s\n' "$raw_out" >&2
-  notify_thread "❌ ${CLAW_TASK_ID} blocked: openclaw agent command failed"
+  notify_thread "❌ ${CLAW_TASK_ID} blocked: openclaw agent(${agent_id}) command failed"
   exit 2
 fi
 

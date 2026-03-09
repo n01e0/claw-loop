@@ -50,6 +50,7 @@ Start only after a clear yes.
 ## Loop start template
 After approval, start with explicit runner mode.
 Resolve `<discord_user_id>` from inbound `sender_id` of the request message (never hardcode in repo files).
+Resolve `<agent_id>` as project-specific loop agent id (avoid `main` when running loops in parallel).
 
 ```bash
 claw-loopd start \
@@ -58,6 +59,7 @@ claw-loopd start \
   --channel discord \
   --thread-id <thread_id> \
   --requester-user-id <discord_user_id> \
+  --task-agent-id <agent_id> \
   --tick-sec 60 \
   --deliver-openclaw \
   --max-task-loops 10 \
