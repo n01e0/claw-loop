@@ -17,6 +17,7 @@ Collect all of these before start:
 - `--max-runtime-sec` は必要時のみ指定（長時間pause運用では未指定推奨）
 - dogfood runner command (`--task-runner-cmd`) ※未指定時は monitor_only
 - 推奨 runner: `scripts/rl-task-agent.sh`（PR作成→auto-merge→merge確認まで実施）
+- `--task-agent-id <agent_id>`（ループ専用agent。並列運用時はループごとに分離）
 - `--auto-check-on-success` default は `true`（runner成功時に自動チェック）
 - `--requester-user-id <discord_user_id>`（完了時メンション先。固定値は使わない）
   - Discord運用では、起動を指示したメッセージの `sender_id` をそのまま渡す
@@ -32,12 +33,14 @@ Never start without `thread_id` + `session_key`.
    - if tasklist is not approved yet, run `ralph-planning-gate` first
 2. Resolve requester id from inbound metadata:
    - use current message `sender_id` as `<discord_user_id>`
-3. Start daemon:
-   - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --requester-user-id <discord_user_id> --tick-sec 60 --deliver-openclaw --max-task-loops 10 --task-runner-cmd './scripts/rl-task-agent.sh'`
+3. Resolve loop agent id:
+   - use project-specific agent id (e.g., `loop-worker-<project>`)
+4. Start daemon:
+   - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --requester-user-id <discord_user_id> --task-agent-id <agent_id> --tick-sec 60 --deliver-openclaw --max-task-loops 10 --task-runner-cmd './scripts/rl-task-agent.sh'`
    - default: runner成功で自動チェックして次へ進む（`--auto-check-on-success=true`）
    - `--auto-check-on-success=false` で完了確認待ちモード（進行中タスクが完了チェックされるまで次は開始しない）
-4. Post `run_id` in-thread immediately.
-5. Record first planned loop item.
+5. Post `run_id` in-thread immediately.
+6. Record first planned loop item.
 
 ## Command set (operator minimum)
 - Status:
