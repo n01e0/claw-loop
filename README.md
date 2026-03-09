@@ -18,6 +18,7 @@ Thread-bound monitored Ralph loop daemon (Rust).
   - recommended: `scripts/rl-task-agent.sh` (task agent must produce PR and wait/confirm merge)
   - `start --task-agent-id <agent_id>` でループ専用agentを指定（並列時はループごとに分離推奨）
   - `start --requester-user-id <id>` を指定すると、all tasks完了時にそのユーザーへメンション付きサマリ通知
+  - `start --feedback-thread-id <thread_id> [--feedback-channel <channel>]` で、完了サマリを別スレ（main集約先）にも送信
   - default (`--auto-check-on-success=true`): runner successを完了判定として自動チェック
   - optional (`--auto-check-on-success=false`): runner starts one task, then waits until checklistが完了になるまで次を開始しない
   - runner can return `TASK_WAITING_MERGE` (exit 10) to keep task in waiting instead of failing
@@ -85,7 +86,7 @@ cargo build
 # 1) start daemon (OpenClaw delivery有効化するなら --deliver-openclaw を付ける)
 # max-task-loops はデフォルト10（task_fileのdone増分ベース）
 # task-runner-cmd を付けると dogfood 実行モード（defaultはagent判定で自動チェック）
-cargo run -- start --repo . --session-key test --channel discord --thread-id thread-test --requester-user-id 123456789012345678 --task-agent-id loop-worker --tick-sec 1 --deliver-openclaw --task-runner-cmd './scripts/rl-task-agent.sh'
+cargo run -- start --repo . --session-key test --channel discord --thread-id thread-test --requester-user-id 123456789012345678 --task-agent-id loop-worker --feedback-thread-id 111111111111111111 --feedback-channel discord --tick-sec 1 --deliver-openclaw --task-runner-cmd './scripts/rl-task-agent.sh'
 
 # 2) bind PR tracking (example)
 cargo run -- track-pr --repo . --run-id <RUN_ID> --gh-repo n01e0/dimpact --pr 24 --merge-method merge

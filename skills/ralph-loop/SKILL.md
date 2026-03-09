@@ -21,6 +21,7 @@ Collect all of these before start:
 - `--auto-check-on-success` default は `true`（runner成功時に自動チェック）
 - `--requester-user-id <discord_user_id>`（完了時メンション先。固定値は使わない）
   - Discord運用では、起動を指示したメッセージの `sender_id` をそのまま渡す
+- `--feedback-thread-id <thread_id> [--feedback-channel <channel>]`（完了サマリのmain集約先）
 
 Never start without `thread_id` + `session_key`.
 
@@ -35,12 +36,14 @@ Never start without `thread_id` + `session_key`.
    - use current message `sender_id` as `<discord_user_id>`
 3. Resolve loop agent id:
    - use project-specific agent id (e.g., `loop-worker-<project>`)
-4. Start daemon:
-   - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --requester-user-id <discord_user_id> --task-agent-id <agent_id> --tick-sec 60 --deliver-openclaw --max-task-loops 10 --task-runner-cmd './scripts/rl-task-agent.sh'`
+4. Resolve aggregation target:
+   - use main control thread id as `<feedback_thread_id>`
+5. Start daemon:
+   - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --requester-user-id <discord_user_id> --task-agent-id <agent_id> --feedback-thread-id <feedback_thread_id> --feedback-channel discord --tick-sec 60 --deliver-openclaw --max-task-loops 10 --task-runner-cmd './scripts/rl-task-agent.sh'`
    - default: runner成功で自動チェックして次へ進む（`--auto-check-on-success=true`）
    - `--auto-check-on-success=false` で完了確認待ちモード（進行中タスクが完了チェックされるまで次は開始しない）
-5. Post `run_id` in-thread immediately.
-6. Record first planned loop item.
+6. Post `run_id` in-thread immediately.
+7. Record first planned loop item.
 
 ## Command set (operator minimum)
 - Status:

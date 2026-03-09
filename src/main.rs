@@ -18,6 +18,7 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     Start {
         #[arg(long)]
@@ -34,6 +35,10 @@ enum Commands {
         requester_user_id: Option<String>,
         #[arg(long)]
         task_agent_id: Option<String>,
+        #[arg(long)]
+        feedback_thread_id: Option<String>,
+        #[arg(long)]
+        feedback_channel: Option<String>,
         #[arg(long, default_value_t = 60)]
         tick_sec: u64,
         #[arg(long, default_value_t = false)]
@@ -163,6 +168,10 @@ struct Manifest {
     requester_user_id: Option<String>,
     #[serde(default)]
     task_agent_id: Option<String>,
+    #[serde(default)]
+    feedback_thread_id: Option<String>,
+    #[serde(default)]
+    feedback_channel: Option<String>,
     started_at: DateTime<Utc>,
     daemon_pid: u32,
     #[serde(default)]
@@ -382,6 +391,8 @@ struct StartOptions {
     owner_message_id: Option<String>,
     requester_user_id: Option<String>,
     task_agent_id: Option<String>,
+    feedback_thread_id: Option<String>,
+    feedback_channel: Option<String>,
     tick_sec: u64,
     deliver_openclaw: bool,
     max_ticks: Option<u64>,
@@ -645,18 +656,20 @@ fn append_event(run_dir: &Path, kind: &str, extra: serde_json::Value) -> Result<
     append_jsonl(&path, &line)
 }
 
-fn queue_notification(
+fn queue_notification_target(
     run_dir: &Path,
-    manifest: &Manifest,
+    run_id: Uuid,
+    channel: String,
+    thread_id: String,
     kind: impl Into<String>,
     message: impl Into<String>,
 ) -> Result<Uuid> {
     let n = Notification {
         event_id: Uuid::new_v4(),
-        run_id: manifest.run_id,
+        run_id,
         ts: Utc::now(),
-        channel: manifest.channel.clone(),
-        thread_id: manifest.thread_id.clone(),
+        channel,
+        thread_id,
         kind: kind.into(),
         message: message.into(),
         attempts: 0,
@@ -667,9 +680,30 @@ fn queue_notification(
     append_event(
         run_dir,
         "notify_enqueued",
-        serde_json::json!({"event_id": n.event_id, "kind": n.kind}),
+        serde_json::json!({
+            "event_id": n.event_id,
+            "kind": n.kind,
+            "channel": n.channel,
+            "thread_id": n.thread_id,
+        }),
     )?;
     Ok(n.event_id)
+}
+
+fn queue_notification(
+    run_dir: &Path,
+    manifest: &Manifest,
+    kind: impl Into<String>,
+    message: impl Into<String>,
+) -> Result<Uuid> {
+    queue_notification_target(
+        run_dir,
+        manifest.run_id,
+        manifest.channel.clone(),
+        manifest.thread_id.clone(),
+        kind,
+        message,
+    )
 }
 
 fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> {
@@ -829,6 +863,39 @@ fn completion_mention_prefix(manifest: &Manifest) -> String {
         return format!("<@{}> ", user_id.trim());
     }
     String::new()
+}
+
+fn queue_main_feedback_summary(
+    run_dir: &Path,
+    manifest: &Manifest,
+    summary_message: &str,
+) -> Result<Option<Uuid>> {
+    let Some(thread_id) = manifest.feedback_thread_id.as_deref() else {
+        return Ok(None);
+    };
+    let thread_id = thread_id.trim();
+    if thread_id.is_empty() {
+        return Ok(None);
+    }
+
+    let channel = manifest
+        .feedback_channel
+        .clone()
+        .unwrap_or_else(|| manifest.channel.clone());
+
+    if channel == manifest.channel && thread_id == manifest.thread_id {
+        return Ok(None);
+    }
+
+    let event_id = queue_notification_target(
+        run_dir,
+        manifest.run_id,
+        channel,
+        thread_id.to_string(),
+        "main_feedback",
+        summary_message.to_string(),
+    )?;
+    Ok(Some(event_id))
 }
 
 fn should_suppress_waiting_stuck(runner_state: &RunnerState) -> bool {
@@ -1849,6 +1916,8 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
         owner_message_id: opts.owner_message_id,
         requester_user_id: opts.requester_user_id,
         task_agent_id: opts.task_agent_id,
+        feedback_thread_id: opts.feedback_thread_id,
+        feedback_channel: opts.feedback_channel,
         started_at: now,
         daemon_pid: child.id(),
         deliver_openclaw: opts.deliver_openclaw,
@@ -2102,7 +2171,13 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             task_done_now,
                             last_task,
                         );
-                        queue_notification(&dir, &manifest, "all_tasks_completed", summary)?;
+                        queue_notification(
+                            &dir,
+                            &manifest,
+                            "all_tasks_completed",
+                            summary.clone(),
+                        )?;
+                        let _ = queue_main_feedback_summary(&dir, &manifest, &summary)?;
                     } else {
                         let queued_task = next.clone().expect("checked next.is_some");
                         runner_state.current_task_id = Some(queued_task.id.clone());
@@ -2572,6 +2647,8 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
             "thread_id": manifest.thread_id,
             "session_key": manifest.session_key,
             "requester_user_id": manifest.requester_user_id,
+            "feedback_thread_id": manifest.feedback_thread_id,
+            "feedback_channel": manifest.feedback_channel,
             "status": state.status,
             "summary": state.summary,
             "waiting_reason": state.waiting_reason,
@@ -3276,6 +3353,8 @@ fn main() -> Result<()> {
             owner_message_id,
             requester_user_id,
             task_agent_id,
+            feedback_thread_id,
+            feedback_channel,
             tick_sec,
             deliver_openclaw,
             max_ticks,
@@ -3292,6 +3371,8 @@ fn main() -> Result<()> {
             owner_message_id,
             requester_user_id,
             task_agent_id,
+            feedback_thread_id,
+            feedback_channel,
             tick_sec,
             deliver_openclaw,
             max_ticks,
@@ -3403,6 +3484,8 @@ mod tests {
             owner_message_id: None,
             requester_user_id: None,
             task_agent_id: None,
+            feedback_thread_id: None,
+            feedback_channel: None,
             started_at: Utc::now(),
             daemon_pid: std::process::id(),
             deliver_openclaw,
