@@ -32,6 +32,8 @@ enum Commands {
         owner_message_id: Option<String>,
         #[arg(long)]
         requester_user_id: Option<String>,
+        #[arg(long)]
+        task_agent_id: Option<String>,
         #[arg(long, default_value_t = 60)]
         tick_sec: u64,
         #[arg(long, default_value_t = false)]
@@ -159,6 +161,8 @@ struct Manifest {
     owner_message_id: Option<String>,
     #[serde(default)]
     requester_user_id: Option<String>,
+    #[serde(default)]
+    task_agent_id: Option<String>,
     started_at: DateTime<Utc>,
     daemon_pid: u32,
     #[serde(default)]
@@ -377,6 +381,7 @@ struct StartOptions {
     thread_id: String,
     owner_message_id: Option<String>,
     requester_user_id: Option<String>,
+    task_agent_id: Option<String>,
     tick_sec: u64,
     deliver_openclaw: bool,
     max_ticks: Option<u64>,
@@ -805,6 +810,7 @@ struct TaskRunOptions<'a> {
     run_id: Option<Uuid>,
     thread_id: Option<&'a str>,
     channel: Option<&'a str>,
+    task_agent_id: Option<&'a str>,
 }
 
 fn clip_text(input: &str, max_chars: usize) -> String {
@@ -992,6 +998,9 @@ fn run_task_once(opts: TaskRunOptions<'_>) -> Result<TaskRunOutcome> {
     }
     if let Some(channel) = opts.channel {
         command.env("CLAW_CHANNEL", channel);
+    }
+    if let Some(task_agent_id) = opts.task_agent_id {
+        command.env("CLAW_AGENT_ID", task_agent_id);
     }
 
     if let Some(cwd) = opts.cwd {
@@ -1839,6 +1848,7 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
         thread_id: opts.thread_id,
         owner_message_id: opts.owner_message_id,
         requester_user_id: opts.requester_user_id,
+        task_agent_id: opts.task_agent_id,
         started_at: now,
         daemon_pid: child.id(),
         deliver_openclaw: opts.deliver_openclaw,
@@ -2118,6 +2128,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             run_id: Some(run_id),
                             thread_id: Some(&manifest.thread_id),
                             channel: Some(&manifest.channel),
+                            task_agent_id: manifest.task_agent_id.as_deref(),
                         })?;
 
                         append_event(
@@ -2528,6 +2539,7 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
     let runner_view = serde_json::json!({
         "mode": runner_mode,
         "task_runner_cmd": manifest.task_runner_cmd,
+        "task_agent_id": manifest.task_agent_id,
         "auto_check_on_success": manifest.auto_check_on_success,
         "task_loops_started": runner_state.task_loops_started,
         "waiting_stuck_threshold": stuck_wait_ticks_threshold(),
@@ -3225,6 +3237,7 @@ fn cmd_task_run_once(
         run_id: None,
         thread_id: None,
         channel: None,
+        task_agent_id: None,
     })?;
 
     println!(
@@ -3262,6 +3275,7 @@ fn main() -> Result<()> {
             thread_id,
             owner_message_id,
             requester_user_id,
+            task_agent_id,
             tick_sec,
             deliver_openclaw,
             max_ticks,
@@ -3277,6 +3291,7 @@ fn main() -> Result<()> {
             thread_id,
             owner_message_id,
             requester_user_id,
+            task_agent_id,
             tick_sec,
             deliver_openclaw,
             max_ticks,
@@ -3387,6 +3402,7 @@ mod tests {
             thread_id: "test-thread".to_string(),
             owner_message_id: None,
             requester_user_id: None,
+            task_agent_id: None,
             started_at: Utc::now(),
             daemon_pid: std::process::id(),
             deliver_openclaw,
