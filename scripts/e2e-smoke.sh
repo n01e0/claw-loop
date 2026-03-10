@@ -831,7 +831,7 @@ import json, sys
 obj = json.loads(sys.argv[1])
 runner = obj.get("runner") or {}
 ok = (
-    obj.get("status") == "waiting"
+    obj.get("status") == "stopped"
     and runner.get("pause_reason") == "all tasklist items completed"
     and int(obj.get("pending_notifications", 0)) == 0
 )
