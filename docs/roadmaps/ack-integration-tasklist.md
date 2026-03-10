@@ -123,8 +123,16 @@
 - [x] S4-3: task通知をsingle-status編集ベースへ移行（started/waiting/progressはedit、重要イベントのみ新規投稿）
 - [x] S4-4: e2e + runbook更新（通知欠落/重複/編集失敗フォールバックを検証）
 
+## Current Execution Plan v6 (approved: timeout + notify-path unification)
+- [x] S5-1: OpenClaw通知timeout設計を修正（固定5sを廃止し、設定可能 + 安全なデフォルト値へ）
+- [ ] S5-2: 通知経路をdaemonへ一元化（`scripts/rl-task-agent.sh` の direct `message send` 通知を撤廃）
+- [ ] S5-3: daemon側のstatus message確立フローを強化（初回送信失敗時の再試行/復旧で `status_message_id` を確実化）
+- [ ] S5-4: 回帰テスト + e2e + runbook更新（timeout遅延/通知重複なし/single-status更新を固定）
+- [ ] S5-5: 全タスク完了時の自動停止を追加（`all_tasks_completed` 後に `waiting` ではなく `stopped` へ遷移）
+
 ## 次の1手（着手順）
-1. S4-1: merge確認ガード堅牢化
-2. S4-2: all_tasks_completed通知保証
-3. S4-3: task通知のsingle-status編集化
-4. S4-4: e2e/runbook更新
+1. S5-1: OpenClaw通知timeout設計修正
+2. S5-2: 通知経路のdaemon一元化
+3. S5-3: status message確立フロー強化
+4. S5-4: 回帰テスト/e2e/runbook更新
+5. S5-5: 全タスク完了時の自動停止
