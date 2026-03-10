@@ -60,6 +60,19 @@ Thread-bound monitored Ralph loop daemon (Rust).
 - 24h soak scenario: `docs/specs/ack-soak-24h.md` (`scripts/soak-24h.sh`)
 - Dogfood runbook: `docs/runbooks/dogfood-runbook.md`
 
+## Code structure
+
+- `src/main.rs`
+  - CLI entrypoint, daemon loop orchestration, runtime wiring
+- `src/notify_policy.rs`
+  - notification delivery mode routing (`send` vs `edit`)
+  - OpenClaw message-id parsing
+  - retry/backoff policy and error normalization
+- `src/tasklist.rs`
+  - task checklist parsing/counting/updating helpers
+
+When adding new behavior, prefer extending the module that owns the concern first, then keep `main.rs` as orchestration glue.
+
 ## Build
 
 ```bash
@@ -70,6 +83,7 @@ cargo build
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --all --all-features`
+- `find scripts -type f -name '*.sh' -print0 | xargs -0 -r -n1 bash -n`
 - `./scripts/e2e-smoke.sh ./target/debug/claw-loopd`
   - lifecycle (start/notify/stop)
   - orphan sweep block
@@ -79,6 +93,7 @@ cargo build
   - dead-letter transition + failed-only report filter
   - dead-letter requeue back to pending queue
   - requeue idempotency (`--event-id`) + dry-run behavior
+  - single-status post reduction + duplicate suppression
 
 ## Quick test
 
