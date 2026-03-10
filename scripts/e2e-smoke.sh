@@ -354,8 +354,8 @@ if [[ -z "$RUN6" ]]; then
   echo "$OUT6"
   exit 1
 fi
-$BIN notify --repo "$WORKDIR" --run-id "$RUN6" --kind progress --message "should dead-letter A" >/dev/null
-$BIN notify --repo "$WORKDIR" --run-id "$RUN6" --kind progress --message "should dead-letter B" >/dev/null
+$BIN notify --repo "$WORKDIR" --run-id "$RUN6" --kind blocked --message "should dead-letter A" >/dev/null
+$BIN notify --repo "$WORKDIR" --run-id "$RUN6" --kind blocked --message "should dead-letter B" >/dev/null
 sleep 3
 STATUS6="$($BIN status --repo "$WORKDIR" --run-id "$RUN6")"
 python3 - <<'PY' "$STATUS6"
@@ -398,8 +398,8 @@ if hist[0].get("reason") != "openclaw_send_failed":
 by_kind = obj.get("failed_reason_histogram_by_kind") or []
 if not by_kind:
     raise SystemExit(f"expected failed_reason_histogram_by_kind entries, got: {by_kind}")
-if by_kind[0].get("kind") != "progress":
-    raise SystemExit(f"expected kind 'progress', got: {by_kind}")
+if by_kind[0].get("kind") != "blocked":
+    raise SystemExit(f"expected kind 'blocked', got: {by_kind}")
 print(items[0]["event_id"])
 PY
 )"
@@ -484,7 +484,7 @@ if [[ -z "$RUN8" ]]; then
   echo "$OUT8"
   exit 1
 fi
-$BIN notify --repo "$WORKDIR" --run-id "$RUN8" --kind progress --message "run8 fail then resend" >/dev/null
+$BIN notify --repo "$WORKDIR" --run-id "$RUN8" --kind blocked --message "run8 fail then resend" >/dev/null
 sleep 3
 REPORT8_FAIL="$($BIN delivery-report --repo "$WORKDIR" --run-id "$RUN8" --limit 10 --status failed)"
 EVENT8_ID="$(python3 - <<'PY' "$REPORT8_FAIL"
