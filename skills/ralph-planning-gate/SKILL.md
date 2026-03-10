@@ -43,7 +43,7 @@ Before loop start, send:
 - proposed tasklist
 - loop runtime settings
 
-Then ask: "このタスクリストで開始していい?"
+Then ask: "Can we start with this tasklist?"
 
 Start only after a clear yes.
 

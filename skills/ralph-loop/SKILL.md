@@ -1,6 +1,6 @@
 ---
 name: ralph-loop
-description: Operate thread-bound claw-loopd runs for "ralph loopでやって" requests. Use when you must start/monitor/stop autonomous iteration in a Discord thread, keep waiting/blocked reasons explicit, and route notifications to the same thread.
+description: Operate thread-bound claw-loopd runs for "ralph loop" requests. Use when you must start/monitor/stop autonomous iteration in a Discord thread, keep waiting/blocked reasons explicit, and route notifications to the same thread.
 ---
 
 # Ralph Loop (thread-bound daemon)
@@ -13,15 +13,15 @@ Collect all of these before start:
 - `thread_id` (current Discord thread id)
 - `tick_sec` (default 60)
 - delivery mode (`--deliver-openclaw` on/off)
-- safety guard (`--max-task-loops` / `--max-ticks`) ※`max_task_loops` のデフォルトは 10
-- `--max-runtime-sec` は必要時のみ指定（長時間pause運用では未指定推奨）
-- dogfood runner command (`--task-runner-cmd`) ※未指定時は monitor_only
-- 推奨 runner: `scripts/rl-task-agent.sh`（PR作成→auto-merge→merge確認まで実施）
-- `--task-agent-id <agent_id>`（ループ専用agent。並列運用時はループごとに分離）
-- `--auto-check-on-success` default は `true`（runner成功時に自動チェック）
-- `--requester-user-id <discord_user_id>`（完了時メンション先。固定値は使わない）
-  - Discord運用では、起動を指示したメッセージの `sender_id` をそのまま渡す
-- `--feedback-thread-id <thread_id> [--feedback-channel <channel>]`（完了サマリのmain集約先）
+- safety guard (`--max-task-loops` / `--max-ticks`), with `max_task_loops` defaulting to `10`
+- `--max-runtime-sec` only when needed (omit for long pause-oriented operation)
+- dogfood runner command (`--task-runner-cmd`), monitor-only when omitted
+- recommended runner: `scripts/rl-task-agent.sh` (PR creation → auto-merge → merge confirmation)
+- `--task-agent-id <agent_id>` (dedicated loop agent; split per loop for parallel operation)
+- `--auto-check-on-success` defaults to `true` (auto-check on runner success)
+- `--requester-user-id <discord_user_id>` (completion mention target; never hardcode)
+  - in Discord operation, pass the triggering message `sender_id` directly
+- `--feedback-thread-id <thread_id> [--feedback-channel <channel>]` (main aggregation target for completion summaries)
 
 Never start without `thread_id` + `session_key`.
 
@@ -40,8 +40,8 @@ Never start without `thread_id` + `session_key`.
    - use main control thread id as `<feedback_thread_id>`
 5. Start daemon:
    - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --requester-user-id <discord_user_id> --task-agent-id <agent_id> --feedback-thread-id <feedback_thread_id> --feedback-channel discord --tick-sec 60 --deliver-openclaw --max-task-loops 10 --task-runner-cmd './scripts/rl-task-agent.sh'`
-   - default: runner成功で自動チェックして次へ進む（`--auto-check-on-success=true`）
-   - `--auto-check-on-success=false` で完了確認待ちモード（進行中タスクが完了チェックされるまで次は開始しない）
+   - default: auto-check and continue on runner success (`--auto-check-on-success=true`)
+   - with `--auto-check-on-success=false`, run in completion-gated mode (do not start the next task until the active task is checked complete)
 6. Post `run_id` in-thread immediately.
 7. Record first planned loop item.
 
@@ -77,7 +77,7 @@ Daemon notifications are lifecycle-level:
 - `pr_closed`: tracked PR closed without merge
 - `all_tasks_completed`: tasklist has no open item
 - `orphan_blocked`: sweep detected expired lease + missing daemon
-- `auto_stopped`: max-task-loops / max-ticks / max-runtime に到達
+- `auto_stopped`: max-task-loops / max-ticks / max-runtime reached
 - `stopped`: stop request processed
 - `terminal`: daemon exits because state is `done|failed|stopped`
 
@@ -97,13 +97,13 @@ Always set explicit `waiting_reason` for `waiting` and `blocked`.
 
 ## Stop semantics (Discord operations)
 - Discord users stop runs by asking the agent **or** native command kill switch.
-- Normal stop: `claw-loopd stop ...` → daemon stops on next tick after seeing `control.stop`.
-- Immediate stop: `claw-loopd stop ... --immediate` → stateを即 `stopped` 化し、daemon pidをTERM/KILLで停止。
+- Normal stop: `claw-loopd stop ...` -> daemon stops on next tick after seeing `control.stop`.
+- Immediate stop: `claw-loopd stop ... --immediate` -> set state to `stopped` immediately and stop daemon PID with TERM/KILL.
 - Stop latency target:
   - normal: `<= tick_sec + flush time`
   - immediate: near-immediate (process signal + local flush)
 
-`blocked` は即停止しない（ただし max-task-loops / max-ticks / max-runtime 到達時は `auto_stopped`）。
+`blocked` does not stop immediately by itself (except when max-task-loops / max-ticks / max-runtime is reached and `auto_stopped` is triggered).
 
 ## Per-loop reporting rules
 - Send one progress update per loop minimum.
