@@ -110,10 +110,16 @@
 - [x] S2-5: e2e追加（投稿数削減と重複抑止の検証）
 - [x] S2-6: runbook更新（single-status運用と復旧手順）
 
+## Current Execution Plan v4 (approved: docs/ci/refactor)
+- [x] S3-1: READMEの日本語を英語へ統一（意味を保ちつつ全体整合）
+- [ ] S3-2: CIへscript構文チェック追加（`bash -n` を自動実行し失敗時にCI fail）
+- [ ] S3-3: `src/main.rs` の責務分割（モジュール化）+ 既存挙動維持の回帰テスト追加
+- [ ] S3-4: 分割後の単体テスト拡充（通知/runner/tasklist系の境界ケース）
+- [ ] S3-5: runbook/READMEの更新（新しい構成と開発手順を反映）
+
 ## 次の1手（着手順）
-1. S2-1: statusメッセージモデル追加
-2. S2-2: daemon通知を編集更新フローへ変更
-3. S2-3: 重要イベントのみ新規投稿
-4. S2-4: 編集失敗フォールバック
-5. S2-5: e2e検証追加
-6. S2-6: runbook更新
+1. S3-1: README英語統一
+2. S3-2: CI script syntax check追加
+3. S3-3: `main.rs` 分割 + 回帰テスト
+4. S3-4: 単体テスト拡充
+5. S3-5: docs更新
