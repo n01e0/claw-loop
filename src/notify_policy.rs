@@ -18,6 +18,8 @@ pub(crate) fn notification_delivery_mode(kind: &str) -> NotificationDeliveryMode
             | "orphan_blocked"
             | "all_tasks_completed"
             | "pr_closed"
+            | "task_blocked"
+            | "task_done"
     );
 
     if important_new_post {
@@ -248,6 +250,26 @@ mod tests {
         );
         assert_eq!(
             notification_delivery_mode("auto_stopped"),
+            NotificationDeliveryMode::Send
+        );
+        assert_eq!(
+            notification_delivery_mode("task_started"),
+            NotificationDeliveryMode::EditStatus
+        );
+        assert_eq!(
+            notification_delivery_mode("task_waiting_merge"),
+            NotificationDeliveryMode::EditStatus
+        );
+        assert_eq!(
+            notification_delivery_mode("task_progress"),
+            NotificationDeliveryMode::EditStatus
+        );
+        assert_eq!(
+            notification_delivery_mode("task_blocked"),
+            NotificationDeliveryMode::Send
+        );
+        assert_eq!(
+            notification_delivery_mode("task_done"),
             NotificationDeliveryMode::Send
         );
     }
