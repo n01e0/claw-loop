@@ -125,14 +125,19 @@
 
 ## Current Execution Plan v6 (approved: timeout + notify-path unification)
 - [x] S5-1: OpenClaw通知timeout設計を修正（固定5sを廃止し、設定可能 + 安全なデフォルト値へ）
-- [ ] S5-2: 通知経路をdaemonへ一元化（`scripts/rl-task-agent.sh` の direct `message send` 通知を撤廃）
+- [x] S5-2: 通知経路をdaemonへ一元化（`scripts/rl-task-agent.sh` の direct `message send` 通知を撤廃）
 - [ ] S5-3: daemon側のstatus message確立フローを強化（初回送信失敗時の再試行/復旧で `status_message_id` を確実化）
 - [ ] S5-4: 回帰テスト + e2e + runbook更新（timeout遅延/通知重複なし/single-status更新を固定）
 - [ ] S5-5: 全タスク完了時の自動停止を追加（`all_tasks_completed` 後に `waiting` ではなく `stopped` へ遷移）
+- [ ] S5-6: task_blocked 自動復旧モードを追加（blocked理由を次タスクとして自動生成して再開）
+- [ ] S5-7: 自動復旧の安全ガード + 可視化（再試行上限・同一理由デデュープ・復旧失敗時の停止条件）
+- [ ] S5-8: OpenClaw `--json` 出力の前置きログ混入に耐える messageId 抽出へ修正（status_message_id が確実に取れること）
 
 ## 次の1手（着手順）
-1. S5-1: OpenClaw通知timeout設計修正
-2. S5-2: 通知経路のdaemon一元化
-3. S5-3: status message確立フロー強化
-4. S5-4: 回帰テスト/e2e/runbook更新
-5. S5-5: 全タスク完了時の自動停止
+1. S5-2: 通知経路のdaemon一元化
+2. S5-3: status message確立フロー強化
+3. S5-4: 回帰テスト/e2e/runbook更新
+4. S5-5: 全タスク完了時の自動停止
+5. S5-6: blocked自動復旧モード
+6. S5-7: 自動復旧ガード/可視化
+7. S5-8: `--json` 前置きログ混入に耐える messageId 抽出修正
