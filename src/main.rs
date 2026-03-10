@@ -1957,6 +1957,21 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             task_done_now = task_checklist_done_count(&task_file_abs)?;
                             task_loops_completed =
                                 task_done_now.saturating_sub(manifest.task_done_baseline);
+
+                            let pr_suffix = runner_state
+                                .last_task_pr_url
+                                .clone()
+                                .map(|u| format!(" PR_URL={u}"))
+                                .unwrap_or_default();
+                            queue_notification(
+                                &dir,
+                                &manifest,
+                                "task_done",
+                                format!(
+                                    "task {} marked done in checklist; done={}{}",
+                                    entry.id, task_done_now, pr_suffix
+                                ),
+                            )?;
                         }
                         Some(entry) => {
                             state.status = LoopStatus::Waiting;
@@ -2067,6 +2082,16 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                         runner_state.current_task_state = Some(RunnerTaskState::Running);
                         write_runner_state(&dir, &runner_state)?;
 
+                        queue_notification(
+                            &dir,
+                            &manifest,
+                            "task_started",
+                            format!(
+                                "task started: {} (line {})",
+                                queued_task.id, queued_task.line_no
+                            ),
+                        )?;
+
                         let runner = run_task_once(TaskRunOptions {
                             task_file: &task_file_abs,
                             cmd,
@@ -2131,6 +2156,17 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             runner_state.current_task_pr_url = first_line_pr_url.clone();
                             write_runner_state(&dir, &runner_state)?;
                             write_json(&dir.join("state.json"), &state)?;
+
+                            let pr_suffix = first_line_pr_url
+                                .clone()
+                                .map(|u| format!(" PR_URL={u}"))
+                                .unwrap_or_default();
+                            queue_notification(
+                                &dir,
+                                &manifest,
+                                "task_waiting_merge",
+                                format!("task waiting merge: {}{}", task_label, pr_suffix),
+                            )?;
                         } else if !runner.success {
                             state.version += 1;
                             state.status = LoopStatus::Blocked;
@@ -2152,6 +2188,17 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             runner_state.last_task_reason = Some(state.waiting_reason.clone());
                             runner_state.last_task_pr_url = first_line_pr_url.clone();
                             write_runner_state(&dir, &runner_state)?;
+
+                            let pr_suffix = first_line_pr_url
+                                .clone()
+                                .map(|u| format!(" PR_URL={u}"))
+                                .unwrap_or_default();
+                            queue_notification(
+                                &dir,
+                                &manifest,
+                                "task_blocked",
+                                format!("task blocked: {}{}", task_label, pr_suffix),
+                            )?;
 
                             write_json(&dir.join("state.json"), &state)?;
                             let _ = flush_notifications(&dir, &manifest)?;
@@ -2182,6 +2229,20 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                 task_done_now = task_checklist_done_count(&task_file_abs)?;
                                 task_loops_completed =
                                     task_done_now.saturating_sub(manifest.task_done_baseline);
+
+                                let pr_suffix = first_line_pr_url
+                                    .clone()
+                                    .map(|u| format!(" PR_URL={u}"))
+                                    .unwrap_or_default();
+                                queue_notification(
+                                    &dir,
+                                    &manifest,
+                                    "task_done",
+                                    format!(
+                                        "task done: {} (done={}){}",
+                                        task.id, task_done_now, pr_suffix
+                                    ),
+                                )?;
                             } else {
                                 runner_state.current_task_id = Some(task.id.clone());
                                 runner_state.current_task_text = Some(task.text.clone());
@@ -2194,6 +2255,16 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                 state.summary = format!("task running: {}", task.id);
                                 state.waiting_reason =
                                     format!("waiting for task completion: {}", task.id);
+
+                                queue_notification(
+                                    &dir,
+                                    &manifest,
+                                    "task_progress",
+                                    format!(
+                                        "task in progress: {} (waiting for checklist completion)",
+                                        task.id
+                                    ),
+                                )?;
                             }
                             write_runner_state(&dir, &runner_state)?;
                         }
@@ -3823,6 +3894,18 @@ mod tests {
             notification_delivery_mode("pr_merged"),
             NotificationDeliveryMode::EditStatus
         );
+        assert_eq!(
+            notification_delivery_mode("task_started"),
+            NotificationDeliveryMode::EditStatus
+        );
+        assert_eq!(
+            notification_delivery_mode("task_waiting_merge"),
+            NotificationDeliveryMode::EditStatus
+        );
+        assert_eq!(
+            notification_delivery_mode("task_progress"),
+            NotificationDeliveryMode::EditStatus
+        );
 
         assert_eq!(
             notification_delivery_mode("blocked"),
@@ -3838,6 +3921,14 @@ mod tests {
         );
         assert_eq!(
             notification_delivery_mode("auto_stopped"),
+            NotificationDeliveryMode::Send
+        );
+        assert_eq!(
+            notification_delivery_mode("task_blocked"),
+            NotificationDeliveryMode::Send
+        );
+        assert_eq!(
+            notification_delivery_mode("task_done"),
             NotificationDeliveryMode::Send
         );
         assert_eq!(
