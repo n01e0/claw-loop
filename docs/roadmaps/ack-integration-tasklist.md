@@ -112,7 +112,7 @@
 
 ## Current Execution Plan v4 (approved: docs/ci/refactor)
 - [x] S3-1: READMEの日本語を英語へ統一（意味を保ちつつ全体整合）
-- [ ] S3-2: CIへscript構文チェック追加（`bash -n` を自動実行し失敗時にCI fail）
+- [x] S3-2: CIへscript構文チェック追加（`bash -n` を自動実行し失敗時にCI fail）
 - [ ] S3-3: `src/main.rs` の責務分割（モジュール化）+ 既存挙動維持の回帰テスト追加
 - [ ] S3-4: 分割後の単体テスト拡充（通知/runner/tasklist系の境界ケース）
 - [ ] S3-5: runbook/READMEの更新（新しい構成と開発手順を反映）

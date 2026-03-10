@@ -38,5 +38,8 @@ jobs:
       - name: Build binary
         run: cargo build --all-features
 
+      - name: Bash syntax check (scripts)
+        run: find scripts -type f -name '*.sh' -print0 | xargs -0 -r -n1 bash -n
+
       - name: E2E smoke
         run: ./scripts/e2e-smoke.sh ./target/debug/claw-loopd
