@@ -1334,13 +1334,44 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
             None
         };
 
-        let delivery_result = if manifest.deliver_openclaw {
+        let mut delivery_result = if manifest.deliver_openclaw {
             deliver_via_openclaw(&n, status_edit_target.as_deref())
         } else {
             Ok(OpenclawDeliveryOutcome {
                 message_id: status_edit_target.clone(),
             })
         };
+
+        if manifest.deliver_openclaw
+            && matches!(mode, NotificationDeliveryMode::EditStatus)
+            && status_edit_target.is_some()
+            && let Err(edit_err) = &delivery_result
+        {
+            let fallback_result = deliver_via_openclaw(&n, None);
+            match fallback_result {
+                Ok(fallback_outcome) => {
+                    append_event(
+                        run_dir,
+                        "notify_status_edit_fallback_send",
+                        serde_json::json!({
+                            "event_id": n.event_id,
+                            "kind": n.kind.clone(),
+                            "previous_status_message_id": status_edit_target.clone(),
+                            "error": edit_err.to_string(),
+                            "recreated_message_id": fallback_outcome.message_id.clone(),
+                        }),
+                    )?;
+                    delivery_result = Ok(fallback_outcome);
+                }
+                Err(send_err) => {
+                    delivery_result = Err(anyhow::anyhow!(
+                        "status message edit fallback failed: edit_error={} send_error={}",
+                        edit_err,
+                        send_err
+                    ));
+                }
+            }
+        }
 
         match delivery_result {
             Ok(delivery_outcome) => {
@@ -3844,6 +3875,10 @@ mod tests {
             normalize_error_reason(Some("openclaw message send failed: status=1 stderr=mock")),
             "openclaw_send_failed"
         );
+        assert_eq!(
+            normalize_error_reason(Some("openclaw message edit failed: status=1 stderr=mock")),
+            "openclaw_send_failed"
+        );
         assert_eq!(normalize_error_reason(Some("request timed out")), "timeout");
         assert_eq!(
             normalize_error_reason(Some("HTTP 429 rate limit")),
@@ -3870,6 +3905,10 @@ mod tests {
     fn classify_ack_failure_category_maps_expected_buckets() {
         assert_eq!(
             classify_ack_failure_category(Some("openclaw message send failed: status=1")),
+            "transport"
+        );
+        assert_eq!(
+            classify_ack_failure_category(Some("openclaw message edit failed: status=1")),
             "transport"
         );
         assert_eq!(
