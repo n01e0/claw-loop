@@ -1,6 +1,34 @@
-# Dogfood Runbook (S1-6)
+# Dogfood Runbook (S2-6)
 
-`claw-loopd` の dogfood 運用時に、状態確認・復旧・手動介入を行うための実運用メモ。
+`claw-loopd` の dogfood 運用時に、single-status 通知モデルを前提に状態確認・復旧・手動介入を行うための実運用メモ。
+
+## 0) single-status 通知契約（運用前提）
+
+### A. 通知モード
+
+- **EditStatus（既存 status メッセージ更新）**
+  - started / waiting / progress 系イベント
+  - 実装上は「重要イベント以外」を edit 対象として扱う
+- **Send（新規投稿）**
+  - `blocked` / `done` / `stopped` / `auto_stopped`
+  - 同等の重要イベント（`orphan_blocked` / `pr_closed` / `all_tasks_completed`）
+
+### B. 状態保持
+
+`runner-state.json` / `status` 出力に以下が乗る:
+
+- `runner.status_message_id`
+- `runner.status_updated_at`
+
+初回の status 通知は `send` で作成し、以後は `status_message_id` に対して `edit` で更新する。
+
+### C. フォールバック
+
+status edit が失敗した場合:
+
+1. 同じ通知内容を `send` で再作成
+2. 新しい `messageId` を `status_message_id` として保存
+3. `events.jsonl` に `notify_status_edit_fallback_send` を記録
 
 ## 1) 確認ポイント（通常監視）
 
@@ -13,11 +41,13 @@ cargo run -- status --repo . --run-id <RUN_ID>
 主な見る項目:
 
 - `status` / `summary` / `waiting_reason`
-- `runner.current`（現在のタスク）
+- `runner.current`（現在タスク）
   - `id`, `state`, `blocked_reason`, `pr_url`
 - `runner.last`（直近タスク）
   - `id`, `state`, `reason`, `pr_url`
-- `last_pr_url`（現在または直近PR URL）
+- single-status 健全性
+  - `runner.status_message_id`
+  - `runner.status_updated_at`
 - stuck検知
   - `runner.waiting_unchanged_ticks`
   - `runner.waiting_last_notified_ticks`
@@ -31,6 +61,8 @@ cargo run -- status --repo . --run-id <RUN_ID>
   - PR merge待ちの通常状態
 - `status=blocked`
   - 介入が必要（`waiting_reason` と `runner.current.blocked_reason` を優先確認）
+- `runner.status_message_id` が空
+  - まだ status メッセージ未作成、または失効直後
 - `runner.waiting_unchanged_ticks` が閾値超過
   - `task_waiting_stuck` 通知済み。PR/CI進捗の手動確認へ
 
@@ -41,7 +73,7 @@ cargo run -- delivery-report --repo . --run-id <RUN_ID> --status all --limit 20
 cargo run -- sweep --repo . --run-id <RUN_ID>
 ```
 
-## 2) 復旧手順（よくあるケース）
+## 2) 復旧手順（single-status 運用）
 
 ### ケース1: waiting_merge が長時間変わらない
 
@@ -59,7 +91,29 @@ cargo run -- sweep --repo . --run-id <RUN_ID>
 3. PRが merge 済みか確認
 4. 必要なら同タスクを再実行（runner再開）
 
-### ケース3: dead-letter 増加
+### ケース3: status edit 失敗（message id失効/権限変化）
+
+1. `events.jsonl` で `notify_status_edit_fallback_send` の有無を確認
+2. `runner.status_message_id` が新しいIDに更新されたか確認
+3. `delivery-report --status failed` に edit系失敗が残っていないか確認
+
+補助コマンド:
+
+```bash
+jq -c 'select(.kind=="notify_status_edit_fallback_send")' .ralph/runs/<RUN_ID>/events.jsonl | tail
+```
+
+### ケース4: `runner.status_message_id` が空のまま
+
+1. daemonが `deliver_openclaw=true` で動作しているか確認
+2. `pending_notifications` / `delivery-report` で送信失敗の有無確認
+3. 手動で progress 通知を1回投入して status message bootstrap を促す
+
+```bash
+cargo run -- notify --repo . --run-id <RUN_ID> --kind progress --message "status bootstrap"
+```
+
+### ケース5: dead-letter 増加
 
 ```bash
 cargo run -- delivery-report --repo . --run-id <RUN_ID> --status failed --limit 20
@@ -69,7 +123,7 @@ cargo run -- requeue-dead-letter --repo . --run-id <RUN_ID> --event-id <EVENT_ID
 - 短期の送信障害なら requeue で復帰
 - 恒久失敗（権限/宛先不備）は設定修正を先行
 
-### ケース4: daemon停止/孤児化
+### ケース6: daemon停止/孤児化
 
 ```bash
 cargo run -- sweep --repo . --run-id <RUN_ID>
@@ -114,5 +168,6 @@ CLAW_LOOPD_STUCK_WAIT_TICKS=10 cargo run -- start ...
 
 - `status` が意図した状態に遷移（`waiting_merge` / `running` / `done` など）
 - `runner.current` / `runner.last` が最新状態に整合
+- `runner.status_message_id` が安定して保持され、`status_updated_at` が更新される
 - `delivery-report` で failed/pending が許容範囲
-- 必要なら thread 通知（`task_blocked` / `task_waiting_stuck` への対応内容）を残す
+- 必要なら thread 通知（`task_blocked` / `task_waiting_stuck` 対応内容）を残す
