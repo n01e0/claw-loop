@@ -227,8 +227,9 @@ pub(crate) fn classify_ack_failure_category(raw: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        NotificationDeliveryMode, classify_ack_failure_category, delivery_retry_backoff_sec,
-        normalize_error_reason, notification_delivery_mode, parse_openclaw_message_id,
+        NotificationDeliveryMode, ack_retry_policy, classify_ack_failure_category,
+        delivery_retry_backoff_sec, normalize_error_reason, notification_delivery_mode,
+        parse_openclaw_message_id,
     };
 
     #[test]
@@ -265,6 +266,64 @@ mod tests {
             parse_openclaw_message_id(&encoded),
             Some("1234567890".to_string())
         );
+    }
+
+    #[test]
+    fn parse_openclaw_message_id_prefers_payload_top_level_message_id() {
+        let sample = serde_json::json!({
+            "payload": {
+                "messageId": "top-level-id",
+                "result": {
+                    "messageId": "nested-id"
+                }
+            }
+        });
+        let encoded = serde_json::to_vec(&sample).expect("encode sample json");
+        assert_eq!(
+            parse_openclaw_message_id(&encoded),
+            Some("top-level-id".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_openclaw_message_id_returns_none_for_invalid_payload() {
+        assert_eq!(parse_openclaw_message_id(br#"{"foo":1}"#), None);
+        assert_eq!(parse_openclaw_message_id(br#"not-json"#), None);
+    }
+
+    #[test]
+    fn notification_delivery_mode_is_case_and_space_insensitive() {
+        assert_eq!(
+            notification_delivery_mode("  STOPPED  "),
+            NotificationDeliveryMode::Send
+        );
+        assert_eq!(
+            notification_delivery_mode("  Pr_ClOsEd  "),
+            NotificationDeliveryMode::Send
+        );
+        assert_eq!(
+            notification_delivery_mode("  waiting_update  "),
+            NotificationDeliveryMode::EditStatus
+        );
+    }
+
+    #[test]
+    fn ack_retry_policy_boundary_categories() {
+        let auth = ack_retry_policy("auth", 0);
+        assert!(!auth.retryable);
+        assert_eq!(auth.max_attempts, 1);
+        assert_eq!(auth.backoff_sec, 0);
+
+        let unknown = ack_retry_policy("something-new", 2);
+        assert!(unknown.retryable);
+        assert!(unknown.max_attempts >= 1);
+        assert_eq!(unknown.backoff_sec, 15);
+    }
+
+    #[test]
+    fn normalize_error_reason_uses_first_line_only() {
+        let reason = normalize_error_reason(Some("request timed out\npermission denied"));
+        assert_eq!(reason, "timeout");
     }
 
     #[test]
