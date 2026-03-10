@@ -266,6 +266,56 @@ struct RunnerState {
     paused: bool,
     #[serde(default)]
     pause_reason: Option<String>,
+    #[serde(default)]
+    status_message_id: Option<String>,
+    #[serde(default)]
+    status_updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotificationDeliveryMode {
+    Send,
+    EditStatus,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OpenclawDeliveryOutcome {
+    message_id: Option<String>,
+}
+
+fn notification_delivery_mode(kind: &str) -> NotificationDeliveryMode {
+    let normalized = kind.trim().to_ascii_lowercase();
+    if normalized.contains("started")
+        || normalized.contains("waiting")
+        || normalized.contains("progress")
+    {
+        NotificationDeliveryMode::EditStatus
+    } else {
+        NotificationDeliveryMode::Send
+    }
+}
+
+fn parse_openclaw_message_id(stdout: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    let payload = value.get("payload")?;
+
+    let from_payload = payload
+        .get("messageId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    if from_payload.is_some() {
+        return from_payload;
+    }
+
+    payload
+        .get("result")
+        .and_then(|v| v.get("messageId"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -613,21 +663,44 @@ fn openclaw_bin() -> String {
     std::env::var("CLAW_LOOPD_OPENCLAW_BIN").unwrap_or_else(|_| "openclaw".to_string())
 }
 
-fn deliver_via_openclaw(notification: &Notification) -> Result<()> {
-    let mut args: Vec<String> = vec![
-        "message".into(),
-        "send".into(),
-        "--channel".into(),
-        notification.channel.clone(),
-        "--target".into(),
-        notification.thread_id.clone(),
-        "--message".into(),
-        format!(
-            "[ralph-loop][{}] {}",
-            notification.kind, notification.message
-        ),
-        "--silent".into(),
-    ];
+fn deliver_via_openclaw(
+    notification: &Notification,
+    edit_message_id: Option<&str>,
+) -> Result<OpenclawDeliveryOutcome> {
+    let mut args: Vec<String> = vec!["message".into()];
+
+    if let Some(message_id) = edit_message_id {
+        args.extend([
+            "edit".into(),
+            "--channel".into(),
+            notification.channel.clone(),
+            "--target".into(),
+            notification.thread_id.clone(),
+            "--message-id".into(),
+            message_id.to_string(),
+            "--message".into(),
+            format!(
+                "[ralph-loop][{}] {}",
+                notification.kind, notification.message
+            ),
+            "--json".into(),
+        ]);
+    } else {
+        args.extend([
+            "send".into(),
+            "--channel".into(),
+            notification.channel.clone(),
+            "--target".into(),
+            notification.thread_id.clone(),
+            "--message".into(),
+            format!(
+                "[ralph-loop][{}] {}",
+                notification.kind, notification.message
+            ),
+            "--silent".into(),
+            "--json".into(),
+        ]);
+    }
 
     if std::env::var("CLAW_LOOPD_OPENCLAW_DRY_RUN").ok().as_deref() == Some("1") {
         args.push("--dry-run".into());
@@ -636,14 +709,23 @@ fn deliver_via_openclaw(notification: &Notification) -> Result<()> {
     let openclaw = openclaw_bin();
     let output = run_with_timeout_cmd(&openclaw, &args, 5)?;
     if !output.status.success() {
+        let action = if edit_message_id.is_some() {
+            "edit"
+        } else {
+            "send"
+        };
         bail!(
-            "openclaw message send failed: status={:?} stderr={}",
+            "openclaw message {} failed: status={:?} stderr={}",
+            action,
             output.status.code(),
             String::from_utf8_lossy(&output.stderr)
         );
     }
 
-    Ok(())
+    let parsed_message_id = parse_openclaw_message_id(&output.stdout);
+    Ok(OpenclawDeliveryOutcome {
+        message_id: parsed_message_id.or_else(|| edit_message_id.map(ToOwned::to_owned)),
+    })
 }
 
 fn append_event(run_dir: &Path, kind: &str, extra: serde_json::Value) -> Result<()> {
@@ -1215,6 +1297,8 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
     let mut delivered = 0usize;
     let mut kept: Vec<Notification> = Vec::new();
     let mut processed_in_flush: HashSet<Uuid> = HashSet::new();
+    let mut runner_state = read_runner_state(run_dir)?;
+    let mut runner_state_dirty = false;
 
     for mut n in queued {
         if terminal_ids.contains(&n.event_id) {
@@ -1234,14 +1318,23 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
         let previous_attempts = n.attempts;
         n.attempts = n.attempts.saturating_add(1);
 
-        let delivery_result = if manifest.deliver_openclaw {
-            deliver_via_openclaw(&n)
+        let mode = notification_delivery_mode(&n.kind);
+        let status_edit_target = if matches!(mode, NotificationDeliveryMode::EditStatus) {
+            runner_state.status_message_id.clone()
         } else {
-            Ok(())
+            None
+        };
+
+        let delivery_result = if manifest.deliver_openclaw {
+            deliver_via_openclaw(&n, status_edit_target.as_deref())
+        } else {
+            Ok(OpenclawDeliveryOutcome {
+                message_id: status_edit_target.clone(),
+            })
         };
 
         match delivery_result {
-            Ok(()) => {
+            Ok(delivery_outcome) => {
                 let attempt = DeliveryAttempt {
                     event_id: n.event_id,
                     run_id: n.run_id,
@@ -1271,6 +1364,19 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
                             "attempts": ack.attempts,
                         }),
                     )?;
+                }
+
+                if matches!(mode, NotificationDeliveryMode::EditStatus) {
+                    if let Some(message_id) = delivery_outcome.message_id {
+                        if runner_state.status_message_id.as_deref() != Some(message_id.as_str()) {
+                            runner_state.status_message_id = Some(message_id);
+                            runner_state_dirty = true;
+                        }
+                    }
+                    if runner_state.status_message_id.is_some() {
+                        runner_state.status_updated_at = Some(now);
+                        runner_state_dirty = true;
+                    }
                 }
 
                 let d = DispatchedNotification {
@@ -1381,6 +1487,10 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
                 }
             }
         }
+    }
+
+    if runner_state_dirty {
+        write_runner_state(run_dir, &runner_state)?;
     }
 
     rewrite_jsonl(&queue_path, &kept)?;
@@ -1589,7 +1699,7 @@ fn normalize_error_reason(raw: Option<&str>) -> String {
         return "unknown".to_string();
     }
 
-    if line.contains("openclaw message send failed") {
+    if line.contains("openclaw message") && line.contains("failed") {
         return "openclaw_send_failed".to_string();
     }
     if line.contains("timeout") || line.contains("timed out") {
@@ -2638,6 +2748,8 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
         "last": runner_last_view,
         "paused": runner_state.paused,
         "pause_reason": runner_state.pause_reason.clone(),
+        "status_message_id": runner_state.status_message_id.clone(),
+        "status_updated_at": runner_state.status_updated_at,
     });
 
     println!(
@@ -3441,12 +3553,13 @@ fn main() -> Result<()> {
 mod tests {
     use super::{
         DeadLetterEntry, DeliveryAck, DeliveryAttempt, DispatchedNotification, LoopStatus,
-        Manifest, Notification, RunnerState, ack_retry_policy, append_jsonl,
-        classify_ack_failure_category, compute_auto_stop_reason, compute_backoff_sec,
+        Manifest, Notification, NotificationDeliveryMode, RunnerState, ack_retry_policy,
+        append_jsonl, classify_ack_failure_category, compute_auto_stop_reason, compute_backoff_sec,
         dead_letter_path, delivery_ack_path, delivery_attempts_path, delivery_retry_backoff_sec,
         extract_pr_url, flush_notifications, lease_window_sec, normalize_error_reason,
-        parse_task_checklist_entry, read_jsonl, should_suppress_waiting_stuck,
-        update_waiting_stuck_tracker, validate_task_done_contract_with,
+        notification_delivery_mode, parse_openclaw_message_id, parse_task_checklist_entry,
+        read_jsonl, should_suppress_waiting_stuck, update_waiting_stuck_tracker,
+        validate_task_done_contract_with,
     };
     use chrono::{Duration, Utc};
     use std::{
@@ -3838,6 +3951,46 @@ mod tests {
         let ok = validate_task_done_contract_with(line, |_| Ok(true))
             .expect("merged PR should satisfy completion guard");
         assert_eq!(ok, "https://github.com/n01e0/claw-loop/pull/123");
+    }
+
+    #[test]
+    fn notification_delivery_mode_marks_started_waiting_progress_for_edit() {
+        assert_eq!(
+            notification_delivery_mode("run_started"),
+            NotificationDeliveryMode::EditStatus
+        );
+        assert_eq!(
+            notification_delivery_mode("task_waiting_stuck"),
+            NotificationDeliveryMode::EditStatus
+        );
+        assert_eq!(
+            notification_delivery_mode("progress"),
+            NotificationDeliveryMode::EditStatus
+        );
+        assert_eq!(
+            notification_delivery_mode("auto_stopped"),
+            NotificationDeliveryMode::Send
+        );
+    }
+
+    #[test]
+    fn parse_openclaw_message_id_reads_cli_json_payload() {
+        let sample = serde_json::json!({
+            "action": "send",
+            "channel": "discord",
+            "dryRun": false,
+            "handledBy": "plugin",
+            "payload": {
+                "result": {
+                    "messageId": "1234567890"
+                }
+            }
+        });
+        let encoded = serde_json::to_vec(&sample).expect("encode sample json");
+        assert_eq!(
+            parse_openclaw_message_id(&encoded),
+            Some("1234567890".to_string())
+        );
     }
 
     #[test]
