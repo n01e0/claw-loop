@@ -1367,11 +1367,11 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
                 }
 
                 if matches!(mode, NotificationDeliveryMode::EditStatus) {
-                    if let Some(message_id) = delivery_outcome.message_id {
-                        if runner_state.status_message_id.as_deref() != Some(message_id.as_str()) {
-                            runner_state.status_message_id = Some(message_id);
-                            runner_state_dirty = true;
-                        }
+                    if let Some(message_id) = delivery_outcome.message_id
+                        && runner_state.status_message_id.as_deref() != Some(message_id.as_str())
+                    {
+                        runner_state.status_message_id = Some(message_id);
+                        runner_state_dirty = true;
                     }
                     if runner_state.status_message_id.is_some() {
                         runner_state.status_updated_at = Some(now);
