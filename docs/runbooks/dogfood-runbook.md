@@ -30,6 +30,14 @@ status edit が失敗した場合:
 2. 新しい `messageId` を `status_message_id` として保存
 3. `events.jsonl` に `notify_status_edit_fallback_send` を記録
 
+### D. 実装構成（S3以降）
+
+- `src/main.rs`: CLI入口 + daemonオーケストレーション
+- `src/notify_policy.rs`: 通知方針（send/edit）、retry/backoff、エラー正規化
+- `src/tasklist.rs`: tasklist の parse/count/update
+
+機能追加時は、責務を持つモジュール側へ実装し、`main.rs` は配線・制御に限定する。
+
 ## 1) 確認ポイント（通常監視）
 
 ### A. まず `status` を確認
@@ -171,3 +179,21 @@ CLAW_LOOPD_STUCK_WAIT_TICKS=10 cargo run -- start ...
 - `runner.status_message_id` が安定して保持され、`status_updated_at` が更新される
 - `delivery-report` で failed/pending が許容範囲
 - 必要なら thread 通知（`task_blocked` / `task_waiting_stuck` 対応内容）を残す
+
+## 5) 開発時チェックリスト（PR前）
+
+S3以降の標準確認手順:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all --all-features
+find scripts -type f -name '*.sh' -print0 | xargs -0 -r -n1 bash -n
+./scripts/e2e-smoke.sh ./target/debug/claw-loopd
+```
+
+テスト追加の方針:
+
+- 通知ポリシー境界は `src/notify_policy.rs` の unit test に追加
+- tasklist境界は `src/tasklist.rs` の unit test に追加
+- runner/daemonの遷移境界は `src/main.rs` の unit test か e2e に追加

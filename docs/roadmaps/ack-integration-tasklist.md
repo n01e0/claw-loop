@@ -115,7 +115,7 @@
 - [x] S3-2: CIへscript構文チェック追加（`bash -n` を自動実行し失敗時にCI fail）
 - [x] S3-3: `src/main.rs` の責務分割（モジュール化）+ 既存挙動維持の回帰テスト追加
 - [x] S3-4: 分割後の単体テスト拡充（通知/runner/tasklist系の境界ケース）
-- [ ] S3-5: runbook/READMEの更新（新しい構成と開発手順を反映）
+- [x] S3-5: runbook/READMEの更新（新しい構成と開発手順を反映）
 
 ## 次の1手（着手順）
 1. S3-1: README英語統一
