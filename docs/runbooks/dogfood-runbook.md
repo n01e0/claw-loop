@@ -197,3 +197,9 @@ find scripts -type f -name '*.sh' -print0 | xargs -0 -r -n1 bash -n
 - 通知ポリシー境界は `src/notify_policy.rs` の unit test に追加
 - tasklist境界は `src/tasklist.rs` の unit test に追加
 - runner/daemonの遷移境界は `src/main.rs` の unit test か e2e に追加
+
+S4-4で追加した e2e 観点（`scripts/e2e-smoke.sh` case11）:
+
+- **通知欠落防止**: 全タスク完了 run で `all_tasks_completed` が必ず1回 dispatch される
+- **通知重複抑止**: `task_started` / `task_done` / `all_tasks_completed` の kind 別 dispatch 件数が想定どおり（各1件）
+- **編集失敗フォールバック**: status edit 失敗時に `notify_status_edit_fallback_send` が記録され、`runner.status_message_id` が新IDへ更新される
