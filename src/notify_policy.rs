@@ -1,4 +1,5 @@
-use serde_json::Value;
+use serde::Deserialize;
+use serde_json::{Deserializer, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NotificationDeliveryMode {
@@ -29,8 +30,7 @@ pub(crate) fn notification_delivery_mode(kind: &str) -> NotificationDeliveryMode
     }
 }
 
-pub(crate) fn parse_openclaw_message_id(stdout: &[u8]) -> Option<String> {
-    let value: Value = serde_json::from_slice(stdout).ok()?;
+fn message_id_from_openclaw_payload(value: &Value) -> Option<String> {
     let payload = value.get("payload")?;
 
     let from_payload = payload
@@ -50,6 +50,28 @@ pub(crate) fn parse_openclaw_message_id(stdout: &[u8]) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned)
+}
+
+pub(crate) fn parse_openclaw_message_id(stdout: &[u8]) -> Option<String> {
+    if let Ok(value) = serde_json::from_slice::<Value>(stdout)
+        && let Some(id) = message_id_from_openclaw_payload(&value)
+    {
+        return Some(id);
+    }
+
+    for (idx, b) in stdout.iter().enumerate() {
+        if *b != b'{' {
+            continue;
+        }
+        let mut de = Deserializer::from_slice(&stdout[idx..]);
+        if let Ok(value) = Value::deserialize(&mut de)
+            && let Some(id) = message_id_from_openclaw_payload(&value)
+        {
+            return Some(id);
+        }
+    }
+
+    None
 }
 
 pub(crate) fn delivery_retry_backoff_sec(attempts: u32) -> i64 {
@@ -311,6 +333,25 @@ mod tests {
     fn parse_openclaw_message_id_returns_none_for_invalid_payload() {
         assert_eq!(parse_openclaw_message_id(br#"{"foo":1}"#), None);
         assert_eq!(parse_openclaw_message_id(br#"not-json"#), None);
+    }
+
+    #[test]
+    fn parse_openclaw_message_id_handles_prefixed_logs_before_json() {
+        let mixed = br#"[openclaw] debug: transport retry
+{"payload":{"result":{"messageId":"prefixed-id"}}}
+"#;
+        assert_eq!(
+            parse_openclaw_message_id(mixed),
+            Some("prefixed-id".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_openclaw_message_id_handles_trailing_logs_after_json() {
+        let mixed = br#"{"payload":{"messageId":"top-id"}}
+[openclaw] done
+"#;
+        assert_eq!(parse_openclaw_message_id(mixed), Some("top-id".to_string()));
     }
 
     #[test]
