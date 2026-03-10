@@ -930,10 +930,19 @@ fn pr_url_is_merged(pr_url: &str) -> Result<bool> {
     ];
     let output = run_with_timeout_cmd(&gh, &args, 5)?;
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let is_timeout = output.status.code() == Some(124)
+            || stderr.to_ascii_lowercase().contains("timed out")
+            || stderr.to_ascii_lowercase().contains("timeout");
+
+        if is_timeout {
+            bail!("merge check timed out for {pr_url}: {stderr}");
+        }
+
         bail!(
             "gh pr view failed: status={:?} stderr={}",
             output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
+            stderr
         );
     }
     let value: serde_json::Value = serde_json::from_slice(&output.stdout)
@@ -970,6 +979,15 @@ fn validate_task_done_contract_with(
 
 fn validate_task_done_contract(first_stdout_line: &str) -> Result<String> {
     validate_task_done_contract_with(first_stdout_line, pr_url_is_merged)
+}
+
+fn completion_guard_waiting_fallback_line(first_stdout_line: &str, err: &str) -> Option<String> {
+    let lowered = err.to_ascii_lowercase();
+    if !lowered.contains("merge check timed out") {
+        return None;
+    }
+    let pr_url = extract_pr_url(first_stdout_line)?;
+    Some(format!("TASK_WAITING_MERGE PR_URL={pr_url}"))
 }
 
 fn run_task_once(opts: TaskRunOptions<'_>) -> Result<TaskRunOutcome> {
@@ -1050,17 +1068,32 @@ fn run_task_once(opts: TaskRunOptions<'_>) -> Result<TaskRunOutcome> {
                 outcome.check_result = Some(update_task_check(opts.task_file, &task.id, true)?);
             }
             Err(err) => {
-                outcome.success = false;
-                if outcome.exit_code == Some(0) {
-                    outcome.exit_code = Some(65);
+                let err_text = err.to_string().replace('\n', " ");
+
+                if let Some(waiting_line) =
+                    completion_guard_waiting_fallback_line(&first_stdout_line, &err_text)
+                {
+                    outcome.success = false;
+                    outcome.exit_code = Some(10);
+                    outcome.stdout = format!("{waiting_line}\n{}", outcome.stdout);
+                    if !outcome.stderr.trim().is_empty() {
+                        outcome.stderr.push('\n');
+                    }
+                    outcome.stderr.push_str(&format!(
+                        "completion guard deferred to waiting recheck: {err_text}"
+                    ));
+                } else {
+                    outcome.success = false;
+                    if outcome.exit_code == Some(0) {
+                        outcome.exit_code = Some(65);
+                    }
+                    if !outcome.stderr.trim().is_empty() {
+                        outcome.stderr.push('\n');
+                    }
+                    outcome
+                        .stderr
+                        .push_str(&format!("completion guard failed: {err_text}"));
                 }
-                if !outcome.stderr.trim().is_empty() {
-                    outcome.stderr.push('\n');
-                }
-                outcome.stderr.push_str(&format!(
-                    "completion guard failed: {}",
-                    err.to_string().replace('\n', " ")
-                ));
             }
         }
     }
@@ -3275,11 +3308,12 @@ mod tests {
     use super::{
         DeadLetterEntry, DeliveryAck, DeliveryAttempt, DispatchedNotification, LoopStatus,
         Manifest, Notification, NotificationDeliveryMode, RunnerState, ack_retry_policy,
-        append_jsonl, classify_ack_failure_category, compute_auto_stop_reason, compute_backoff_sec,
-        dead_letter_path, delivery_ack_path, delivery_attempts_path, delivery_retry_backoff_sec,
-        extract_pr_url, flush_notifications, lease_window_sec, normalize_error_reason,
-        notification_delivery_mode, parse_openclaw_message_id, parse_task_checklist_entry,
-        read_jsonl, should_suppress_waiting_stuck, update_waiting_stuck_tracker,
+        append_jsonl, classify_ack_failure_category, completion_guard_waiting_fallback_line,
+        compute_auto_stop_reason, compute_backoff_sec, dead_letter_path, delivery_ack_path,
+        delivery_attempts_path, delivery_retry_backoff_sec, extract_pr_url, flush_notifications,
+        lease_window_sec, normalize_error_reason, notification_delivery_mode,
+        parse_openclaw_message_id, parse_task_checklist_entry, read_jsonl,
+        should_suppress_waiting_stuck, update_waiting_stuck_tracker,
         validate_task_done_contract_with,
     };
     use chrono::{Duration, Utc};
@@ -3680,6 +3714,26 @@ mod tests {
         let ok = validate_task_done_contract_with(line, |_| Ok(true))
             .expect("merged PR should satisfy completion guard");
         assert_eq!(ok, "https://github.com/n01e0/claw-loop/pull/123");
+    }
+
+    #[test]
+    fn completion_guard_waiting_fallback_line_emits_waiting_merge_on_timeout() {
+        let line = "TASK_DONE PR_URL=https://github.com/n01e0/claw-loop/pull/777";
+        let err = "merge check timed out for https://github.com/n01e0/claw-loop/pull/777: timeout";
+        let waiting = completion_guard_waiting_fallback_line(line, err);
+        assert_eq!(
+            waiting,
+            Some(
+                "TASK_WAITING_MERGE PR_URL=https://github.com/n01e0/claw-loop/pull/777".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn completion_guard_waiting_fallback_line_ignores_non_timeout_errors() {
+        let line = "TASK_DONE PR_URL=https://github.com/n01e0/claw-loop/pull/778";
+        let err = "PR is not merged yet: https://github.com/n01e0/claw-loop/pull/778";
+        assert_eq!(completion_guard_waiting_fallback_line(line, err), None);
     }
 
     #[test]
