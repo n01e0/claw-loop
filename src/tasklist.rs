@@ -63,6 +63,55 @@ pub(crate) fn load_task_checklist(
     Ok((content, lines, entries))
 }
 
+fn clip_recovery_reason(reason: &str, max_chars: usize) -> String {
+    let flat = reason.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+    let clipped: String = flat.chars().take(max_chars).collect();
+    if clipped.trim().is_empty() {
+        "blocked without reason".to_string()
+    } else {
+        clipped
+    }
+}
+
+pub(crate) fn append_recovery_task_for_blocked(
+    file: &Path,
+    blocked_id: &str,
+    blocked_reason: &str,
+) -> Result<TaskChecklistEntry> {
+    let (content, mut lines, entries) = load_task_checklist(file)?;
+    let had_trailing_newline = content.ends_with('\n');
+
+    let base_id = format!("{blocked_id}-RECOVER");
+    let existing_ids = entries
+        .iter()
+        .map(|e| e.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+
+    let mut candidate = base_id.clone();
+    let mut suffix = 2usize;
+    while existing_ids.contains(candidate.as_str()) {
+        candidate = format!("{base_id}-{suffix}");
+        suffix = suffix.saturating_add(1);
+    }
+
+    let clipped_reason = clip_recovery_reason(blocked_reason, 160);
+    let text = format!("auto-recover from {blocked_id}: {clipped_reason}");
+    lines.push(format!("- [ ] {}: {}", candidate, text));
+
+    let mut rebuilt = lines.join("\n");
+    if had_trailing_newline || !rebuilt.ends_with('\n') {
+        rebuilt.push('\n');
+    }
+    fs::write(file, rebuilt).with_context(|| format!("write {}", file.display()))?;
+
+    Ok(TaskChecklistEntry {
+        line_no: lines.len(),
+        done: false,
+        id: candidate,
+        text,
+    })
+}
+
 pub(crate) fn update_task_check(file: &Path, id: &str, done: bool) -> Result<serde_json::Value> {
     let (content, mut lines, entries) = load_task_checklist(file)?;
     let had_trailing_newline = content.ends_with('\n');
@@ -113,8 +162,8 @@ pub(crate) fn update_task_check(file: &Path, id: &str, done: bool) -> Result<ser
 #[cfg(test)]
 mod tests {
     use super::{
-        load_task_checklist, parse_task_checklist_entry, task_checklist_done_count,
-        update_task_check,
+        append_recovery_task_for_blocked, load_task_checklist, parse_task_checklist_entry,
+        task_checklist_done_count, update_task_check,
     };
     use std::{fs, path::PathBuf};
     use uuid::Uuid;
@@ -186,5 +235,39 @@ mod tests {
         // do not create tasklist file
         let count = task_checklist_done_count(&file).expect("done count on missing file");
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn append_recovery_task_for_blocked_appends_unique_unchecked_entry() {
+        let file = temp_file("append-recovery");
+        fs::write(
+            &file,
+            "- [ ] S5-6: blocked base\n- [ ] S5-6-RECOVER: existing\n",
+        )
+        .expect("write file");
+
+        let entry =
+            append_recovery_task_for_blocked(&file, "S5-6", "runner exit=2: command failed")
+                .expect("append recovery task");
+
+        assert_eq!(entry.id, "S5-6-RECOVER-2");
+        assert!(!entry.done);
+        assert!(entry.text.contains("auto-recover from S5-6"));
+
+        let content = fs::read_to_string(&file).expect("read file");
+        assert!(content.contains("- [ ] S5-6-RECOVER-2: auto-recover from S5-6"));
+    }
+
+    #[test]
+    fn append_recovery_task_for_blocked_clips_multiline_reason() {
+        let file = temp_file("append-recovery-clip");
+        fs::write(&file, "- [ ] S5-6: blocked base\n").expect("write file");
+
+        let long_reason = "line1\nline2\n".to_string() + &"x".repeat(300);
+        let entry = append_recovery_task_for_blocked(&file, "S5-6", &long_reason)
+            .expect("append recovery task");
+
+        assert!(entry.text.len() < 260);
+        assert!(!entry.text.contains('\n'));
     }
 }
