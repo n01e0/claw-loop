@@ -1,13 +1,28 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
+#[cfg(test)]
+use notify_policy::delivery_retry_backoff_sec;
+use notify_policy::{
+    NotificationDeliveryMode, ack_retry_policy, ack_retry_policy_snapshot,
+    classify_ack_failure_category, normalize_error_reason, notification_delivery_mode,
+    parse_openclaw_message_id,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
+#[cfg(test)]
+use tasklist::parse_task_checklist_entry;
+use tasklist::{
+    TaskChecklistEntry, load_task_checklist, task_checklist_done_count, update_task_check,
+};
 use uuid::Uuid;
+
+mod notify_policy;
+mod tasklist;
 
 #[derive(Parser, Debug)]
 #[command(name = "claw-loopd")]
@@ -272,59 +287,9 @@ struct RunnerState {
     status_updated_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NotificationDeliveryMode {
-    Send,
-    EditStatus,
-}
-
 #[derive(Debug, Clone, Default)]
 struct OpenclawDeliveryOutcome {
     message_id: Option<String>,
-}
-
-fn notification_delivery_mode(kind: &str) -> NotificationDeliveryMode {
-    let normalized = kind.trim().to_ascii_lowercase();
-
-    let important_new_post = matches!(
-        normalized.as_str(),
-        "blocked"
-            | "done"
-            | "stopped"
-            | "auto_stopped"
-            | "orphan_blocked"
-            | "all_tasks_completed"
-            | "pr_closed"
-    );
-
-    if important_new_post {
-        NotificationDeliveryMode::Send
-    } else {
-        NotificationDeliveryMode::EditStatus
-    }
-}
-
-fn parse_openclaw_message_id(stdout: &[u8]) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_slice(stdout).ok()?;
-    let payload = value.get("payload")?;
-
-    let from_payload = payload
-        .get("messageId")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned);
-    if from_payload.is_some() {
-        return from_payload;
-    }
-
-    payload
-        .get("result")
-        .and_then(|v| v.get("messageId"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -432,14 +397,6 @@ struct GhPrView {
     merge_state_status: Option<String>,
     #[serde(rename = "autoMergeRequest")]
     auto_merge_request: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone)]
-struct TaskChecklistEntry {
-    line_no: usize,
-    done: bool,
-    id: String,
-    text: String,
 }
 
 struct StartOptions {
@@ -814,104 +771,6 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> {
         out.push(item);
     }
     Ok(out)
-}
-
-fn parse_task_checklist_entry(line_no: usize, line: &str) -> Option<TaskChecklistEntry> {
-    let trimmed = line.trim_start();
-    let (done, rest) = if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
-        (false, rest)
-    } else if let Some(rest) = trimmed.strip_prefix("- [x] ") {
-        (true, rest)
-    } else {
-        return None;
-    };
-
-    let (id_raw, text_raw) = rest.split_once(':')?;
-    let id = id_raw.trim().to_string();
-    if id.is_empty() {
-        return None;
-    }
-
-    let text = text_raw.trim().to_string();
-    Some(TaskChecklistEntry {
-        line_no,
-        done,
-        id,
-        text,
-    })
-}
-
-fn task_checklist_done_count(file: &Path) -> Result<u64> {
-    if !file.exists() {
-        return Ok(0);
-    }
-
-    let content = fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
-    let done = content
-        .lines()
-        .enumerate()
-        .filter_map(|(idx, line)| parse_task_checklist_entry(idx + 1, line))
-        .filter(|entry| entry.done)
-        .count() as u64;
-    Ok(done)
-}
-
-fn load_task_checklist(file: &Path) -> Result<(String, Vec<String>, Vec<TaskChecklistEntry>)> {
-    let content = fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
-    let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-    let entries: Vec<TaskChecklistEntry> = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, line)| parse_task_checklist_entry(idx + 1, line))
-        .collect();
-    Ok((content, lines, entries))
-}
-
-fn update_task_check(file: &Path, id: &str, done: bool) -> Result<serde_json::Value> {
-    let (content, mut lines, entries) = load_task_checklist(file)?;
-    let had_trailing_newline = content.ends_with('\n');
-
-    let target = entries
-        .iter()
-        .find(|entry| entry.id == id)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("task id not found: {id}"))?;
-
-    let idx = target.line_no.saturating_sub(1);
-    let mut changed = false;
-    if target.done != done {
-        if done {
-            lines[idx] = lines[idx].replacen("[ ]", "[x]", 1);
-        } else {
-            lines[idx] = lines[idx].replacen("[x]", "[ ]", 1);
-        }
-        changed = true;
-    }
-
-    if changed {
-        let mut rebuilt = lines.join("\n");
-        if had_trailing_newline {
-            rebuilt.push('\n');
-        }
-        fs::write(file, rebuilt).with_context(|| format!("write {}", file.display()))?;
-    }
-
-    let (_, _, updated_entries) = load_task_checklist(file)?;
-    let total = updated_entries.len();
-    let done_count = updated_entries.iter().filter(|entry| entry.done).count();
-
-    Ok(serde_json::json!({
-        "file": file,
-        "id": id,
-        "line": target.line_no,
-        "done": done,
-        "changed": changed,
-        "summary": {
-            "total": total,
-            "done": done_count,
-            "open": total.saturating_sub(done_count),
-        }
-    }))
 }
 
 #[derive(Debug)]
@@ -1615,184 +1474,6 @@ fn compute_backoff_sec(unchanged_polls: u32) -> i64 {
         1 => 120,
         2 => 240,
         _ => 300,
-    }
-}
-
-fn delivery_retry_backoff_sec(attempts: u32) -> i64 {
-    match attempts {
-        0 | 1 => 5,
-        2 => 15,
-        3 => 30,
-        _ => 60,
-    }
-}
-
-fn delivery_max_attempts() -> u32 {
-    std::env::var("CLAW_LOOPD_DELIVERY_MAX_ATTEMPTS")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(5)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AckRetryPolicy {
-    retryable: bool,
-    max_attempts: u32,
-    backoff_sec: i64,
-}
-
-fn ack_retry_policy(category: &str, attempts: u32) -> AckRetryPolicy {
-    let global_max = delivery_max_attempts();
-    let default_backoff = delivery_retry_backoff_sec(attempts);
-
-    match category {
-        // Non-retryable categories.
-        "auth" | "permission" | "not_found" => AckRetryPolicy {
-            retryable: false,
-            max_attempts: 1,
-            backoff_sec: 0,
-        },
-        // Retryable, but with longer backoff than transport jitter.
-        "rate_limited" => AckRetryPolicy {
-            retryable: true,
-            max_attempts: global_max,
-            backoff_sec: match attempts {
-                0 | 1 => 30,
-                2 => 60,
-                3 => 120,
-                _ => 300,
-            },
-        },
-        // Retryable defaults.
-        "timeout" | "transport" | "upstream_5xx" | "unknown" => AckRetryPolicy {
-            retryable: true,
-            max_attempts: global_max,
-            backoff_sec: default_backoff,
-        },
-        // Future-safe fallback.
-        _ => AckRetryPolicy {
-            retryable: true,
-            max_attempts: global_max,
-            backoff_sec: default_backoff,
-        },
-    }
-}
-
-fn ack_retry_policy_snapshot() -> serde_json::Value {
-    let max_attempts = delivery_max_attempts();
-    serde_json::json!({
-        "retryable_categories": ["timeout", "transport", "rate_limited", "upstream_5xx", "unknown"],
-        "non_retryable_categories": ["auth", "permission", "not_found"],
-        "max_attempts": {
-            "default_retryable": max_attempts,
-            "non_retryable": 1
-        },
-        "backoff_seconds": {
-            "default": [5, 5, 15, 30, 60],
-            "rate_limited": [30, 30, 60, 120, 300]
-        }
-    })
-}
-
-fn sanitize_reason_fallback(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut prev_sep = false;
-    for ch in raw.chars() {
-        let mapped = if ch.is_ascii_digit() {
-            '#'
-        } else if ch.is_ascii_whitespace() {
-            ' '
-        } else {
-            ch.to_ascii_lowercase()
-        };
-
-        let sep = mapped == ' ' || mapped == ':' || mapped == ';' || mapped == ',';
-        if sep {
-            if !prev_sep {
-                out.push(' ');
-            }
-        } else {
-            out.push(mapped);
-        }
-        prev_sep = sep;
-    }
-
-    let trimmed = out.trim();
-    if trimmed.is_empty() {
-        "unknown".to_string()
-    } else {
-        trimmed.chars().take(96).collect()
-    }
-}
-
-fn normalize_error_reason(raw: Option<&str>) -> String {
-    let line = raw
-        .unwrap_or("unknown")
-        .lines()
-        .next()
-        .unwrap_or("unknown")
-        .trim()
-        .to_ascii_lowercase();
-
-    if line.is_empty() {
-        return "unknown".to_string();
-    }
-
-    if line.contains("openclaw message") && line.contains("failed") {
-        return "openclaw_send_failed".to_string();
-    }
-    if line.contains("timeout") || line.contains("timed out") {
-        return "timeout".to_string();
-    }
-    if line.contains("rate limit") || line.contains("429") {
-        return "rate_limited".to_string();
-    }
-    if line.contains("permission denied") {
-        return "permission_denied".to_string();
-    }
-    if line.contains("unauthorized") || line.contains(" 401") || line.ends_with("401") {
-        return "unauthorized".to_string();
-    }
-    if line.contains("forbidden") || line.contains(" 403") || line.ends_with("403") {
-        return "forbidden".to_string();
-    }
-    if line.contains("not found") || line.contains("no such file") || line.contains(" 404") {
-        return "not_found".to_string();
-    }
-    if line.contains("connection refused") {
-        return "connection_refused".to_string();
-    }
-    if line.contains("network is unreachable")
-        || line.contains("temporary failure in name resolution")
-        || line.contains("name or service not known")
-        || line.contains("dns")
-    {
-        return "dns_or_network".to_string();
-    }
-    if line.contains("broken pipe") {
-        return "broken_pipe".to_string();
-    }
-    if line.contains("500") || line.contains("502") || line.contains("503") || line.contains("504")
-    {
-        return "upstream_5xx".to_string();
-    }
-
-    sanitize_reason_fallback(&line)
-}
-
-fn classify_ack_failure_category(raw: Option<&str>) -> String {
-    match normalize_error_reason(raw).as_str() {
-        "timeout" => "timeout".to_string(),
-        "rate_limited" => "rate_limited".to_string(),
-        "unauthorized" => "auth".to_string(),
-        "forbidden" | "permission_denied" => "permission".to_string(),
-        "not_found" => "not_found".to_string(),
-        "upstream_5xx" => "upstream_5xx".to_string(),
-        "connection_refused" | "dns_or_network" | "broken_pipe" | "openclaw_send_failed" => {
-            "transport".to_string()
-        }
-        _ => "unknown".to_string(),
     }
 }
 
