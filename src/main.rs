@@ -843,7 +843,7 @@ fn apply_status_establish_retry_override(
     if force_status_establish_retry {
         policy.retryable = true;
         policy.max_attempts = u32::MAX;
-        policy.backoff_sec = policy.backoff_sec.max(15);
+        policy.backoff_sec = policy.backoff_sec.max(5);
     }
     policy
 }
@@ -3878,7 +3878,7 @@ mod tests {
         let overridden = apply_status_establish_retry_override(base, force);
         assert!(overridden.retryable);
         assert_eq!(overridden.max_attempts, u32::MAX);
-        assert!(overridden.backoff_sec >= 15);
+        assert!(overridden.backoff_sec >= 5);
     }
 
     #[test]
