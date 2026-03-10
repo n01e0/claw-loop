@@ -73,6 +73,8 @@ enum Commands {
         auto_check_on_success: bool,
         #[arg(long, default_value_t = false)]
         auto_recover_blocked: bool,
+        #[arg(long, default_value_t = 3)]
+        auto_recover_blocked_max_attempts: u64,
     },
     Daemon {
         #[arg(long)]
@@ -210,6 +212,8 @@ struct Manifest {
     auto_check_on_success: bool,
     #[serde(default)]
     auto_recover_blocked: bool,
+    #[serde(default = "default_auto_recover_blocked_max_attempts")]
+    auto_recover_blocked_max_attempts: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -290,6 +294,16 @@ struct RunnerState {
     status_message_id: Option<String>,
     #[serde(default)]
     status_updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    auto_recover_attempts: u64,
+    #[serde(default)]
+    auto_recover_last_reason: Option<String>,
+    #[serde(default)]
+    auto_recover_same_reason_count: u64,
+    #[serde(default)]
+    auto_recover_last_task_id: Option<String>,
+    #[serde(default)]
+    auto_recover_last_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -423,6 +437,7 @@ struct StartOptions {
     task_runner_cmd: Option<String>,
     auto_check_on_success: bool,
     auto_recover_blocked: bool,
+    auto_recover_blocked_max_attempts: u64,
 }
 
 fn default_max_task_loops() -> u64 {
@@ -431,6 +446,10 @@ fn default_max_task_loops() -> u64 {
 
 fn default_auto_check_on_success() -> bool {
     true
+}
+
+fn default_auto_recover_blocked_max_attempts() -> u64 {
+    3
 }
 
 fn stuck_wait_ticks_threshold() -> u64 {
@@ -907,6 +926,42 @@ fn emit_all_tasks_completed_notifications(
     let _ = queue_main_feedback_summary(run_dir, manifest, &summary)?;
     let _ = flush_notifications(run_dir, manifest)?;
     Ok(())
+}
+
+fn normalize_blocked_reason_for_recovery(reason: &str) -> String {
+    let compact = reason
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    clip_text(&compact, 160)
+}
+
+fn auto_recover_guard_reason(
+    blocked_task_id: &str,
+    reason_key: &str,
+    runner_state: &RunnerState,
+    max_attempts: u64,
+) -> Option<String> {
+    if blocked_task_id.contains("-RECOVER") {
+        return Some(format!(
+            "auto-recover halted: generated recovery task failed ({blocked_task_id})"
+        ));
+    }
+    if runner_state.auto_recover_attempts >= max_attempts {
+        return Some(format!(
+            "auto-recover halted: max attempts reached ({}/{})",
+            runner_state.auto_recover_attempts, max_attempts
+        ));
+    }
+    if runner_state.auto_recover_last_reason.as_deref() == Some(reason_key)
+        && runner_state.auto_recover_same_reason_count >= 1
+    {
+        return Some("auto-recover halted: duplicate blocked reason detected".to_string());
+    }
+    None
 }
 
 fn should_suppress_waiting_stuck(runner_state: &RunnerState) -> bool {
@@ -1874,6 +1929,7 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
         task_runner_cmd: opts.task_runner_cmd,
         auto_check_on_success: opts.auto_check_on_success,
         auto_recover_blocked: opts.auto_recover_blocked,
+        auto_recover_blocked_max_attempts: opts.auto_recover_blocked_max_attempts,
     };
     let state = State {
         version: 1,
@@ -2276,6 +2332,50 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
 
                             if manifest.auto_recover_blocked {
                                 if let Some(blocked_task) = runner.task.as_ref() {
+                                    let reason_key = normalize_blocked_reason_for_recovery(
+                                        &state.waiting_reason,
+                                    );
+                                    let guard_reason = auto_recover_guard_reason(
+                                        &blocked_task.id,
+                                        &reason_key,
+                                        &runner_state,
+                                        manifest.auto_recover_blocked_max_attempts,
+                                    );
+
+                                    if let Some(reason) = guard_reason {
+                                        runner_state.paused = true;
+                                        runner_state.pause_reason = Some(reason.clone());
+                                        runner_state.auto_recover_last_reason =
+                                            Some(reason_key.clone());
+                                        runner_state.auto_recover_same_reason_count = runner_state
+                                            .auto_recover_same_reason_count
+                                            .saturating_add(1);
+                                        runner_state.auto_recover_last_at = Some(now);
+                                        write_runner_state(&dir, &runner_state)?;
+
+                                        state.status = LoopStatus::Stopped;
+                                        state.summary = "auto-recovery halted".to_string();
+                                        state.waiting_reason = reason.clone();
+                                        state.updated_at = now;
+                                        state.version += 1;
+
+                                        append_event(
+                                            &dir,
+                                            "task_blocked_auto_recover_guard_hit",
+                                            serde_json::json!({
+                                                "blocked_task_id": blocked_task.id,
+                                                "blocked_reason_key": reason_key,
+                                                "guard_reason": reason,
+                                                "attempts": runner_state.auto_recover_attempts,
+                                                "max_attempts": manifest.auto_recover_blocked_max_attempts,
+                                            }),
+                                        )?;
+
+                                        write_json(&dir.join("state.json"), &state)?;
+                                        let _ = flush_notifications(&dir, &manifest)?;
+                                        break;
+                                    }
+
                                     let recovery_task = append_recovery_task_for_blocked(
                                         &task_file_abs,
                                         &blocked_task.id,
@@ -2286,6 +2386,22 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                     task_done_now = task_checklist_done_count(&task_file_abs)?;
                                     task_loops_completed =
                                         task_done_now.saturating_sub(manifest.task_done_baseline);
+
+                                    runner_state.auto_recover_attempts =
+                                        runner_state.auto_recover_attempts.saturating_add(1);
+                                    if runner_state.auto_recover_last_reason.as_deref()
+                                        == Some(reason_key.as_str())
+                                    {
+                                        runner_state.auto_recover_same_reason_count = runner_state
+                                            .auto_recover_same_reason_count
+                                            .saturating_add(1);
+                                    } else {
+                                        runner_state.auto_recover_same_reason_count = 1;
+                                    }
+                                    runner_state.auto_recover_last_reason = Some(reason_key);
+                                    runner_state.auto_recover_last_task_id =
+                                        Some(recovery_task.id.clone());
+                                    runner_state.auto_recover_last_at = Some(now);
 
                                     runner_state.current_task_id = None;
                                     runner_state.current_task_text = None;
@@ -2318,6 +2434,8 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                             "blocked_reason": runner_state.last_task_reason.clone(),
                                             "recovery_task_id": recovery_task.id,
                                             "recovery_task_line": recovery_task.line_no,
+                                            "auto_recover_attempts": runner_state.auto_recover_attempts,
+                                            "auto_recover_same_reason_count": runner_state.auto_recover_same_reason_count,
                                         }),
                                     )?;
 
@@ -2705,6 +2823,12 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
         "task_agent_id": manifest.task_agent_id,
         "auto_check_on_success": manifest.auto_check_on_success,
         "auto_recover_blocked": manifest.auto_recover_blocked,
+        "auto_recover_blocked_max_attempts": manifest.auto_recover_blocked_max_attempts,
+        "auto_recover_attempts": runner_state.auto_recover_attempts,
+        "auto_recover_last_reason": runner_state.auto_recover_last_reason.clone(),
+        "auto_recover_same_reason_count": runner_state.auto_recover_same_reason_count,
+        "auto_recover_last_task_id": runner_state.auto_recover_last_task_id.clone(),
+        "auto_recover_last_at": runner_state.auto_recover_last_at,
         "task_loops_started": runner_state.task_loops_started,
         "waiting_stuck_threshold": stuck_wait_ticks_threshold(),
         "waiting_unchanged_ticks": runner_state.waiting_unchanged_ticks,
@@ -3455,6 +3579,7 @@ fn main() -> Result<()> {
             task_runner_cmd,
             auto_check_on_success,
             auto_recover_blocked,
+            auto_recover_blocked_max_attempts,
         } => cmd_start(StartOptions {
             repo,
             session_key,
@@ -3474,6 +3599,7 @@ fn main() -> Result<()> {
             task_runner_cmd,
             auto_check_on_success,
             auto_recover_blocked,
+            auto_recover_blocked_max_attempts,
         }),
         Commands::Daemon {
             repo,
@@ -3535,11 +3661,12 @@ mod tests {
     use super::{
         DeadLetterEntry, DeliveryAck, DeliveryAttempt, DispatchedNotification, LoopStatus,
         Manifest, Notification, NotificationDeliveryMode, RunnerState, ack_retry_policy,
-        append_jsonl, apply_status_establish_retry_override, classify_ack_failure_category,
-        completion_guard_waiting_fallback_line, compute_auto_stop_reason, compute_backoff_sec,
-        dead_letter_path, delivery_ack_path, delivery_attempts_path, delivery_retry_backoff_sec,
-        emit_all_tasks_completed_notifications, extract_pr_url, flush_notifications,
-        lease_window_sec, normalize_error_reason, notification_delivery_mode,
+        append_jsonl, apply_status_establish_retry_override, auto_recover_guard_reason,
+        classify_ack_failure_category, completion_guard_waiting_fallback_line,
+        compute_auto_stop_reason, compute_backoff_sec, dead_letter_path, delivery_ack_path,
+        delivery_attempts_path, delivery_retry_backoff_sec, emit_all_tasks_completed_notifications,
+        extract_pr_url, flush_notifications, lease_window_sec,
+        normalize_blocked_reason_for_recovery, normalize_error_reason, notification_delivery_mode,
         openclaw_notify_timeout_sec_from, parse_openclaw_message_id, parse_task_checklist_entry,
         read_jsonl, should_force_status_establish_retry, should_suppress_waiting_stuck,
         update_waiting_stuck_tracker, validate_task_done_contract_with,
@@ -3593,6 +3720,7 @@ mod tests {
             task_runner_cmd: None,
             auto_check_on_success: true,
             auto_recover_blocked: false,
+            auto_recover_blocked_max_attempts: 3,
         }
     }
 
@@ -3999,6 +4127,53 @@ mod tests {
         let overridden = apply_status_establish_retry_override(base, force);
         assert!(!overridden.retryable);
         assert_eq!(overridden.max_attempts, 1);
+    }
+
+    #[test]
+    fn normalize_blocked_reason_for_recovery_compacts_and_lowercases() {
+        let normalized = normalize_blocked_reason_for_recovery("Runner EXIT=2:\n  Timeout ERROR");
+        assert!(normalized.contains("runner exit=2:"));
+        assert!(normalized.contains("timeout error"));
+        assert!(!normalized.contains('\n'));
+    }
+
+    #[test]
+    fn auto_recover_guard_reason_stops_on_recovery_task_failure() {
+        let runner = RunnerState::default();
+        let reason = auto_recover_guard_reason("S5-6-RECOVER", "same-reason", &runner, 3);
+        assert!(
+            reason
+                .expect("guard reason")
+                .contains("generated recovery task failed")
+        );
+    }
+
+    #[test]
+    fn auto_recover_guard_reason_stops_on_duplicate_reason() {
+        let runner = RunnerState {
+            auto_recover_last_reason: Some("same-reason".to_string()),
+            auto_recover_same_reason_count: 1,
+            ..RunnerState::default()
+        };
+        let reason = auto_recover_guard_reason("S5-6", "same-reason", &runner, 3);
+        assert_eq!(
+            reason,
+            Some("auto-recover halted: duplicate blocked reason detected".to_string())
+        );
+    }
+
+    #[test]
+    fn auto_recover_guard_reason_stops_on_max_attempts() {
+        let runner = RunnerState {
+            auto_recover_attempts: 3,
+            ..RunnerState::default()
+        };
+        let reason = auto_recover_guard_reason("S5-6", "new-reason", &runner, 3);
+        assert!(
+            reason
+                .expect("guard reason")
+                .contains("max attempts reached")
+        );
     }
 
     #[test]
