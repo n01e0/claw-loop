@@ -2108,10 +2108,13 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                         runner_state.current_task_pr_url = None;
                         runner_state.pause_reason = Some("all tasklist items completed".into());
                         write_runner_state(&dir, &runner_state)?;
-                        state.status = LoopStatus::Waiting;
+                        state.status = LoopStatus::Stopped;
                         state.summary = "all tasklist items completed".into();
                         state.waiting_reason =
-                            "all tasklist items completed; waiting for new instruction".into();
+                            "all tasklist items completed; daemon stopped".into();
+                        state.updated_at = now;
+                        state.version += 1;
+                        write_json(&dir.join("state.json"), &state)?;
 
                         emit_all_tasks_completed_notifications(
                             &dir,
@@ -2119,6 +2122,17 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             &runner_state,
                             task_done_now,
                         )?;
+
+                        append_event(
+                            &dir,
+                            "daemon_stopped_all_tasks_completed",
+                            serde_json::json!({
+                                "task_done_now": task_done_now,
+                                "task_done_baseline": manifest.task_done_baseline,
+                                "task_loops_started": runner_state.task_loops_started,
+                            }),
+                        )?;
+                        break;
                     } else {
                         let queued_task = next.clone().expect("checked next.is_some");
                         runner_state.current_task_id = Some(queued_task.id.clone());
