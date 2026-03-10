@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 #[cfg(test)]
 use notify_policy::delivery_retry_backoff_sec;
 use notify_policy::{
-    NotificationDeliveryMode, ack_retry_policy, ack_retry_policy_snapshot,
+    AckRetryPolicy, NotificationDeliveryMode, ack_retry_policy, ack_retry_policy_snapshot,
     classify_ack_failure_category, normalize_error_reason, notification_delivery_mode,
     parse_openclaw_message_id,
 };
@@ -829,6 +829,25 @@ fn completion_mention_prefix(manifest: &Manifest) -> String {
     String::new()
 }
 
+fn should_force_status_establish_retry(
+    mode: NotificationDeliveryMode,
+    status_edit_target: Option<&str>,
+) -> bool {
+    matches!(mode, NotificationDeliveryMode::EditStatus) && status_edit_target.is_none()
+}
+
+fn apply_status_establish_retry_override(
+    mut policy: AckRetryPolicy,
+    force_status_establish_retry: bool,
+) -> AckRetryPolicy {
+    if force_status_establish_retry {
+        policy.retryable = true;
+        policy.max_attempts = u32::MAX;
+        policy.backoff_sec = policy.backoff_sec.max(15);
+    }
+    policy
+}
+
 fn queue_main_feedback_summary(
     run_dir: &Path,
     manifest: &Manifest,
@@ -1405,7 +1424,27 @@ fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
                 metrics.last_failed_at = Some(now);
                 metrics.last_error = Some(err_text.clone());
 
-                let policy = ack_retry_policy(&category, n.attempts);
+                let force_status_establish_retry =
+                    should_force_status_establish_retry(mode, status_edit_target.as_deref());
+                let policy = apply_status_establish_retry_override(
+                    ack_retry_policy(&category, n.attempts),
+                    force_status_establish_retry,
+                );
+                if force_status_establish_retry {
+                    append_event(
+                        run_dir,
+                        "notify_status_establish_retry",
+                        serde_json::json!({
+                            "event_id": n.event_id,
+                            "kind": n.kind.clone(),
+                            "attempts": n.attempts,
+                            "category": category,
+                            "max_attempts": policy.max_attempts,
+                            "backoff_sec": policy.backoff_sec,
+                        }),
+                    )?;
+                }
+
                 if !policy.retryable || n.attempts >= policy.max_attempts {
                     let dead = DeadLetterEntry {
                         event_id: n.event_id,
@@ -3402,12 +3441,13 @@ mod tests {
     use super::{
         DeadLetterEntry, DeliveryAck, DeliveryAttempt, DispatchedNotification, LoopStatus,
         Manifest, Notification, NotificationDeliveryMode, RunnerState, ack_retry_policy,
-        append_jsonl, classify_ack_failure_category, completion_guard_waiting_fallback_line,
-        compute_auto_stop_reason, compute_backoff_sec, dead_letter_path, delivery_ack_path,
-        delivery_attempts_path, delivery_retry_backoff_sec, emit_all_tasks_completed_notifications,
-        extract_pr_url, flush_notifications, lease_window_sec, normalize_error_reason,
-        notification_delivery_mode, openclaw_notify_timeout_sec_from, parse_openclaw_message_id,
-        parse_task_checklist_entry, read_jsonl, should_suppress_waiting_stuck,
+        append_jsonl, apply_status_establish_retry_override, classify_ack_failure_category,
+        completion_guard_waiting_fallback_line, compute_auto_stop_reason, compute_backoff_sec,
+        dead_letter_path, delivery_ack_path, delivery_attempts_path, delivery_retry_backoff_sec,
+        emit_all_tasks_completed_notifications, extract_pr_url, flush_notifications,
+        lease_window_sec, normalize_error_reason, notification_delivery_mode,
+        openclaw_notify_timeout_sec_from, parse_openclaw_message_id, parse_task_checklist_entry,
+        read_jsonl, should_force_status_establish_retry, should_suppress_waiting_stuck,
         update_waiting_stuck_tracker, validate_task_done_contract_with,
     };
     use chrono::{Duration, Utc};
@@ -3824,6 +3864,35 @@ mod tests {
         let rate = ack_retry_policy("rate_limited", 3);
         assert!(rate.retryable);
         assert_eq!(rate.backoff_sec, 120);
+    }
+
+    #[test]
+    fn status_establish_retry_override_forces_retry_when_status_unset() {
+        let base = ack_retry_policy("permission", 1);
+        assert!(!base.retryable);
+        assert_eq!(base.max_attempts, 1);
+
+        let force = should_force_status_establish_retry(NotificationDeliveryMode::EditStatus, None);
+        assert!(force);
+
+        let overridden = apply_status_establish_retry_override(base, force);
+        assert!(overridden.retryable);
+        assert_eq!(overridden.max_attempts, u32::MAX);
+        assert!(overridden.backoff_sec >= 15);
+    }
+
+    #[test]
+    fn status_establish_retry_override_does_not_apply_when_status_exists() {
+        let base = ack_retry_policy("permission", 1);
+        let force = should_force_status_establish_retry(
+            NotificationDeliveryMode::EditStatus,
+            Some("status-msg-1"),
+        );
+        assert!(!force);
+
+        let overridden = apply_status_establish_retry_override(base, force);
+        assert!(!overridden.retryable);
+        assert_eq!(overridden.max_attempts, 1);
     }
 
     #[test]
