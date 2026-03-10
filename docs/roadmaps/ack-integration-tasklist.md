@@ -119,7 +119,7 @@
 
 ## Current Execution Plan v5 (approved: completion+edit-notify fixes)
 - [x] S4-1: merge確認ガードの堅牢化（`gh pr view` timeout時は即blockedにせず再確認待ちへフォールバック）
-- [ ] S4-2: `all_tasks_completed` 通知保証（全タスク完了時に最終通知が欠落しないことを回帰で固定）
+- [x] S4-2: `all_tasks_completed` 通知保証（全タスク完了時に最終通知が欠落しないことを回帰で固定）
 - [ ] S4-3: task通知をsingle-status編集ベースへ移行（started/waiting/progressはedit、重要イベントのみ新規投稿）
 - [ ] S4-4: e2e + runbook更新（通知欠落/重複/編集失敗フォールバックを検証）
 

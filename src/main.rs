@@ -848,6 +848,28 @@ fn queue_main_feedback_summary(
     Ok(Some(event_id))
 }
 
+fn emit_all_tasks_completed_notifications(
+    run_dir: &Path,
+    manifest: &Manifest,
+    runner_state: &RunnerState,
+    task_done_now: u64,
+) -> Result<()> {
+    let mention = completion_mention_prefix(manifest);
+    let last_task = runner_state
+        .last_task_id
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let summary = format!(
+        "{mention}all tasks completed (run_id={}, loops_started={}, done={}, last_task={}); waiting for instruction",
+        manifest.run_id, runner_state.task_loops_started, task_done_now, last_task,
+    );
+
+    queue_notification(run_dir, manifest, "all_tasks_completed", summary.clone())?;
+    let _ = queue_main_feedback_summary(run_dir, manifest, &summary)?;
+    let _ = flush_notifications(run_dir, manifest)?;
+    Ok(())
+}
+
 fn should_suppress_waiting_stuck(runner_state: &RunnerState) -> bool {
     runner_state.paused
         && runner_state.pause_reason.as_deref() == Some("all tasklist items completed")
@@ -2023,25 +2045,12 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                         state.waiting_reason =
                             "all tasklist items completed; waiting for new instruction".into();
 
-                        let mention = completion_mention_prefix(&manifest);
-                        let last_task = runner_state
-                            .last_task_id
-                            .clone()
-                            .unwrap_or_else(|| "unknown".to_string());
-                        let summary = format!(
-                            "{mention}all tasks completed (run_id={}, loops_started={}, done={}, last_task={}); waiting for instruction",
-                            manifest.run_id,
-                            runner_state.task_loops_started,
-                            task_done_now,
-                            last_task,
-                        );
-                        queue_notification(
+                        emit_all_tasks_completed_notifications(
                             &dir,
                             &manifest,
-                            "all_tasks_completed",
-                            summary.clone(),
+                            &runner_state,
+                            task_done_now,
                         )?;
-                        let _ = queue_main_feedback_summary(&dir, &manifest, &summary)?;
                     } else {
                         let queued_task = next.clone().expect("checked next.is_some");
                         runner_state.current_task_id = Some(queued_task.id.clone());
@@ -3310,10 +3319,10 @@ mod tests {
         Manifest, Notification, NotificationDeliveryMode, RunnerState, ack_retry_policy,
         append_jsonl, classify_ack_failure_category, completion_guard_waiting_fallback_line,
         compute_auto_stop_reason, compute_backoff_sec, dead_letter_path, delivery_ack_path,
-        delivery_attempts_path, delivery_retry_backoff_sec, extract_pr_url, flush_notifications,
-        lease_window_sec, normalize_error_reason, notification_delivery_mode,
-        parse_openclaw_message_id, parse_task_checklist_entry, read_jsonl,
-        should_suppress_waiting_stuck, update_waiting_stuck_tracker,
+        delivery_attempts_path, delivery_retry_backoff_sec, emit_all_tasks_completed_notifications,
+        extract_pr_url, flush_notifications, lease_window_sec, normalize_error_reason,
+        notification_delivery_mode, parse_openclaw_message_id, parse_task_checklist_entry,
+        read_jsonl, should_suppress_waiting_stuck, update_waiting_stuck_tracker,
         validate_task_done_contract_with,
     };
     use chrono::{Duration, Utc};
@@ -3557,6 +3566,66 @@ mod tests {
         assert_eq!(ack[0].event_id, event_id);
         assert!(ack[0].ok);
         assert_eq!(ack[0].attempts, 3);
+    }
+
+    #[test]
+    fn emit_all_tasks_completed_notifications_dispatches_final_notification() {
+        let run = TestRunDir::new("all-tasks-completed");
+        let run_id = Uuid::new_v4();
+        let runner = RunnerState {
+            last_task_id: Some("S4-2".to_string()),
+            task_loops_started: 3,
+            ..RunnerState::default()
+        };
+
+        emit_all_tasks_completed_notifications(
+            &run.path,
+            &test_manifest(&run.path, run_id, false),
+            &runner,
+            3,
+        )
+        .expect("emit all tasks completed notifications");
+
+        let dispatched =
+            read_jsonl::<DispatchedNotification>(&run.path.join("notify-dispatched.jsonl"))
+                .expect("read dispatched");
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].kind, "all_tasks_completed");
+        assert!(dispatched[0].message.contains("all tasks completed"));
+        assert!(dispatched[0].message.contains("last_task=S4-2"));
+
+        assert!(
+            read_jsonl::<Notification>(&run.path.join("notify-queue.jsonl"))
+                .expect("read queue")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn emit_all_tasks_completed_notifications_also_dispatches_main_feedback_when_configured() {
+        let run = TestRunDir::new("all-tasks-feedback");
+        let run_id = Uuid::new_v4();
+        let runner = RunnerState {
+            last_task_id: Some("S4-2B".to_string()),
+            task_loops_started: 4,
+            ..RunnerState::default()
+        };
+
+        let mut manifest = test_manifest(&run.path, run_id, false);
+        manifest.feedback_channel = Some("discord".to_string());
+        manifest.feedback_thread_id = Some("main-thread".to_string());
+
+        emit_all_tasks_completed_notifications(&run.path, &manifest, &runner, 4)
+            .expect("emit all tasks completed notifications");
+
+        let dispatched =
+            read_jsonl::<DispatchedNotification>(&run.path.join("notify-dispatched.jsonl"))
+                .expect("read dispatched");
+        assert_eq!(dispatched.len(), 2);
+
+        let kinds: Vec<_> = dispatched.iter().map(|d| d.kind.as_str()).collect();
+        assert!(kinds.contains(&"all_tasks_completed"));
+        assert!(kinds.contains(&"main_feedback"));
     }
 
     #[test]
