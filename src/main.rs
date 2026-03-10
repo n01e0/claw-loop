@@ -629,6 +629,19 @@ fn openclaw_bin() -> String {
     std::env::var("CLAW_LOOPD_OPENCLAW_BIN").unwrap_or_else(|_| "openclaw".to_string())
 }
 
+fn openclaw_notify_timeout_sec_from(raw: Option<&str>) -> u64 {
+    const DEFAULT_TIMEOUT_SEC: u64 = 15;
+
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| (1..=120).contains(v))
+        .unwrap_or(DEFAULT_TIMEOUT_SEC)
+}
+
+fn openclaw_notify_timeout_sec() -> u64 {
+    let raw = std::env::var("CLAW_LOOPD_OPENCLAW_TIMEOUT_SEC").ok();
+    openclaw_notify_timeout_sec_from(raw.as_deref())
+}
+
 fn deliver_via_openclaw(
     notification: &Notification,
     edit_message_id: Option<&str>,
@@ -673,7 +686,8 @@ fn deliver_via_openclaw(
     }
 
     let openclaw = openclaw_bin();
-    let output = run_with_timeout_cmd(&openclaw, &args, 5)?;
+    let timeout_sec = openclaw_notify_timeout_sec();
+    let output = run_with_timeout_cmd(&openclaw, &args, timeout_sec)?;
     if !output.status.success() {
         let action = if edit_message_id.is_some() {
             "edit"
@@ -3392,9 +3406,9 @@ mod tests {
         compute_auto_stop_reason, compute_backoff_sec, dead_letter_path, delivery_ack_path,
         delivery_attempts_path, delivery_retry_backoff_sec, emit_all_tasks_completed_notifications,
         extract_pr_url, flush_notifications, lease_window_sec, normalize_error_reason,
-        notification_delivery_mode, parse_openclaw_message_id, parse_task_checklist_entry,
-        read_jsonl, should_suppress_waiting_stuck, update_waiting_stuck_tracker,
-        validate_task_done_contract_with,
+        notification_delivery_mode, openclaw_notify_timeout_sec_from, parse_openclaw_message_id,
+        parse_task_checklist_entry, read_jsonl, should_suppress_waiting_stuck,
+        update_waiting_stuck_tracker, validate_task_done_contract_with,
     };
     use chrono::{Duration, Utc};
     use std::{
@@ -3722,6 +3736,22 @@ mod tests {
         assert_eq!(delivery_retry_backoff_sec(2), 15);
         assert_eq!(delivery_retry_backoff_sec(3), 30);
         assert_eq!(delivery_retry_backoff_sec(9), 60);
+    }
+
+    #[test]
+    fn openclaw_notify_timeout_sec_uses_safe_default_and_accepts_config() {
+        assert_eq!(openclaw_notify_timeout_sec_from(None), 15);
+        assert_eq!(openclaw_notify_timeout_sec_from(Some("")), 15);
+        assert_eq!(openclaw_notify_timeout_sec_from(Some("30")), 30);
+        assert_eq!(openclaw_notify_timeout_sec_from(Some("1")), 1);
+    }
+
+    #[test]
+    fn openclaw_notify_timeout_sec_rejects_invalid_or_unsafe_values() {
+        assert_eq!(openclaw_notify_timeout_sec_from(Some("0")), 15);
+        assert_eq!(openclaw_notify_timeout_sec_from(Some("-5")), 15);
+        assert_eq!(openclaw_notify_timeout_sec_from(Some("nan")), 15);
+        assert_eq!(openclaw_notify_timeout_sec_from(Some("999")), 15);
     }
 
     #[test]
