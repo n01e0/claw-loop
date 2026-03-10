@@ -108,7 +108,7 @@
 - [x] S2-3: 重要イベントのみ新規投稿（blocked/done/stopped/auto_stopped）
 - [x] S2-4: status編集失敗時のフォールバック（再作成 + id再保存）
 - [x] S2-5: e2e追加（投稿数削減と重複抑止の検証）
-- [ ] S2-6: runbook更新（single-status運用と復旧手順）
+- [x] S2-6: runbook更新（single-status運用と復旧手順）
 
 ## 次の1手（着手順）
 1. S2-1: statusメッセージモデル追加
