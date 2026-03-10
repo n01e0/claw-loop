@@ -3853,6 +3853,49 @@ mod tests {
     }
 
     #[test]
+    fn waiting_stuck_tracker_resets_when_waiting_reason_changes() {
+        let mut runner = RunnerState::default();
+
+        assert_eq!(
+            update_waiting_stuck_tracker(
+                &mut runner,
+                &LoopStatus::Waiting,
+                "task waiting_merge: S3",
+                "TASK_WAITING_MERGE PR_URL=https://example.invalid/pr/3",
+                3,
+            ),
+            None
+        );
+        assert_eq!(runner.waiting_unchanged_ticks, 1);
+
+        assert_eq!(
+            update_waiting_stuck_tracker(
+                &mut runner,
+                &LoopStatus::Waiting,
+                "task waiting_merge: S3",
+                "TASK_WAITING_MERGE PR_URL=https://example.invalid/pr/4",
+                3,
+            ),
+            None
+        );
+        assert_eq!(runner.waiting_unchanged_ticks, 1);
+        assert_eq!(
+            runner.waiting_last_reason.as_deref(),
+            Some("TASK_WAITING_MERGE PR_URL=https://example.invalid/pr/4")
+        );
+    }
+
+    #[test]
+    fn waiting_stuck_is_not_suppressed_without_pause_reason() {
+        let runner = RunnerState {
+            paused: true,
+            pause_reason: None,
+            ..RunnerState::default()
+        };
+        assert!(!should_suppress_waiting_stuck(&runner));
+    }
+
+    #[test]
     fn waiting_stuck_is_suppressed_when_paused_all_tasks_completed() {
         let runner = RunnerState {
             paused: true,
