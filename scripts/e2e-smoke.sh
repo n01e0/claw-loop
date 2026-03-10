@@ -645,4 +645,103 @@ if any(r.get("event_id") in terminal_ids for r in queue_rows):
     raise SystemExit(f"expected no stale queued terminal rows after reconcile, got queue={queue_rows}")
 PY
 
+echo "[e2e-smoke] case10 single-status post reduction + duplicate suppression"
+cat > "$MOCKDIR/openclaw-status-mode" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+STATE_DIR="${CLAW_LOOPD_STATUS_MOCK_DIR:?missing CLAW_LOOPD_STATUS_MOCK_DIR}"
+mkdir -p "$STATE_DIR"
+LOG_FILE="$STATE_DIR/calls.jsonl"
+SEND_COUNT_FILE="$STATE_DIR/send_count"
+EDIT_COUNT_FILE="$STATE_DIR/edit_count"
+LAST_STATUS_ID_FILE="$STATE_DIR/last_status_id"
+
+send_count=0
+edit_count=0
+if [[ -f "$SEND_COUNT_FILE" ]]; then
+  send_count="$(cat "$SEND_COUNT_FILE")"
+fi
+if [[ -f "$EDIT_COUNT_FILE" ]]; then
+  edit_count="$(cat "$EDIT_COUNT_FILE")"
+fi
+
+action="${2:-}"
+message_id=""
+for ((i=1; i<=$#; i++)); do
+  arg="${!i}"
+  if [[ "$arg" == "--message-id" ]]; then
+    j=$((i + 1))
+    message_id="${!j:-}"
+  fi
+done
+
+if [[ "$action" == "send" ]]; then
+  send_count=$((send_count + 1))
+  echo "$send_count" > "$SEND_COUNT_FILE"
+  new_id="msg-${send_count}"
+  if [[ ! -f "$LAST_STATUS_ID_FILE" ]]; then
+    echo "$new_id" > "$LAST_STATUS_ID_FILE"
+  fi
+  printf '{"action":"send","message_id":null,"returned_id":"%s"}\n' "$new_id" >> "$LOG_FILE"
+  printf '{"payload":{"result":{"messageId":"%s"}}}\n' "$new_id"
+  exit 0
+fi
+
+if [[ "$action" == "edit" ]]; then
+  edit_count=$((edit_count + 1))
+  echo "$edit_count" > "$EDIT_COUNT_FILE"
+  printf '{"action":"edit","message_id":"%s"}\n' "$message_id" >> "$LOG_FILE"
+  printf '{"payload":{"result":{"messageId":"%s"}}}\n' "$message_id"
+  exit 0
+fi
+
+echo "unsupported mock openclaw action: $*" >&2
+exit 1
+EOF
+chmod +x "$MOCKDIR/openclaw-status-mode"
+
+STATUS_MOCK_DIR="$WORKDIR/status-mock"
+OUT10="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-status-mode" CLAW_LOOPD_STATUS_MOCK_DIR="$STATUS_MOCK_DIR" $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw)"
+RUN10="$(echo "$OUT10" | awk -F= '/^run_id=/{print $2}')"
+if [[ -z "$RUN10" ]]; then
+  echo "[e2e-smoke] failed to parse run10 id"
+  echo "$OUT10"
+  exit 1
+fi
+
+$BIN notify --repo "$WORKDIR" --run-id "$RUN10" --kind progress --message "run10 progress #1" >/dev/null
+$BIN notify --repo "$WORKDIR" --run-id "$RUN10" --kind progress --message "run10 progress #2" >/dev/null
+$BIN notify --repo "$WORKDIR" --run-id "$RUN10" --kind progress --message "run10 progress #3" >/dev/null
+sleep 4
+
+STATUS10="$($BIN status --repo "$WORKDIR" --run-id "$RUN10")"
+python3 - <<'PY' "$STATUS10" "$STATUS_MOCK_DIR"
+import json, pathlib, sys
+status = json.loads(sys.argv[1])
+mock_dir = pathlib.Path(sys.argv[2])
+calls_path = mock_dir / "calls.jsonl"
+if not calls_path.exists():
+    raise SystemExit("expected calls.jsonl for run10")
+rows = [json.loads(line) for line in calls_path.read_text().splitlines() if line.strip()]
+sends = [r for r in rows if r.get("action") == "send"]
+edits = [r for r in rows if r.get("action") == "edit"]
+if len(sends) != 1:
+    raise SystemExit(f"expected exactly 1 send for status bootstrap, got {len(sends)} rows={rows}")
+if len(edits) < 1:
+    raise SystemExit(f"expected >=1 edits for progress updates, got {len(edits)} rows={rows}")
+status_id = sends[0].get("returned_id")
+if not status_id:
+    raise SystemExit(f"missing status returned_id in first send row: {sends}")
+if not all(e.get("message_id") == status_id for e in edits):
+    raise SystemExit(f"expected all edits to target the same status message id={status_id}, got edits={edits}")
+runner = status.get("runner") or {}
+if runner.get("status_message_id") != status_id:
+    raise SystemExit(f"expected runner.status_message_id={status_id}, got {runner.get('status_message_id')}")
+if int(status.get("pending_notifications", 0)) != 0:
+    raise SystemExit(f"expected pending_notifications=0, got {status.get('pending_notifications')}")
+PY
+
+$BIN stop --repo "$WORKDIR" --run-id "$RUN10" >/dev/null || true
+sleep 1
+
 echo "[e2e-smoke] ok"
