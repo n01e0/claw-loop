@@ -17,7 +17,8 @@ use std::process::{self, Command, Stdio};
 #[cfg(test)]
 use tasklist::parse_task_checklist_entry;
 use tasklist::{
-    TaskChecklistEntry, load_task_checklist, task_checklist_done_count, update_task_check,
+    TaskChecklistEntry, append_recovery_task_for_blocked, load_task_checklist,
+    task_checklist_done_count, update_task_check,
 };
 use uuid::Uuid;
 
@@ -70,6 +71,8 @@ enum Commands {
         task_runner_cmd: Option<String>,
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         auto_check_on_success: bool,
+        #[arg(long, default_value_t = false)]
+        auto_recover_blocked: bool,
     },
     Daemon {
         #[arg(long)]
@@ -205,6 +208,8 @@ struct Manifest {
     task_runner_cmd: Option<String>,
     #[serde(default = "default_auto_check_on_success")]
     auto_check_on_success: bool,
+    #[serde(default)]
+    auto_recover_blocked: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -417,6 +422,7 @@ struct StartOptions {
     task_file: PathBuf,
     task_runner_cmd: Option<String>,
     auto_check_on_success: bool,
+    auto_recover_blocked: bool,
 }
 
 fn default_max_task_loops() -> u64 {
@@ -1867,6 +1873,7 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
         task_done_baseline,
         task_runner_cmd: opts.task_runner_cmd,
         auto_check_on_success: opts.auto_check_on_success,
+        auto_recover_blocked: opts.auto_recover_blocked,
     };
     let state = State {
         version: 1,
@@ -2267,6 +2274,76 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                 format!("task blocked: {}{}", task_label, pr_suffix),
                             )?;
 
+                            if manifest.auto_recover_blocked {
+                                if let Some(blocked_task) = runner.task.as_ref() {
+                                    let recovery_task = append_recovery_task_for_blocked(
+                                        &task_file_abs,
+                                        &blocked_task.id,
+                                        &state.waiting_reason,
+                                    )?;
+                                    let _ =
+                                        update_task_check(&task_file_abs, &blocked_task.id, true)?;
+                                    task_done_now = task_checklist_done_count(&task_file_abs)?;
+                                    task_loops_completed =
+                                        task_done_now.saturating_sub(manifest.task_done_baseline);
+
+                                    runner_state.current_task_id = None;
+                                    runner_state.current_task_text = None;
+                                    runner_state.current_task_line = None;
+                                    runner_state.current_task_started_at = None;
+                                    runner_state.current_task_state = None;
+                                    runner_state.current_task_blocked_reason = None;
+                                    runner_state.current_task_pr_url = None;
+                                    runner_state.paused = false;
+                                    runner_state.pause_reason = None;
+
+                                    state.version += 1;
+                                    state.status = LoopStatus::Running;
+                                    state.summary =
+                                        format!("auto-recovery queued: {}", recovery_task.id);
+                                    state.waiting_reason = format!(
+                                        "auto-recovery generated from blocked task {}",
+                                        blocked_task.id
+                                    );
+                                    state.updated_at = now;
+
+                                    write_runner_state(&dir, &runner_state)?;
+                                    write_json(&dir.join("state.json"), &state)?;
+
+                                    append_event(
+                                        &dir,
+                                        "task_blocked_auto_recovered",
+                                        serde_json::json!({
+                                            "blocked_task_id": blocked_task.id,
+                                            "blocked_reason": runner_state.last_task_reason.clone(),
+                                            "recovery_task_id": recovery_task.id,
+                                            "recovery_task_line": recovery_task.line_no,
+                                        }),
+                                    )?;
+
+                                    queue_notification(
+                                        &dir,
+                                        &manifest,
+                                        "task_progress",
+                                        format!(
+                                            "auto-recovery task queued: {} (from blocked task {})",
+                                            recovery_task.id, blocked_task.id
+                                        ),
+                                    )?;
+
+                                    continue;
+                                }
+
+                                append_event(
+                                    &dir,
+                                    "task_blocked_auto_recover_skipped",
+                                    serde_json::json!({
+                                        "reason": "runner.task is missing",
+                                        "task_label": task_label,
+                                    }),
+                                )?;
+                            }
+
                             write_json(&dir.join("state.json"), &state)?;
                             let _ = flush_notifications(&dir, &manifest)?;
                             break;
@@ -2627,6 +2704,7 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
         "task_runner_cmd": manifest.task_runner_cmd,
         "task_agent_id": manifest.task_agent_id,
         "auto_check_on_success": manifest.auto_check_on_success,
+        "auto_recover_blocked": manifest.auto_recover_blocked,
         "task_loops_started": runner_state.task_loops_started,
         "waiting_stuck_threshold": stuck_wait_ticks_threshold(),
         "waiting_unchanged_ticks": runner_state.waiting_unchanged_ticks,
@@ -3376,6 +3454,7 @@ fn main() -> Result<()> {
             task_file,
             task_runner_cmd,
             auto_check_on_success,
+            auto_recover_blocked,
         } => cmd_start(StartOptions {
             repo,
             session_key,
@@ -3394,6 +3473,7 @@ fn main() -> Result<()> {
             task_file,
             task_runner_cmd,
             auto_check_on_success,
+            auto_recover_blocked,
         }),
         Commands::Daemon {
             repo,
@@ -3512,6 +3592,7 @@ mod tests {
             task_done_baseline: 0,
             task_runner_cmd: None,
             auto_check_on_success: true,
+            auto_recover_blocked: false,
         }
     }
 
