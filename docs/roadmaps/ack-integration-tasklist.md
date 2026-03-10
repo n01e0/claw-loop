@@ -102,7 +102,18 @@
   - `cargo clippy --all-targets --all-features -- -D warnings`
   - `./scripts/e2e-smoke.sh ./target/debug/claw-loopd`
 
+## Current Execution Plan v3 (approved: single status message)
+- [x] S2-1: statusメッセージモデル追加（`status_message_id` / `status_updated_at`）
+- [x] S2-2: daemon通知を編集更新フローへ変更（started/waiting/progressはedit）
+- [ ] S2-3: 重要イベントのみ新規投稿（blocked/done/stopped/auto_stopped）
+- [ ] S2-4: status編集失敗時のフォールバック（再作成 + id再保存）
+- [ ] S2-5: e2e追加（投稿数削減と重複抑止の検証）
+- [ ] S2-6: runbook更新（single-status運用と復旧手順）
+
 ## 次の1手（着手順）
-1. S2: 監視運用（stuck通知の頻度/閾値チューニング）
-2. 24h soak 本番条件実行と結果レビュー
-3. 必要なら retry/backoff と通知ポリシー再調整
+1. S2-1: statusメッセージモデル追加
+2. S2-2: daemon通知を編集更新フローへ変更
+3. S2-3: 重要イベントのみ新規投稿
+4. S2-4: 編集失敗フォールバック
+5. S2-5: e2e検証追加
+6. S2-6: runbook更新
