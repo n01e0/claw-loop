@@ -744,4 +744,148 @@ PY
 $BIN stop --repo "$WORKDIR" --run-id "$RUN10" >/dev/null || true
 sleep 1
 
+echo "[e2e-smoke] case11 task single-status + edit fallback + no missing/duplicate final notify"
+cat > "$MOCKDIR/openclaw-task-fallback" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+STATE_DIR="${CLAW_LOOPD_STATUS_MOCK_DIR:?missing CLAW_LOOPD_STATUS_MOCK_DIR}"
+mkdir -p "$STATE_DIR"
+LOG_FILE="$STATE_DIR/calls-case11.jsonl"
+SEND_COUNT_FILE="$STATE_DIR/send_count_case11"
+EDIT_COUNT_FILE="$STATE_DIR/edit_count_case11"
+FAILED_ONCE_FILE="$STATE_DIR/edit_failed_once_case11"
+
+send_count=0
+edit_count=0
+if [[ -f "$SEND_COUNT_FILE" ]]; then
+  send_count="$(cat "$SEND_COUNT_FILE")"
+fi
+if [[ -f "$EDIT_COUNT_FILE" ]]; then
+  edit_count="$(cat "$EDIT_COUNT_FILE")"
+fi
+
+action="${2:-}"
+message_id=""
+for ((i=1; i<=$#; i++)); do
+  arg="${!i}"
+  if [[ "$arg" == "--message-id" ]]; then
+    j=$((i + 1))
+    message_id="${!j:-}"
+  fi
+done
+
+if [[ "$action" == "send" ]]; then
+  send_count=$((send_count + 1))
+  echo "$send_count" > "$SEND_COUNT_FILE"
+  new_id="msg-${send_count}"
+  printf '{"action":"send","message_id":null,"returned_id":"%s"}\n' "$new_id" >> "$LOG_FILE"
+  printf '{"payload":{"result":{"messageId":"%s"}}}\n' "$new_id"
+  exit 0
+fi
+
+if [[ "$action" == "edit" ]]; then
+  edit_count=$((edit_count + 1))
+  echo "$edit_count" > "$EDIT_COUNT_FILE"
+  if [[ ! -f "$FAILED_ONCE_FILE" ]]; then
+    touch "$FAILED_ONCE_FILE"
+    printf '{"action":"edit_fail","message_id":"%s"}\n' "$message_id" >> "$LOG_FILE"
+    echo "mock edit failure (case11)" >&2
+    exit 1
+  fi
+  printf '{"action":"edit","message_id":"%s"}\n' "$message_id" >> "$LOG_FILE"
+  printf '{"payload":{"result":{"messageId":"%s"}}}\n' "$message_id"
+  exit 0
+fi
+
+echo "unsupported mock openclaw action: $*" >&2
+exit 1
+EOF
+chmod +x "$MOCKDIR/openclaw-task-fallback"
+
+TASKFILE11="$WORKDIR/docs/roadmaps/s4-case11-tasklist.md"
+mkdir -p "$(dirname "$TASKFILE11")"
+cat > "$TASKFILE11" <<'EOF'
+- [ ] S4X-1: single task completion
+EOF
+
+STATUS_MOCK_DIR11="$WORKDIR/status-mock-case11"
+OUT11="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-task-fallback" CLAW_LOOPD_STATUS_MOCK_DIR="$STATUS_MOCK_DIR11" CLAW_LOOPD_GH_BIN="$MOCKDIR/gh" $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw --task-file "$TASKFILE11" --task-runner-cmd 'echo "TASK_DONE PR_URL=https://example.invalid/pr/200"')"
+RUN11="$(echo "$OUT11" | awk -F= '/^run_id=/{print $2}')"
+if [[ -z "$RUN11" ]]; then
+  echo "[e2e-smoke] failed to parse run11 id"
+  echo "$OUT11"
+  exit 1
+fi
+
+sleep 2
+$BIN notify --repo "$WORKDIR" --run-id "$RUN11" --kind progress --message "case11 forced edit for fallback" >/dev/null
+
+STATUS11=""
+for _ in {1..20}; do
+  STATUS11="$($BIN status --repo "$WORKDIR" --run-id "$RUN11")"
+  if python3 - <<'PY' "$STATUS11"
+import json, sys
+obj = json.loads(sys.argv[1])
+runner = obj.get("runner") or {}
+ok = (
+    obj.get("status") == "waiting"
+    and runner.get("pause_reason") == "all tasklist items completed"
+    and int(obj.get("pending_notifications", 0)) == 0
+)
+raise SystemExit(0 if ok else 1)
+PY
+  then
+    break
+  fi
+  sleep 1
+done
+
+python3 - <<'PY' "$STATUS11" "$STATUS_MOCK_DIR11" "$WORKDIR/.ralph/runs/$RUN11"
+import json, pathlib, sys
+status = json.loads(sys.argv[1])
+mock_dir = pathlib.Path(sys.argv[2])
+run_dir = pathlib.Path(sys.argv[3])
+
+calls_path = mock_dir / "calls-case11.jsonl"
+if not calls_path.exists():
+    raise SystemExit("expected calls-case11.jsonl")
+rows = [json.loads(line) for line in calls_path.read_text().splitlines() if line.strip()]
+if not any(r.get("action") == "edit_fail" for r in rows):
+    raise SystemExit(f"expected at least one edit_fail row, got {rows}")
+sends = [r for r in rows if r.get("action") == "send"]
+if len(sends) < 2:
+    raise SystemExit(f"expected >=2 sends (bootstrap + fallback), got {len(sends)} rows={rows}")
+
+runner = status.get("runner") or {}
+status_id = runner.get("status_message_id")
+if not status_id:
+    raise SystemExit(f"expected non-empty runner.status_message_id, got {runner}")
+bootstrap_id = sends[0].get("returned_id") if sends else None
+if status_id == bootstrap_id:
+    raise SystemExit(f"expected status_message_id to move away from bootstrap id after fallback, got {status_id}")
+all_send_ids = {r.get("returned_id") for r in sends if r.get("returned_id")}
+if status_id not in all_send_ids:
+    raise SystemExit(f"expected status_message_id to match one of recreated send ids, got {status_id}, send_ids={all_send_ids}")
+
+events_path = run_dir / "events.jsonl"
+events = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+if not any(e.get("kind") == "notify_status_edit_fallback_send" for e in events):
+    raise SystemExit("expected notify_status_edit_fallback_send event")
+
+dispatched_path = run_dir / "notify-dispatched.jsonl"
+dispatched = [json.loads(line) for line in dispatched_path.read_text().splitlines() if line.strip()]
+kind_counts = {}
+for row in dispatched:
+    kind = row.get("kind")
+    kind_counts[kind] = kind_counts.get(kind, 0) + 1
+
+if kind_counts.get("all_tasks_completed", 0) != 1:
+    raise SystemExit(f"expected exactly 1 all_tasks_completed dispatch, got {kind_counts}")
+if int(status.get("pending_notifications", 0)) != 0:
+    raise SystemExit(f"expected pending_notifications=0, got {status.get('pending_notifications')}")
+PY
+
+$BIN stop --repo "$WORKDIR" --run-id "$RUN11" >/dev/null || true
+sleep 1
+
 echo "[e2e-smoke] ok"
