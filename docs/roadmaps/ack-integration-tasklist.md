@@ -107,7 +107,7 @@
 - [x] S2-2: daemon通知を編集更新フローへ変更（started/waiting/progressはedit）
 - [x] S2-3: 重要イベントのみ新規投稿（blocked/done/stopped/auto_stopped）
 - [x] S2-4: status編集失敗時のフォールバック（再作成 + id再保存）
-- [ ] S2-5: e2e追加（投稿数削減と重複抑止の検証）
+- [x] S2-5: e2e追加（投稿数削減と重複抑止の検証）
 - [ ] S2-6: runbook更新（single-status運用と復旧手順）
 
 ## 次の1手（着手順）
