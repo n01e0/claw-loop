@@ -201,5 +201,11 @@ find scripts -type f -name '*.sh' -print0 | xargs -0 -r -n1 bash -n
 S4-4で追加した e2e 観点（`scripts/e2e-smoke.sh` case11）:
 
 - **通知欠落防止**: 全タスク完了 run で `all_tasks_completed` が必ず1回 dispatch される
-- **通知重複抑止**: `task_started` / `task_done` / `all_tasks_completed` の kind 別 dispatch 件数が想定どおり（各1件）
-- **編集失敗フォールバック**: status edit 失敗時に `notify_status_edit_fallback_send` が記録され、`runner.status_message_id` が新IDへ更新される
+- **通知重複抑止**: kind別 dispatch が不必要に重複しない（特に最終通知 `all_tasks_completed`）
+- **編集失敗フォールバック**: status edit 失敗時に `notify_status_edit_fallback_send` が記録され、`runner.status_message_id` が再作成IDへ更新される
+
+S5-4で固定した追加観点（case10 / case12）:
+
+- **single-status更新固定**: case10 で `runner.status_message_id` が単一IDを維持し、`runner.status_updated_at` が更新される
+- **timeout遅延の回帰固定**: case12 で `CLAW_LOOPD_OPENCLAW_TIMEOUT_SEC` の短/長設定が daemon→OpenClaw 呼び出しへ反映されることを確認し、長め設定時の配送成功を検証
+- **通知重複なし**: case9/case11 で queue/ack の重複除去と terminal通知の単発性を検証

@@ -738,6 +738,8 @@ if not all(e.get("message_id") == status_id for e in edits):
 runner = status.get("runner") or {}
 if runner.get("status_message_id") != status_id:
     raise SystemExit(f"expected runner.status_message_id={status_id}, got {runner.get('status_message_id')}")
+if not runner.get("status_updated_at"):
+    raise SystemExit(f"expected runner.status_updated_at to be set, got {runner}")
 if int(status.get("pending_notifications", 0)) != 0:
     raise SystemExit(f"expected pending_notifications=0, got {status.get('pending_notifications')}")
 PY
@@ -887,6 +889,87 @@ if int(status.get("pending_notifications", 0)) != 0:
 PY
 
 $BIN stop --repo "$WORKDIR" --run-id "$RUN11" >/dev/null || true
+sleep 1
+
+echo "[e2e-smoke] case12 timeout-delay behavior (configurable OpenClaw timeout)"
+cat > "$MOCKDIR/openclaw-delay" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+STATE_DIR="${CLAW_LOOPD_STATUS_MOCK_DIR:?missing CLAW_LOOPD_STATUS_MOCK_DIR}"
+mkdir -p "$STATE_DIR"
+LOG_FILE="$STATE_DIR/calls-case12.jsonl"
+COUNT_FILE="$STATE_DIR/send_count_case12"
+
+count=0
+if [[ -f "$COUNT_FILE" ]]; then
+  count="$(cat "$COUNT_FILE")"
+fi
+
+action="${2:-}"
+if [[ "$action" != "send" && "$action" != "edit" ]]; then
+  echo "unsupported mock openclaw action: $*" >&2
+  exit 1
+fi
+
+count=$((count + 1))
+echo "$count" > "$COUNT_FILE"
+
+DELAY_SEC="${CLAW_LOOPD_TIMEOUT_MOCK_DELAY_SEC:-1}"
+printf '{"action":"%s","timeout_sec":"%s","delay_sec":"%s"}\n' "$action" "${CLAW_LOOPD_OPENCLAW_TIMEOUT_SEC:-}" "$DELAY_SEC" >> "$LOG_FILE"
+
+sleep "$DELAY_SEC"
+printf '{"payload":{"result":{"messageId":"delay-msg-%s"}}}\n' "$count"
+EOF
+chmod +x "$MOCKDIR/openclaw-delay"
+
+STATUS_MOCK_DIR12A="$WORKDIR/status-mock-case12a"
+OUT12A="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-delay" CLAW_LOOPD_STATUS_MOCK_DIR="$STATUS_MOCK_DIR12A" CLAW_LOOPD_TIMEOUT_MOCK_DELAY_SEC=2 CLAW_LOOPD_OPENCLAW_TIMEOUT_SEC=1 $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw)"
+RUN12A="$(echo "$OUT12A" | awk -F= '/^run_id=/{print $2}')"
+if [[ -z "$RUN12A" ]]; then
+  echo "[e2e-smoke] failed to parse run12a id"
+  echo "$OUT12A"
+  exit 1
+fi
+sleep 4
+python3 - <<'PY' "$STATUS_MOCK_DIR12A"
+import json, pathlib, sys
+mock_dir = pathlib.Path(sys.argv[1])
+calls = mock_dir / "calls-case12.jsonl"
+if not calls.exists():
+    raise SystemExit("expected calls-case12.jsonl for run12a")
+rows = [json.loads(line) for line in calls.read_text().splitlines() if line.strip()]
+if not rows:
+    raise SystemExit("expected at least one run12a openclaw call")
+if not any(r.get("timeout_sec") == "1" for r in rows):
+    raise SystemExit(f"expected timeout_sec=1 in run12a calls, got {rows}")
+PY
+$BIN stop --repo "$WORKDIR" --run-id "$RUN12A" --immediate >/dev/null || true
+sleep 1
+
+STATUS_MOCK_DIR12B="$WORKDIR/status-mock-case12b"
+OUT12B="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-delay" CLAW_LOOPD_STATUS_MOCK_DIR="$STATUS_MOCK_DIR12B" CLAW_LOOPD_TIMEOUT_MOCK_DELAY_SEC=1 CLAW_LOOPD_OPENCLAW_TIMEOUT_SEC=3 $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw)"
+RUN12B="$(echo "$OUT12B" | awk -F= '/^run_id=/{print $2}')"
+if [[ -z "$RUN12B" ]]; then
+  echo "[e2e-smoke] failed to parse run12b id"
+  echo "$OUT12B"
+  exit 1
+fi
+sleep 4
+STATUS12B="$($BIN status --repo "$WORKDIR" --run-id "$RUN12B")"
+python3 - <<'PY' "$STATUS12B" "$STATUS_MOCK_DIR12B"
+import json, pathlib, sys
+obj = json.loads(sys.argv[1])
+mock_dir = pathlib.Path(sys.argv[2])
+metrics = obj.get("delivery_metrics") or {}
+if int(metrics.get("delivered_total", 0)) < 1:
+    raise SystemExit(f"expected delivered_total>=1 under longer timeout, got {metrics}")
+if int(obj.get("dispatched_notifications", 0)) < 1:
+    raise SystemExit(f"expected dispatched_notifications>=1 under longer timeout, got {obj.get('dispatched_notifications')}")
+rows = [json.loads(line) for line in (mock_dir / "calls-case12.jsonl").read_text().splitlines() if line.strip()]
+if not any(r.get("timeout_sec") == "3" for r in rows):
+    raise SystemExit(f"expected timeout_sec=3 in run12b calls, got {rows}")
+PY
+$BIN stop --repo "$WORKDIR" --run-id "$RUN12B" --immediate >/dev/null || true
 sleep 1
 
 echo "[e2e-smoke] ok"
