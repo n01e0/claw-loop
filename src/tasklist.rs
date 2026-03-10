@@ -112,7 +112,10 @@ pub(crate) fn update_task_check(file: &Path, id: &str, done: bool) -> Result<ser
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_task_checklist_entry, update_task_check};
+    use super::{
+        load_task_checklist, parse_task_checklist_entry, task_checklist_done_count,
+        update_task_check,
+    };
     use std::{fs, path::PathBuf};
     use uuid::Uuid;
 
@@ -148,5 +151,40 @@ mod tests {
 
         let content = fs::read_to_string(&file).expect("read file");
         assert_eq!(content, "- [ ] A1: alpha\n");
+    }
+
+    #[test]
+    fn update_task_check_marks_done_and_updates_summary_counts() {
+        let file = temp_file("flip-done");
+        fs::write(&file, "- [ ] A1: alpha\n- [x] A2: bravo\n").expect("write file");
+
+        let out = update_task_check(&file, "A1", true).expect("update task check");
+        assert_eq!(out["changed"], true);
+        assert_eq!(out["summary"]["total"], 2);
+        assert_eq!(out["summary"]["done"], 2);
+        assert_eq!(out["summary"]["open"], 0);
+
+        let content = fs::read_to_string(&file).expect("read file");
+        assert_eq!(content, "- [x] A1: alpha\n- [x] A2: bravo\n");
+
+        let (_, _, entries) = load_task_checklist(&file).expect("load checklist");
+        assert!(entries.iter().all(|e| e.done));
+    }
+
+    #[test]
+    fn update_task_check_errors_for_missing_task_id() {
+        let file = temp_file("missing-id");
+        fs::write(&file, "- [ ] A1: alpha\n").expect("write file");
+
+        let err = update_task_check(&file, "A9", true).expect_err("missing id should fail");
+        assert!(err.to_string().contains("task id not found"));
+    }
+
+    #[test]
+    fn task_checklist_done_count_returns_zero_for_missing_file() {
+        let file = temp_file("missing-file");
+        // do not create tasklist file
+        let count = task_checklist_done_count(&file).expect("done count on missing file");
+        assert_eq!(count, 0);
     }
 }
