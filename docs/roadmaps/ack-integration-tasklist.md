@@ -117,9 +117,14 @@
 - [x] S3-4: 分割後の単体テスト拡充（通知/runner/tasklist系の境界ケース）
 - [x] S3-5: runbook/READMEの更新（新しい構成と開発手順を反映）
 
+## Current Execution Plan v5 (approved: completion+edit-notify fixes)
+- [x] S4-1: merge確認ガードの堅牢化（`gh pr view` timeout時は即blockedにせず再確認待ちへフォールバック）
+- [ ] S4-2: `all_tasks_completed` 通知保証（全タスク完了時に最終通知が欠落しないことを回帰で固定）
+- [ ] S4-3: task通知をsingle-status編集ベースへ移行（started/waiting/progressはedit、重要イベントのみ新規投稿）
+- [ ] S4-4: e2e + runbook更新（通知欠落/重複/編集失敗フォールバックを検証）
+
 ## 次の1手（着手順）
-1. S3-1: README英語統一
-2. S3-2: CI script syntax check追加
-3. S3-3: `main.rs` 分割 + 回帰テスト
-4. S3-4: 単体テスト拡充
-5. S3-5: docs更新
+1. S4-1: merge確認ガード堅牢化
+2. S4-2: all_tasks_completed通知保証
+3. S4-3: task通知のsingle-status編集化
+4. S4-4: e2e/runbook更新
