@@ -3896,6 +3896,17 @@ mod tests {
     }
 
     #[test]
+    fn status_establish_retry_override_does_not_apply_for_send_mode() {
+        let base = ack_retry_policy("permission", 1);
+        let force = should_force_status_establish_retry(NotificationDeliveryMode::Send, None);
+        assert!(!force);
+
+        let overridden = apply_status_establish_retry_override(base, force);
+        assert!(!overridden.retryable);
+        assert_eq!(overridden.max_attempts, 1);
+    }
+
+    #[test]
     fn auto_stop_reason_hits_max_ticks() {
         let started_at = chrono::Utc::now() - chrono::Duration::seconds(1);
         let now = chrono::Utc::now();

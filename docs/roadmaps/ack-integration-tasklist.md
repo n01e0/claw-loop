@@ -127,7 +127,7 @@
 - [x] S5-1: OpenClaw通知timeout設計を修正（固定5sを廃止し、設定可能 + 安全なデフォルト値へ）
 - [x] S5-2: 通知経路をdaemonへ一元化（`scripts/rl-task-agent.sh` の direct `message send` 通知を撤廃）
 - [x] S5-3: daemon側のstatus message確立フローを強化（初回送信失敗時の再試行/復旧で `status_message_id` を確実化）
-- [ ] S5-4: 回帰テスト + e2e + runbook更新（timeout遅延/通知重複なし/single-status更新を固定）
+- [x] S5-4: 回帰テスト + e2e + runbook更新（timeout遅延/通知重複なし/single-status更新を固定）
 - [ ] S5-5: 全タスク完了時の自動停止を追加（`all_tasks_completed` 後に `waiting` ではなく `stopped` へ遷移）
 - [ ] S5-6: task_blocked 自動復旧モードを追加（blocked理由を次タスクとして自動生成して再開）
 - [ ] S5-7: 自動復旧の安全ガード + 可視化（再試行上限・同一理由デデュープ・復旧失敗時の停止条件）
