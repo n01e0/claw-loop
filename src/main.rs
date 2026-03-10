@@ -285,13 +285,22 @@ struct OpenclawDeliveryOutcome {
 
 fn notification_delivery_mode(kind: &str) -> NotificationDeliveryMode {
     let normalized = kind.trim().to_ascii_lowercase();
-    if normalized.contains("started")
-        || normalized.contains("waiting")
-        || normalized.contains("progress")
-    {
-        NotificationDeliveryMode::EditStatus
-    } else {
+
+    let important_new_post = matches!(
+        normalized.as_str(),
+        "blocked"
+            | "done"
+            | "stopped"
+            | "auto_stopped"
+            | "orphan_blocked"
+            | "all_tasks_completed"
+            | "pr_closed"
+    );
+
+    if important_new_post {
         NotificationDeliveryMode::Send
+    } else {
+        NotificationDeliveryMode::EditStatus
     }
 }
 
@@ -3954,7 +3963,7 @@ mod tests {
     }
 
     #[test]
-    fn notification_delivery_mode_marks_started_waiting_progress_for_edit() {
+    fn notification_delivery_mode_sends_only_important_events_as_new_posts() {
         assert_eq!(
             notification_delivery_mode("run_started"),
             NotificationDeliveryMode::EditStatus
@@ -3964,11 +3973,40 @@ mod tests {
             NotificationDeliveryMode::EditStatus
         );
         assert_eq!(
-            notification_delivery_mode("progress"),
+            notification_delivery_mode("pr_tracking_started"),
             NotificationDeliveryMode::EditStatus
         );
         assert_eq!(
+            notification_delivery_mode("pr_merged"),
+            NotificationDeliveryMode::EditStatus
+        );
+
+        assert_eq!(
+            notification_delivery_mode("blocked"),
+            NotificationDeliveryMode::Send
+        );
+        assert_eq!(
+            notification_delivery_mode("done"),
+            NotificationDeliveryMode::Send
+        );
+        assert_eq!(
+            notification_delivery_mode("stopped"),
+            NotificationDeliveryMode::Send
+        );
+        assert_eq!(
             notification_delivery_mode("auto_stopped"),
+            NotificationDeliveryMode::Send
+        );
+        assert_eq!(
+            notification_delivery_mode("orphan_blocked"),
+            NotificationDeliveryMode::Send
+        );
+        assert_eq!(
+            notification_delivery_mode("all_tasks_completed"),
+            NotificationDeliveryMode::Send
+        );
+        assert_eq!(
+            notification_delivery_mode("pr_closed"),
             NotificationDeliveryMode::Send
         );
     }
