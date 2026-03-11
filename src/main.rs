@@ -4278,7 +4278,7 @@ mod tests {
         let run = TestRunDir::new("blocked-notify");
         let run_id = Uuid::new_v4();
         let mut manifest = test_manifest(&run.path, run_id, false);
-        manifest.requester_user_id = Some("TEST_REQUESTER_USER_ID".to_string());
+        manifest.requester_user_id = Some("test-user-id".to_string());
         manifest.auto_recover_blocked = true;
 
         let msg = format_task_blocked_notification(
@@ -4288,7 +4288,7 @@ mod tests {
             Some("https://github.com/n01e0/claw-loop/pull/999"),
         );
 
-        assert!(msg.starts_with("<@TEST_REQUESTER_USER_ID> task blocked: S5-2"));
+        assert!(msg.starts_with("<@test-user-id> task blocked: S5-2"));
         assert!(msg.contains("reason:"));
         assert!(msg.contains("recovery:"));
         assert!(msg.contains("next: auto-recovery is enabled"));
@@ -4300,10 +4300,10 @@ mod tests {
         let run = TestRunDir::new("orphan-notify");
         let run_id = Uuid::new_v4();
         let mut manifest = test_manifest(&run.path, run_id, false);
-        manifest.requester_user_id = Some("TEST_REQUESTER_USER_ID".to_string());
+        manifest.requester_user_id = Some("test-user-id".to_string());
 
         let msg = format_orphan_blocked_notification(&manifest, 12345);
-        assert!(msg.starts_with("<@TEST_REQUESTER_USER_ID> run blocked: daemon pid 12345"));
+        assert!(msg.starts_with("<@test-user-id> run blocked: daemon pid 12345"));
         assert!(msg.contains("recovery:"));
     }
 

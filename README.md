@@ -101,7 +101,7 @@ cargo build
 # 1) start daemon (add --deliver-openclaw to enable OpenClaw delivery)
 # max-task-loops defaults to 10 (based on done-delta in task_file)
 # adding task-runner-cmd enables dogfood runner mode (default is auto-check based on agent output)
-cargo run -- start --repo . --session-key test --channel discord --thread-id thread-test --requester-user-id EXAMPLE_DISCORD_USER_ID --task-agent-id loop-worker --feedback-thread-id EXAMPLE_FEEDBACK_THREAD_ID --feedback-channel discord --tick-sec 1 --deliver-openclaw --task-runner-cmd './scripts/rl-task-agent.sh'
+cargo run -- start --repo . --session-key test --channel discord --thread-id thread-test --requester-user-id <discord_user_id> --task-agent-id loop-worker --feedback-thread-id <feedback_thread_id> --feedback-channel discord --tick-sec 1 --deliver-openclaw --task-runner-cmd './scripts/rl-task-agent.sh'
 
 # 2) bind PR tracking (example)
 cargo run -- track-pr --repo . --run-id <RUN_ID> --gh-repo n01e0/dimpact --pr 24 --merge-method merge
