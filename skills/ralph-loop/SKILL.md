@@ -16,7 +16,7 @@ Collect all of these before start:
 - safety guard (`--max-task-loops` / `--max-ticks`), with `max_task_loops` defaulting to `10`
 - `--max-runtime-sec` only when needed (omit for long pause-oriented operation)
 - dogfood runner command (`--task-runner-cmd`), monitor-only when omitted
-- recommended runner: `scripts/rl-task-agent.sh` (PR creation → auto-merge enforced → merge confirmation; CI failure is surfaced as blocked for auto-recovery)
+- recommended runner: `scripts/rl-task-agent.sh` (PR creation → auto-merge enforced → merge confirmation; CI failure is surfaced as blocked for auto-recovery; missing required checks policy is surfaced as waiting warning)
 - `--task-agent-id <agent_id>` (dedicated loop agent; split per loop for parallel operation)
 - `--auto-check-on-success` defaults to `true` (auto-check on runner success)
 - `--auto-recover-blocked` (enable blocked→recovery-task auto-resume)
