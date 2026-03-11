@@ -2180,8 +2180,91 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             state.status = LoopStatus::Waiting;
                             match runner_state.current_task_state {
                                 Some(RunnerTaskState::WaitingMerge) => {
-                                    state.summary = format!("task waiting_merge: {}", entry.id);
-                                    if state.waiting_reason.is_empty() {
+                                    if let Some(pr_url) = runner_state.current_task_pr_url.clone() {
+                                        match pr_url_is_merged(&pr_url) {
+                                            Ok(true) => {
+                                                let check_result = update_task_check(
+                                                    &task_file_abs,
+                                                    &entry.id,
+                                                    true,
+                                                )?;
+                                                task_done_now =
+                                                    task_checklist_done_count(&task_file_abs)?;
+                                                task_loops_completed = task_done_now
+                                                    .saturating_sub(manifest.task_done_baseline);
+
+                                                runner_state.last_task_id = Some(entry.id.clone());
+                                                runner_state.last_task_state =
+                                                    Some(RunnerTaskState::Done);
+                                                runner_state.last_task_at = Some(now);
+                                                runner_state.last_task_reason =
+                                                    Some("PR merged while waiting_merge".into());
+                                                runner_state.last_task_pr_url =
+                                                    Some(pr_url.clone());
+                                                runner_state.current_task_id = None;
+                                                runner_state.current_task_text = None;
+                                                runner_state.current_task_line = None;
+                                                runner_state.current_task_started_at = None;
+                                                runner_state.current_task_state = None;
+                                                runner_state.current_task_blocked_reason = None;
+                                                runner_state.current_task_pr_url = None;
+
+                                                append_event(
+                                                    &dir,
+                                                    "task_waiting_merge_resolved",
+                                                    serde_json::json!({
+                                                        "task_id": entry.id,
+                                                        "pr_url": pr_url,
+                                                        "check_result": check_result,
+                                                        "done": task_done_now,
+                                                    }),
+                                                )?;
+
+                                                queue_notification(
+                                                    &dir,
+                                                    &manifest,
+                                                    "task_done",
+                                                    format!(
+                                                        "task {} merged while waiting; done={} PR_URL={}",
+                                                        entry.id, task_done_now, pr_url
+                                                    ),
+                                                )?;
+
+                                                state.status = LoopStatus::Running;
+                                                state.summary =
+                                                    format!("task merged: {}", entry.id);
+                                                state.waiting_reason = format!(
+                                                    "merge confirmed for task {}",
+                                                    entry.id
+                                                );
+                                            }
+                                            Ok(false) => {
+                                                state.summary =
+                                                    format!("task waiting_merge: {}", entry.id);
+                                                state.waiting_reason =
+                                                    format!("TASK_WAITING_MERGE PR_URL={pr_url}");
+                                            }
+                                            Err(err) => {
+                                                let err_text = clip_text(&err.to_string(), 160);
+                                                append_event(
+                                                    &dir,
+                                                    "task_waiting_merge_recheck_failed",
+                                                    serde_json::json!({
+                                                        "task_id": entry.id,
+                                                        "pr_url": pr_url,
+                                                        "error": err_text,
+                                                    }),
+                                                )?;
+                                                state.summary =
+                                                    format!("task waiting_merge: {}", entry.id);
+                                                state.waiting_reason = format!(
+                                                    "TASK_WAITING_MERGE PR_URL={} (recheck_error={})",
+                                                    pr_url, err_text
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        state.summary = format!("task waiting_merge: {}", entry.id);
                                         state.waiting_reason =
                                             format!("TASK_WAITING_MERGE ({})", entry.id);
                                     }
