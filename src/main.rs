@@ -2378,11 +2378,21 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                 .clone()
                                 .map(|u| format!(" PR_URL={u}"))
                                 .unwrap_or_default();
+                            let checks_warn_suffix = if first_stdout_line
+                                .contains("WARN_REQUIRED_CHECKS_MISSING=1")
+                            {
+                                " [warning: required status checks may be missing on target branch]"
+                            } else {
+                                ""
+                            };
                             queue_notification(
                                 &dir,
                                 &manifest,
                                 "task_waiting_merge",
-                                format!("task waiting merge: {}{}", task_label, pr_suffix),
+                                format!(
+                                    "task waiting merge: {}{}{}",
+                                    task_label, pr_suffix, checks_warn_suffix
+                                ),
                             )?;
                         } else if !runner.success {
                             state.version += 1;

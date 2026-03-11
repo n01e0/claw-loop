@@ -115,6 +115,94 @@ pr_failed_checks_csv() {
   gh pr view "$pr_url" --repo "$gh_repo" --json statusCheckRollup --jq '[.statusCheckRollup[]? | select((.status // "") == "COMPLETED" and ((.conclusion // "") == "FAILURE" or (.conclusion // "") == "TIMED_OUT" or (.conclusion // "") == "CANCELLED" or (.conclusion // "") == "ACTION_REQUIRED" or (.conclusion // "") == "STARTUP_FAILURE")) | ((.name // "unknown") + ":" + (.conclusion // "UNKNOWN"))] | join(", ")' 2>/dev/null || true
 }
 
+required_checks_missing_warning() {
+  local pr_url="$1"
+  if [[ -z "$pr_url" ]]; then
+    return 0
+  fi
+
+  local gh_repo
+  gh_repo="$(resolve_gh_repo || true)"
+  if [[ -z "$gh_repo" ]]; then
+    return 0
+  fi
+
+  local base_branch default_branch bp_required_count rulesets_json
+  base_branch="$(gh pr view "$pr_url" --repo "$gh_repo" --json baseRefName --jq '.baseRefName' 2>/dev/null || true)"
+  if [[ -z "$base_branch" || "$base_branch" == "null" ]]; then
+    return 0
+  fi
+
+  default_branch="$(gh api "repos/${gh_repo}" --jq '.default_branch' 2>/dev/null || true)"
+  bp_required_count="$(gh api "repos/${gh_repo}/branches/${base_branch}/protection" --jq '(.required_status_checks.contexts // []) | length' 2>/dev/null || echo 0)"
+
+  if [[ "$bp_required_count" =~ ^[0-9]+$ ]] && (( bp_required_count > 0 )); then
+    return 0
+  fi
+
+  rulesets_json="$(gh api "repos/${gh_repo}/rulesets" 2>/dev/null || echo '[]')"
+
+  if REQ_CHECKS_ENFORCED="$(RULESETS_JSON="$rulesets_json" BASE_BRANCH="$base_branch" DEFAULT_BRANCH="$default_branch" python3 - <<'PY'
+import json, os
+
+rulesets_raw = os.environ.get('RULESETS_JSON', '[]')
+base = os.environ.get('BASE_BRANCH', '')
+default_branch = os.environ.get('DEFAULT_BRANCH', '')
+
+try:
+    rulesets = json.loads(rulesets_raw)
+except Exception:
+    print('0')
+    raise SystemExit(0)
+
+branch_ref = f"refs/heads/{base}"
+
+def token_matches(token: str) -> bool:
+    if token == '~ALL':
+        return True
+    if token == '~DEFAULT_BRANCH':
+        return bool(default_branch) and base == default_branch
+    return token == branch_ref or token == base
+
+def applies_to_branch(rs: dict) -> bool:
+    if rs.get('target') != 'branch':
+        return False
+    if rs.get('enforcement') != 'active':
+        return False
+
+    cond = rs.get('conditions') or {}
+    ref_name = cond.get('ref_name') or {}
+    include = ref_name.get('include') or []
+    exclude = ref_name.get('exclude') or []
+
+    include_match = True if not include else any(token_matches(t) for t in include)
+    exclude_match = any(token_matches(t) for t in exclude)
+    return include_match and not exclude_match
+
+for rs in rulesets if isinstance(rulesets, list) else []:
+    if not applies_to_branch(rs):
+        continue
+    rules = rs.get('rules') or []
+    for rule in rules:
+        if rule.get('type') != 'required_status_checks':
+            continue
+        params = rule.get('parameters') or {}
+        checks = params.get('required_status_checks') or []
+        if isinstance(checks, list) and len(checks) > 0:
+            print('1')
+            raise SystemExit(0)
+
+print('0')
+PY
+)"; then
+    if [[ "$REQ_CHECKS_ENFORCED" == "1" ]]; then
+      return 0
+    fi
+  fi
+
+  echo "required status checks are not enforced on ${gh_repo}#${base_branch}; merges may bypass CI"
+}
+
 if [[ -f "$state_file" ]]; then
   # shellcheck disable=SC1090
   source "$state_file"
@@ -131,7 +219,13 @@ if [[ -f "$state_file" ]]; then
       exit 2
     fi
 
-    echo "TASK_WAITING_MERGE PR_URL=${PR_URL}"
+    checks_warning="$(required_checks_missing_warning "$PR_URL")"
+    if [[ -n "$checks_warning" ]]; then
+      echo "TASK_WAITING_MERGE PR_URL=${PR_URL} WARN_REQUIRED_CHECKS_MISSING=1"
+      echo "$checks_warning"
+    else
+      echo "TASK_WAITING_MERGE PR_URL=${PR_URL}"
+    fi
     exit 10
   fi
 fi
@@ -203,7 +297,13 @@ if [[ "$first_line" == TASK_DONE* ]]; then
   {
     echo "PR_URL='${pr_url}'"
   } >"$state_file"
-  echo "TASK_WAITING_MERGE PR_URL=${pr_url}"
+  checks_warning="$(required_checks_missing_warning "$pr_url")"
+  if [[ -n "$checks_warning" ]]; then
+    echo "TASK_WAITING_MERGE PR_URL=${pr_url} WARN_REQUIRED_CHECKS_MISSING=1"
+    echo "$checks_warning"
+  else
+    echo "TASK_WAITING_MERGE PR_URL=${pr_url}"
+  fi
   exit 10
 fi
 
@@ -217,6 +317,12 @@ if [[ "$first_line" == TASK_WAITING_MERGE* ]]; then
     if [[ -n "$failed_checks" ]]; then
       echo "TASK_BLOCKED: CI failed for PR_URL=${pr_url} checks=${failed_checks}" >&2
       exit 2
+    fi
+    checks_warning="$(required_checks_missing_warning "$pr_url")"
+    if [[ -n "$checks_warning" ]]; then
+      echo "TASK_WAITING_MERGE PR_URL=${pr_url} WARN_REQUIRED_CHECKS_MISSING=1"
+      echo "$checks_warning"
+      exit 10
     fi
   fi
   exit 10
