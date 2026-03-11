@@ -132,7 +132,7 @@
 - [x] S5-6: task_blocked 自動復旧モードを追加（blocked理由を次タスクとして自動生成して再開）
 - [x] S5-7: 自動復旧の安全ガード + 可視化（再試行上限・同一理由デデュープ・復旧失敗時の停止条件）
 - [x] S5-8: OpenClaw `--json` 出力の前置きログ混入に耐える messageId 抽出へ修正（status_message_id が確実に取れること）
-- [ ] S5-9: 通知を基本即flushへ統一（enqueue直後flush、失敗時は既存retry/queueへ戻す）
+- [x] S5-9: 通知を基本即flushへ統一（enqueue直後flush、失敗時は既存retry/queueへ戻す）
 
 ## 次の1手（着手順）
 1. S5-9: 通知の基本即flush統一
