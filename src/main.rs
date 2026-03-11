@@ -783,14 +783,27 @@ fn queue_notification(
     kind: impl Into<String>,
     message: impl Into<String>,
 ) -> Result<Uuid> {
-    queue_notification_target(
+    let event_id = queue_notification_target(
         run_dir,
         manifest.run_id,
         manifest.channel.clone(),
         manifest.thread_id.clone(),
         kind,
         message,
-    )
+    )?;
+
+    if let Err(err) = flush_notifications(run_dir, manifest) {
+        let _ = append_event(
+            run_dir,
+            "notify_flush_failed",
+            serde_json::json!({
+                "event_id": event_id,
+                "error": err.to_string(),
+            }),
+        );
+    }
+
+    Ok(event_id)
 }
 
 fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> {
@@ -903,6 +916,19 @@ fn queue_main_feedback_summary(
         "main_feedback",
         summary_message.to_string(),
     )?;
+
+    if let Err(err) = flush_notifications(run_dir, manifest) {
+        let _ = append_event(
+            run_dir,
+            "notify_flush_failed",
+            serde_json::json!({
+                "event_id": event_id,
+                "kind": "main_feedback",
+                "error": err.to_string(),
+            }),
+        );
+    }
+
     Ok(Some(event_id))
 }
 
@@ -3668,7 +3694,8 @@ mod tests {
         extract_pr_url, flush_notifications, lease_window_sec,
         normalize_blocked_reason_for_recovery, normalize_error_reason, notification_delivery_mode,
         openclaw_notify_timeout_sec_from, parse_openclaw_message_id, parse_task_checklist_entry,
-        read_jsonl, should_force_status_establish_retry, should_suppress_waiting_stuck,
+        queue_main_feedback_summary, queue_notification, read_jsonl,
+        should_force_status_establish_retry, should_suppress_waiting_stuck,
         update_waiting_stuck_tracker, validate_task_done_contract_with,
     };
     use chrono::{Duration, Utc};
@@ -3914,6 +3941,51 @@ mod tests {
         assert_eq!(ack[0].event_id, event_id);
         assert!(ack[0].ok);
         assert_eq!(ack[0].attempts, 3);
+    }
+
+    #[test]
+    fn queue_notification_flushes_immediately_when_delivery_succeeds() {
+        let run = TestRunDir::new("queue-immediate-flush");
+        let run_id = Uuid::new_v4();
+        let manifest = test_manifest(&run.path, run_id, false);
+
+        let event_id = queue_notification(&run.path, &manifest, "progress", "immediate")
+            .expect("queue notification");
+
+        let queued =
+            read_jsonl::<Notification>(&run.path.join("notify-queue.jsonl")).expect("read queue");
+        assert!(queued.is_empty());
+
+        let dispatched =
+            read_jsonl::<DispatchedNotification>(&run.path.join("notify-dispatched.jsonl"))
+                .expect("read dispatched");
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].event_id, event_id);
+        assert_eq!(dispatched[0].kind, "progress");
+    }
+
+    #[test]
+    fn queue_main_feedback_summary_flushes_immediately() {
+        let run = TestRunDir::new("main-feedback-immediate-flush");
+        let run_id = Uuid::new_v4();
+        let mut manifest = test_manifest(&run.path, run_id, false);
+        manifest.feedback_channel = Some("discord".to_string());
+        manifest.feedback_thread_id = Some("main-thread".to_string());
+
+        let event_id = queue_main_feedback_summary(&run.path, &manifest, "summary")
+            .expect("queue main feedback")
+            .expect("event id");
+
+        let queued =
+            read_jsonl::<Notification>(&run.path.join("notify-queue.jsonl")).expect("read queue");
+        assert!(queued.is_empty());
+
+        let dispatched =
+            read_jsonl::<DispatchedNotification>(&run.path.join("notify-dispatched.jsonl"))
+                .expect("read dispatched");
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].event_id, event_id);
+        assert_eq!(dispatched[0].kind, "main_feedback");
     }
 
     #[test]

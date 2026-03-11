@@ -132,12 +132,7 @@
 - [x] S5-6: task_blocked 自動復旧モードを追加（blocked理由を次タスクとして自動生成して再開）
 - [x] S5-7: 自動復旧の安全ガード + 可視化（再試行上限・同一理由デデュープ・復旧失敗時の停止条件）
 - [x] S5-8: OpenClaw `--json` 出力の前置きログ混入に耐える messageId 抽出へ修正（status_message_id が確実に取れること）
+- [ ] S5-9: 通知を基本即flushへ統一（enqueue直後flush、失敗時は既存retry/queueへ戻す）
 
 ## 次の1手（着手順）
-1. S5-2: 通知経路のdaemon一元化
-2. S5-3: status message確立フロー強化
-3. S5-4: 回帰テスト/e2e/runbook更新
-4. S5-5: 全タスク完了時の自動停止
-5. S5-6: blocked自動復旧モード
-6. S5-7: 自動復旧ガード/可視化
-7. S5-8: `--json` 前置きログ混入に耐える messageId 抽出修正
+1. S5-9: 通知の基本即flush統一
