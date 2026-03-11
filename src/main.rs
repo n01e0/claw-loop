@@ -867,6 +867,67 @@ fn completion_mention_prefix(manifest: &Manifest) -> String {
     String::new()
 }
 
+fn blocked_recovery_hint(reason: &str) -> &'static str {
+    let normalized = reason.to_ascii_lowercase();
+    if normalized.contains("session file locked") || normalized.contains("task_waiting_agent_lock")
+    {
+        "wait for the active agent session lock to clear, then retry with a dedicated --task-agent-id to avoid contention"
+    } else if normalized.contains("unexpected eof")
+        || normalized.contains("syntax error")
+        || normalized.contains("command not found")
+    {
+        "fix the runner/script syntax or missing command in the repository, then rerun the blocked task"
+    } else if normalized.contains("timeout") || normalized.contains("timed out") {
+        "retry after the transient timeout and consider increasing command/agent timeout if it is consistently slow"
+    } else if normalized.contains("permission denied")
+        || normalized.contains("401")
+        || normalized.contains("403")
+        || normalized.contains("forbidden")
+    {
+        "fix the required auth/permission for this action (repo/channel/token), then rerun the task"
+    } else if normalized.contains("without pr_url") || normalized.contains("pr_url") {
+        "ensure the runner returns TASK_DONE PR_URL=<url> and that the PR reaches merged state"
+    } else {
+        "inspect runner stderr, fix the blocker in code/config, then rerun the task"
+    }
+}
+
+fn format_task_blocked_notification(
+    manifest: &Manifest,
+    task_label: &str,
+    blocked_reason: &str,
+    pr_url: Option<&str>,
+) -> String {
+    let mention = completion_mention_prefix(manifest);
+    let reason = if blocked_reason.trim().is_empty() {
+        "unknown blocker".to_string()
+    } else {
+        clip_text(blocked_reason.trim(), 240)
+    };
+    let recovery = blocked_recovery_hint(&reason);
+    let next = if manifest.auto_recover_blocked {
+        "next: auto-recovery is enabled; daemon will queue a recovery task automatically (guard limits apply)"
+    } else {
+        "next: auto-recovery is disabled; fix manually and rerun (or start with --auto-recover-blocked)"
+    };
+    let pr_suffix = pr_url
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| format!(" PR_URL={v}"))
+        .unwrap_or_default();
+
+    format!(
+        "{mention}task blocked: {task_label}{pr_suffix}\nreason: {reason}\nrecovery: {recovery}\n{next}"
+    )
+}
+
+fn format_orphan_blocked_notification(manifest: &Manifest, daemon_pid: u32) -> String {
+    let mention = completion_mention_prefix(manifest);
+    format!(
+        "{mention}run blocked: daemon pid {daemon_pid} missing after lease expiry\nreason: daemon process is gone while lease expired\nrecovery: restart the run with the latest binary and verify stale pid/lock state before resuming"
+    )
+}
+
 fn should_force_status_establish_retry(
     mode: NotificationDeliveryMode,
     status_edit_target: Option<&str>,
@@ -2345,16 +2406,13 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             runner_state.last_task_pr_url = first_line_pr_url.clone();
                             write_runner_state(&dir, &runner_state)?;
 
-                            let pr_suffix = first_line_pr_url
-                                .clone()
-                                .map(|u| format!(" PR_URL={u}"))
-                                .unwrap_or_default();
-                            queue_notification(
-                                &dir,
+                            let blocked_message = format_task_blocked_notification(
                                 &manifest,
-                                "task_blocked",
-                                format!("task blocked: {}{}", task_label, pr_suffix),
-                            )?;
+                                &task_label,
+                                &state.waiting_reason,
+                                first_line_pr_url.as_deref(),
+                            );
+                            queue_notification(&dir, &manifest, "task_blocked", blocked_message)?;
 
                             if manifest.auto_recover_blocked {
                                 if let Some(blocked_task) = runner.task.as_ref() {
@@ -3448,10 +3506,7 @@ fn reconcile_orphan_if_needed(repo: &Path, run_id: Uuid) -> Result<Option<&'stat
             &dir,
             &manifest,
             "orphan_blocked",
-            format!(
-                "run blocked: daemon pid {} missing after lease expiry",
-                manifest.daemon_pid
-            ),
+            format_orphan_blocked_notification(&manifest, manifest.daemon_pid),
         )?;
 
         let _ = flush_notifications(&dir, &manifest)?;
@@ -3688,10 +3743,11 @@ mod tests {
         DeadLetterEntry, DeliveryAck, DeliveryAttempt, DispatchedNotification, LoopStatus,
         Manifest, Notification, NotificationDeliveryMode, RunnerState, ack_retry_policy,
         append_jsonl, apply_status_establish_retry_override, auto_recover_guard_reason,
-        classify_ack_failure_category, completion_guard_waiting_fallback_line,
-        compute_auto_stop_reason, compute_backoff_sec, dead_letter_path, delivery_ack_path,
-        delivery_attempts_path, delivery_retry_backoff_sec, emit_all_tasks_completed_notifications,
-        extract_pr_url, flush_notifications, lease_window_sec,
+        blocked_recovery_hint, classify_ack_failure_category,
+        completion_guard_waiting_fallback_line, compute_auto_stop_reason, compute_backoff_sec,
+        dead_letter_path, delivery_ack_path, delivery_attempts_path, delivery_retry_backoff_sec,
+        emit_all_tasks_completed_notifications, extract_pr_url, flush_notifications,
+        format_orphan_blocked_notification, format_task_blocked_notification, lease_window_sec,
         normalize_blocked_reason_for_recovery, normalize_error_reason, notification_delivery_mode,
         openclaw_notify_timeout_sec_from, parse_openclaw_message_id, parse_task_checklist_entry,
         queue_main_feedback_summary, queue_notification, read_jsonl,
@@ -4199,6 +4255,46 @@ mod tests {
         let overridden = apply_status_establish_retry_override(base, force);
         assert!(!overridden.retryable);
         assert_eq!(overridden.max_attempts, 1);
+    }
+
+    #[test]
+    fn blocked_recovery_hint_maps_common_lock_error() {
+        let hint = blocked_recovery_hint("Error: session file locked (timeout 10000ms)");
+        assert!(hint.contains("dedicated --task-agent-id"));
+    }
+
+    #[test]
+    fn format_task_blocked_notification_includes_mention_reason_and_next_step() {
+        let run = TestRunDir::new("blocked-notify");
+        let run_id = Uuid::new_v4();
+        let mut manifest = test_manifest(&run.path, run_id, false);
+        manifest.requester_user_id = Some("TEST_REQUESTER_USER_ID".to_string());
+        manifest.auto_recover_blocked = true;
+
+        let msg = format_task_blocked_notification(
+            &manifest,
+            "S5-2",
+            r#"runner exit=2: unexpected EOF while looking for matching '"'"#,
+            Some("https://github.com/n01e0/claw-loop/pull/999"),
+        );
+
+        assert!(msg.starts_with("<@TEST_REQUESTER_USER_ID> task blocked: S5-2"));
+        assert!(msg.contains("reason:"));
+        assert!(msg.contains("recovery:"));
+        assert!(msg.contains("next: auto-recovery is enabled"));
+        assert!(msg.contains("PR_URL=https://github.com/n01e0/claw-loop/pull/999"));
+    }
+
+    #[test]
+    fn format_orphan_blocked_notification_mentions_requester() {
+        let run = TestRunDir::new("orphan-notify");
+        let run_id = Uuid::new_v4();
+        let mut manifest = test_manifest(&run.path, run_id, false);
+        manifest.requester_user_id = Some("TEST_REQUESTER_USER_ID".to_string());
+
+        let msg = format_orphan_blocked_notification(&manifest, 12345);
+        assert!(msg.starts_with("<@TEST_REQUESTER_USER_ID> run blocked: daemon pid 12345"));
+        assert!(msg.contains("recovery:"));
     }
 
     #[test]

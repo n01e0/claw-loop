@@ -19,6 +19,8 @@ Collect all of these before start:
 - recommended runner: `scripts/rl-task-agent.sh` (PR creation → auto-merge → merge confirmation)
 - `--task-agent-id <agent_id>` (dedicated loop agent; split per loop for parallel operation)
 - `--auto-check-on-success` defaults to `true` (auto-check on runner success)
+- `--auto-recover-blocked` (enable blocked→recovery-task auto-resume)
+- `--auto-recover-blocked-max-attempts <n>` (default `3`)
 - `--requester-user-id <discord_user_id>` (completion mention target; never hardcode)
   - in Discord operation, pass the triggering message `sender_id` directly
 - `--feedback-thread-id <thread_id> [--feedback-channel <channel>]` (main aggregation target for completion summaries)
@@ -39,7 +41,7 @@ Never start without `thread_id` + `session_key`.
 4. Resolve aggregation target:
    - use main control thread id as `<feedback_thread_id>`
 5. Start daemon:
-   - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --requester-user-id <discord_user_id> --task-agent-id <agent_id> --feedback-thread-id <feedback_thread_id> --feedback-channel discord --tick-sec 60 --deliver-openclaw --max-task-loops 10 --task-runner-cmd './scripts/rl-task-agent.sh'`
+   - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --requester-user-id <discord_user_id> --task-agent-id <agent_id> --feedback-thread-id <feedback_thread_id> --feedback-channel discord --tick-sec 60 --deliver-openclaw --max-task-loops 10 --task-runner-cmd './scripts/rl-task-agent.sh' --auto-recover-blocked --auto-recover-blocked-max-attempts 3`
    - default: auto-check and continue on runner success (`--auto-check-on-success=true`)
    - with `--auto-check-on-success=false`, run in completion-gated mode (do not start the next task until the active task is checked complete)
 6. Post `run_id` in-thread immediately.
