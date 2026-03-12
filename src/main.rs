@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use clap::{Parser, Subcommand};
 #[cfg(test)]
 use notify_policy::delivery_retry_backoff_sec;
@@ -783,6 +783,15 @@ fn queue_notification(
     kind: impl Into<String>,
     message: impl Into<String>,
 ) -> Result<Uuid> {
+    let kind = kind.into();
+    let mut message = message.into();
+    if matches!(
+        notification_delivery_mode(&kind),
+        NotificationDeliveryMode::EditStatus
+    ) {
+        message = format!("{message} | as_of={}", format_local_as_of(Utc::now()));
+    }
+
     let event_id = queue_notification_target(
         run_dir,
         manifest.run_id,
@@ -855,6 +864,34 @@ fn clip_text(input: &str, max_chars: usize) -> String {
     }
     let clipped: String = input.chars().take(max_chars).collect();
     format!("{clipped}…")
+}
+
+fn format_local_as_of(ts: DateTime<Utc>) -> String {
+    ts.with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M:%S %Z")
+        .to_string()
+}
+
+fn format_elapsed_compact(total_sec: u64) -> String {
+    let hours = total_sec / 3600;
+    let minutes = (total_sec % 3600) / 60;
+    let seconds = total_sec % 60;
+
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn task_elapsed_suffix(started_at: Option<&DateTime<Utc>>, now: DateTime<Utc>) -> String {
+    started_at
+        .map(|started| (now - *started).num_seconds().max(0) as u64)
+        .map(format_elapsed_compact)
+        .map(|elapsed| format!(" elapsed={elapsed}"))
+        .unwrap_or_default()
 }
 
 fn completion_mention_prefix(manifest: &Manifest) -> String {
@@ -2143,6 +2180,10 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                     "text": entry.text,
                                 }),
                             )?;
+                            let elapsed_suffix = task_elapsed_suffix(
+                                runner_state.current_task_started_at.as_ref(),
+                                now,
+                            );
                             runner_state.last_task_id = Some(entry.id.clone());
                             runner_state.last_task_state = Some(RunnerTaskState::Done);
                             runner_state.last_task_at = Some(now);
@@ -2171,8 +2212,8 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                 &manifest,
                                 "task_done",
                                 format!(
-                                    "task {} marked done in checklist; done={}{}",
-                                    entry.id, task_done_now, pr_suffix
+                                    "task {} marked done in checklist; done={}{}{}",
+                                    entry.id, task_done_now, pr_suffix, elapsed_suffix
                                 ),
                             )?;
                         }
@@ -2193,6 +2234,10 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                                 task_loops_completed = task_done_now
                                                     .saturating_sub(manifest.task_done_baseline);
 
+                                                let elapsed_suffix = task_elapsed_suffix(
+                                                    runner_state.current_task_started_at.as_ref(),
+                                                    now,
+                                                );
                                                 runner_state.last_task_id = Some(entry.id.clone());
                                                 runner_state.last_task_state =
                                                     Some(RunnerTaskState::Done);
@@ -2225,8 +2270,11 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                                     &manifest,
                                                     "task_done",
                                                     format!(
-                                                        "task {} merged while waiting; done={} PR_URL={}",
-                                                        entry.id, task_done_now, pr_url
+                                                        "task {} merged while waiting; done={} PR_URL={}{}",
+                                                        entry.id,
+                                                        task_done_now,
+                                                        pr_url,
+                                                        elapsed_suffix
                                                     ),
                                                 )?;
 
@@ -2651,6 +2699,10 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                 runner_state.task_loops_started.saturating_add(1);
 
                             if manifest.auto_check_on_success {
+                                let elapsed_suffix = task_elapsed_suffix(
+                                    runner_state.current_task_started_at.as_ref(),
+                                    now,
+                                );
                                 runner_state.last_task_id = Some(task.id.clone());
                                 runner_state.last_task_state = Some(RunnerTaskState::Done);
                                 runner_state.last_task_at = Some(now);
@@ -2678,8 +2730,8 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                     &manifest,
                                     "task_done",
                                     format!(
-                                        "task done: {} (done={}){}",
-                                        task.id, task_done_now, pr_suffix
+                                        "task done: {} (done={}){}{}",
+                                        task.id, task_done_now, pr_suffix, elapsed_suffix
                                     ),
                                 )?;
                             } else {
