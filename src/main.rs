@@ -1230,9 +1230,25 @@ fn completion_guard_waiting_fallback_line(first_stdout_line: &str, err: &str) ->
     Some(format!("TASK_WAITING_MERGE PR_URL={pr_url}"))
 }
 
+fn select_next_task_entry(
+    entries: &[TaskChecklistEntry],
+    preferred_recovery_task_id: Option<&str>,
+) -> Option<TaskChecklistEntry> {
+    if let Some(preferred_id) = preferred_recovery_task_id
+        && !preferred_id.trim().is_empty()
+        && let Some(recovery_entry) = entries
+            .iter()
+            .find(|entry| !entry.done && entry.id == preferred_id)
+    {
+        return Some(recovery_entry.clone());
+    }
+
+    entries.iter().find(|entry| !entry.done).cloned()
+}
+
 fn run_task_once(opts: TaskRunOptions<'_>) -> Result<TaskRunOutcome> {
     let (_, _, entries) = load_task_checklist(opts.task_file)?;
-    let next = entries.iter().find(|entry| !entry.done).cloned();
+    let next = select_next_task_entry(&entries, None);
 
     let mut outcome = TaskRunOutcome {
         task: next.clone(),
@@ -2360,7 +2376,10 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
 
                 if runner_state.current_task_id.is_none() {
                     let (_, _, entries) = load_task_checklist(&task_file_abs)?;
-                    let next = entries.iter().find(|entry| !entry.done).cloned();
+                    let next = select_next_task_entry(
+                        &entries,
+                        runner_state.auto_recover_last_task_id.as_deref(),
+                    );
 
                     if runner_state.task_loops_started >= manifest.max_task_loops {
                         runner_state.paused = true;
@@ -2416,6 +2435,11 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                         break;
                     } else {
                         let queued_task = next.clone().expect("checked next.is_some");
+                        if runner_state.auto_recover_last_task_id.as_deref()
+                            == Some(queued_task.id.as_str())
+                        {
+                            runner_state.auto_recover_last_task_id = None;
+                        }
                         runner_state.current_task_id = Some(queued_task.id.clone());
                         runner_state.current_task_text = Some(queued_task.text.clone());
                         runner_state.current_task_line = Some(queued_task.line_no);
@@ -3886,16 +3910,16 @@ fn main() -> Result<()> {
 mod tests {
     use super::{
         DeadLetterEntry, DeliveryAck, DeliveryAttempt, DispatchedNotification, LoopStatus,
-        Manifest, Notification, NotificationDeliveryMode, RunnerState, ack_retry_policy,
-        append_jsonl, apply_status_establish_retry_override, auto_recover_guard_reason,
-        blocked_recovery_hint, classify_ack_failure_category,
+        Manifest, Notification, NotificationDeliveryMode, RunnerState, TaskChecklistEntry,
+        ack_retry_policy, append_jsonl, apply_status_establish_retry_override,
+        auto_recover_guard_reason, blocked_recovery_hint, classify_ack_failure_category,
         completion_guard_waiting_fallback_line, compute_auto_stop_reason, compute_backoff_sec,
         dead_letter_path, delivery_ack_path, delivery_attempts_path, delivery_retry_backoff_sec,
         emit_all_tasks_completed_notifications, extract_pr_url, flush_notifications,
         format_orphan_blocked_notification, format_task_blocked_notification, lease_window_sec,
         normalize_blocked_reason_for_recovery, normalize_error_reason, notification_delivery_mode,
         openclaw_notify_timeout_sec_from, parse_openclaw_message_id, parse_task_checklist_entry,
-        queue_main_feedback_summary, queue_notification, read_jsonl,
+        queue_main_feedback_summary, queue_notification, read_jsonl, select_next_task_entry,
         should_force_status_establish_retry, should_suppress_waiting_stuck,
         update_waiting_stuck_tracker, validate_task_done_contract_with,
     };
@@ -4487,6 +4511,48 @@ mod tests {
                 .expect("guard reason")
                 .contains("max attempts reached")
         );
+    }
+
+    #[test]
+    fn select_next_task_entry_prioritizes_recovery_task_when_present() {
+        let entries = vec![
+            TaskChecklistEntry {
+                line_no: 3,
+                done: false,
+                id: "H2".to_string(),
+                text: "normal task".to_string(),
+            },
+            TaskChecklistEntry {
+                line_no: 7,
+                done: false,
+                id: "H1-RECOVER".to_string(),
+                text: "recovery task".to_string(),
+            },
+        ];
+
+        let next = select_next_task_entry(&entries, Some("H1-RECOVER")).expect("next task");
+        assert_eq!(next.id, "H1-RECOVER");
+    }
+
+    #[test]
+    fn select_next_task_entry_falls_back_to_first_open_when_recovery_missing() {
+        let entries = vec![
+            TaskChecklistEntry {
+                line_no: 3,
+                done: false,
+                id: "H2".to_string(),
+                text: "normal task".to_string(),
+            },
+            TaskChecklistEntry {
+                line_no: 7,
+                done: true,
+                id: "H1-RECOVER".to_string(),
+                text: "recovery task".to_string(),
+            },
+        ];
+
+        let next = select_next_task_entry(&entries, Some("H1-RECOVER")).expect("next task");
+        assert_eq!(next.id, "H2");
     }
 
     #[test]
