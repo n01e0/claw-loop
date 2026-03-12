@@ -44,6 +44,15 @@ parse_pr_url() {
   printf '%s\n' "$line" | sed -n 's/.*PR_URL=\([^ ]\+\).*/\1/p' | head -n1
 }
 
+clip_one_line() {
+  local input="$1"
+  printf '%s' "$input" \
+    | tr '\n' ' ' \
+    | tr '\r' ' ' \
+    | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' \
+    | cut -c1-240
+}
+
 infer_gh_repo() {
   local remote_url
   remote_url="$(git -C "$repo_path" config --get remote.origin.url 2>/dev/null || true)"
@@ -85,7 +94,9 @@ is_pr_merged() {
   [[ "$out" == MERGED* ]]
 }
 
-enable_pr_auto_merge() {
+AUTO_MERGE_LAST_ERROR=""
+
+is_auto_merge_armed_or_merged() {
   local pr_url="$1"
   if [[ -z "$pr_url" ]]; then
     return 1
@@ -95,10 +106,50 @@ enable_pr_auto_merge() {
   if [[ -z "$gh_repo" ]]; then
     return 1
   fi
+  local armed
+  armed="$(gh pr view "$pr_url" --repo "$gh_repo" --json state,autoMergeRequest --jq 'if ((.state // "") == "MERGED") then "1" elif .autoMergeRequest != null then "1" else "0" end' 2>/dev/null || echo "0")"
+  [[ "$armed" == "1" ]]
+}
+
+enable_pr_auto_merge() {
+  local pr_url="$1"
+  AUTO_MERGE_LAST_ERROR=""
+
+  if [[ -z "$pr_url" ]]; then
+    AUTO_MERGE_LAST_ERROR="missing PR_URL"
+    return 1
+  fi
+
+  local gh_repo
+  gh_repo="$(resolve_gh_repo || true)"
+  if [[ -z "$gh_repo" ]]; then
+    AUTO_MERGE_LAST_ERROR="failed to resolve GitHub repo from remote.origin.url"
+    return 1
+  fi
+
   if is_pr_merged "$pr_url"; then
     return 0
   fi
-  gh pr merge "$pr_url" --repo "$gh_repo" --auto --squash >/dev/null 2>&1 || return 1
+
+  local merge_out merge_rc
+  set +e
+  merge_out="$(gh pr merge "$pr_url" --repo "$gh_repo" --auto --squash 2>&1)"
+  merge_rc=$?
+  set -e
+  if [[ "$merge_rc" -ne 0 ]]; then
+    AUTO_MERGE_LAST_ERROR="$(clip_one_line "$merge_out")"
+    return 1
+  fi
+
+  if is_pr_merged "$pr_url"; then
+    return 0
+  fi
+
+  if ! is_auto_merge_armed_or_merged "$pr_url"; then
+    AUTO_MERGE_LAST_ERROR="auto-merge is not armed after request (check repository settings/permissions)"
+    return 1
+  fi
+
   return 0
 }
 
@@ -207,7 +258,11 @@ if [[ -f "$state_file" ]]; then
   # shellcheck disable=SC1090
   source "$state_file"
   if [[ -n "${PR_URL:-}" ]]; then
-    enable_pr_auto_merge "$PR_URL" || true
+    if ! enable_pr_auto_merge "$PR_URL"; then
+      err="${AUTO_MERGE_LAST_ERROR:-unknown auto-merge error}"
+      echo "TASK_BLOCKED: auto-merge enable failed for PR_URL=${PR_URL} error=${err}" >&2
+      exit 2
+    fi
     if is_pr_merged "$PR_URL"; then
       echo "TASK_DONE PR_URL=${PR_URL}"
       exit 0
@@ -283,7 +338,11 @@ if [[ "$first_line" == TASK_DONE* ]]; then
     echo "TASK_BLOCKED: TASK_DONE without PR_URL" >&2
     exit 2
   fi
-  enable_pr_auto_merge "$pr_url" || true
+  if ! enable_pr_auto_merge "$pr_url"; then
+    err="${AUTO_MERGE_LAST_ERROR:-unknown auto-merge error}"
+    echo "TASK_BLOCKED: auto-merge enable failed for PR_URL=${pr_url} error=${err}" >&2
+    exit 2
+  fi
   if is_pr_merged "$pr_url"; then
     exit 0
   fi
@@ -312,7 +371,11 @@ if [[ "$first_line" == TASK_WAITING_MERGE* ]]; then
     {
       echo "PR_URL='${pr_url}'"
     } >"$state_file"
-    enable_pr_auto_merge "$pr_url" || true
+    if ! enable_pr_auto_merge "$pr_url"; then
+      err="${AUTO_MERGE_LAST_ERROR:-unknown auto-merge error}"
+      echo "TASK_BLOCKED: auto-merge enable failed for PR_URL=${pr_url} error=${err}" >&2
+      exit 2
+    fi
     failed_checks="$(pr_failed_checks_csv "$pr_url")"
     if [[ -n "$failed_checks" ]]; then
       echo "TASK_BLOCKED: CI failed for PR_URL=${pr_url} checks=${failed_checks}" >&2
