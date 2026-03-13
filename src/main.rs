@@ -420,6 +420,16 @@ struct PrTracking {
     auto_merge_armed: bool,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+struct GhStatusCheck {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    conclusion: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct GhPrView {
     state: String,
@@ -428,6 +438,8 @@ struct GhPrView {
     merge_state_status: Option<String>,
     #[serde(rename = "autoMergeRequest")]
     auto_merge_request: Option<serde_json::Value>,
+    #[serde(rename = "statusCheckRollup", default)]
+    status_check_rollup: Vec<GhStatusCheck>,
 }
 
 struct StartOptions {
@@ -1270,16 +1282,138 @@ fn parse_github_pr_url(pr_url: &str) -> Result<(String, u64)> {
     Ok((gh_repo, pr))
 }
 
-fn ensure_waiting_merge_auto_merge(pr_url: &str) -> Result<()> {
+#[derive(Debug, PartialEq, Eq)]
+enum WaitingMergeProgress {
+    Waiting,
+    Merged,
+    Blocked(String),
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PrStatusSummary {
+    failed: Vec<String>,
+    pending: Vec<String>,
+    successful: usize,
+}
+
+fn summarize_pr_status_checks(view: &GhPrView) -> PrStatusSummary {
+    let mut summary = PrStatusSummary::default();
+    for check in &view.status_check_rollup {
+        let status = check.status.as_deref().unwrap_or_default();
+        let conclusion = check.conclusion.as_deref().unwrap_or_default();
+        let name = check.name.as_deref().unwrap_or("unknown");
+
+        if status.eq_ignore_ascii_case("COMPLETED") {
+            if matches!(
+                conclusion,
+                "FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE"
+            ) {
+                summary.failed.push(format!("{name}:{conclusion}"));
+            }
+            if matches!(conclusion, "SUCCESS" | "NEUTRAL" | "SKIPPED") {
+                summary.successful += 1;
+            }
+        } else if !status.is_empty() || !conclusion.is_empty() {
+            summary.pending.push(name.to_string());
+        }
+    }
+    summary
+}
+
+fn auto_merge_unavailable_error(err: &str) -> bool {
+    let lowered = err.to_ascii_lowercase();
+    [
+        "auto merge is not allowed",
+        "auto-merge is not allowed",
+        "pull request auto merge is not allowed for this repository",
+        "auto merge is disabled",
+        "auto-merge is disabled",
+        "repository does not allow auto-merge",
+        "repository has disabled auto-merge",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn ensure_waiting_merge_progress(pr_url: &str) -> Result<WaitingMergeProgress> {
+    ensure_waiting_merge_progress_with(
+        pr_url,
+        gh_pr_view,
+        gh_pr_arm_auto_merge,
+        gh_pr_merge_now,
+        pr_url_is_merged,
+    )
+}
+
+fn ensure_waiting_merge_progress_with<FView, FArm, FMerge, FMerged>(
+    pr_url: &str,
+    mut view_fn: FView,
+    mut arm_auto_merge_fn: FArm,
+    mut merge_now_fn: FMerge,
+    mut is_merged_fn: FMerged,
+) -> Result<WaitingMergeProgress>
+where
+    FView: FnMut(&str, u64) -> Result<GhPrView>,
+    FArm: FnMut(&str, u64, &str) -> Result<()>,
+    FMerge: FnMut(&str, u64, &str) -> Result<()>,
+    FMerged: FnMut(&str) -> Result<bool>,
+{
     let (gh_repo, pr) = parse_github_pr_url(pr_url)?;
-    let view = gh_pr_view(&gh_repo, pr)?;
+    let mut view = view_fn(&gh_repo, pr)?;
     if view.state.eq_ignore_ascii_case("MERGED") {
-        return Ok(());
+        return Ok(WaitingMergeProgress::Merged);
     }
+
+    let mut manual_fallback = false;
     if view.state.eq_ignore_ascii_case("OPEN") && view.auto_merge_request.is_none() {
-        gh_pr_arm_auto_merge(&gh_repo, pr, "squash")?;
+        match arm_auto_merge_fn(&gh_repo, pr, "squash") {
+            Ok(()) => {
+                view = view_fn(&gh_repo, pr)?;
+                if view.state.eq_ignore_ascii_case("MERGED") {
+                    return Ok(WaitingMergeProgress::Merged);
+                }
+                manual_fallback = view.auto_merge_request.is_none();
+            }
+            Err(err) => {
+                if auto_merge_unavailable_error(&err.to_string()) {
+                    manual_fallback = true;
+                } else {
+                    return Err(err);
+                }
+            }
+        }
     }
-    Ok(())
+
+    if !manual_fallback {
+        return Ok(WaitingMergeProgress::Waiting);
+    }
+
+    let summary = summarize_pr_status_checks(&view);
+    if !summary.failed.is_empty() {
+        return Ok(WaitingMergeProgress::Blocked(format!(
+            "CI failed for PR_URL={} checks={}",
+            pr_url,
+            summary.failed.join(", ")
+        )));
+    }
+    if !summary.pending.is_empty() || summary.successful == 0 {
+        return Ok(WaitingMergeProgress::Waiting);
+    }
+
+    match merge_now_fn(&gh_repo, pr, "squash") {
+        Ok(()) => {
+            if is_merged_fn(pr_url)? {
+                Ok(WaitingMergeProgress::Merged)
+            } else {
+                Ok(WaitingMergeProgress::Waiting)
+            }
+        }
+        Err(err) => Ok(WaitingMergeProgress::Blocked(format!(
+            "manual merge failed for PR_URL={} error={}",
+            pr_url,
+            clip_text(&err.to_string(), 200)
+        ))),
+    }
 }
 
 fn pr_url_is_merged(pr_url: &str) -> Result<bool> {
@@ -1374,8 +1508,7 @@ fn task_contract_line(stdout: &str) -> Option<String> {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .filter(|line| line.starts_with("TASK_"))
-        .next_back()
+        .rfind(|line| line.starts_with("TASK_"))
         .map(ToString::to_string)
 }
 
@@ -1396,8 +1529,7 @@ fn blocked_reason_from_runner(stderr: &str, stdout: &str) -> String {
     let stdout_last = stdout
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .next_back()
+        .rfind(|line| !line.is_empty())
         .map(|line| clip_text(line, 200));
     if let Some(stdout_last) = stdout_last {
         return stdout_last;
@@ -1894,7 +2026,7 @@ fn gh_pr_view(gh_repo: &str, pr: u64) -> Result<GhPrView> {
         "--repo".into(),
         gh_repo.into(),
         "--json".into(),
-        "state,url,mergeStateStatus,autoMergeRequest".into(),
+        "state,url,mergeStateStatus,autoMergeRequest,statusCheckRollup".into(),
     ];
     let output = run_with_timeout_cmd(&gh, &args, 5)?;
 
@@ -1911,13 +2043,17 @@ fn gh_pr_view(gh_repo: &str, pr: u64) -> Result<GhPrView> {
     Ok(view)
 }
 
-fn gh_pr_arm_auto_merge(gh_repo: &str, pr: u64, merge_method: &str) -> Result<()> {
-    let method_flag = match merge_method {
-        "merge" => "--merge",
-        "squash" => "--squash",
-        "rebase" => "--rebase",
+fn gh_merge_method_flag(merge_method: &str) -> Result<&'static str> {
+    match merge_method {
+        "merge" => Ok("--merge"),
+        "squash" => Ok("--squash"),
+        "rebase" => Ok("--rebase"),
         other => bail!("invalid merge method: {other}"),
-    };
+    }
+}
+
+fn gh_pr_arm_auto_merge(gh_repo: &str, pr: u64, merge_method: &str) -> Result<()> {
+    let method_flag = gh_merge_method_flag(merge_method)?;
 
     let gh = gh_bin();
     let args: Vec<String> = vec![
@@ -1935,6 +2071,32 @@ fn gh_pr_arm_auto_merge(gh_repo: &str, pr: u64, merge_method: &str) -> Result<()
     if !output.status.success() {
         bail!(
             "gh pr merge --auto failed: status={:?} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
+}
+
+fn gh_pr_merge_now(gh_repo: &str, pr: u64, merge_method: &str) -> Result<()> {
+    let method_flag = gh_merge_method_flag(merge_method)?;
+
+    let gh = gh_bin();
+    let args: Vec<String> = vec![
+        "pr".into(),
+        "merge".into(),
+        pr.to_string(),
+        "--repo".into(),
+        gh_repo.into(),
+        method_flag.into(),
+        "--delete-branch".into(),
+    ];
+    let output = run_with_timeout_cmd(&gh, &args, 5)?;
+
+    if !output.status.success() {
+        bail!(
+            "gh pr merge failed: status={:?} stderr={}",
             output.status.code(),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -2440,113 +2602,130 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             match runner_state.current_task_state {
                                 Some(RunnerTaskState::WaitingMerge) => {
                                     if let Some(pr_url) = runner_state.current_task_pr_url.clone() {
-                                        match ensure_waiting_merge_auto_merge(&pr_url) {
-                                            Ok(()) => match pr_url_is_merged(&pr_url) {
-                                                Ok(true) => {
-                                                    let check_result = update_task_check(
-                                                        &task_file_abs,
-                                                        &entry.id,
-                                                        true,
-                                                    )?;
-                                                    task_done_now =
-                                                        task_checklist_done_count(&task_file_abs)?;
-                                                    task_loops_completed = task_done_now
-                                                        .saturating_sub(
-                                                            manifest.task_done_baseline,
-                                                        );
+                                        match ensure_waiting_merge_progress(&pr_url) {
+                                            Ok(WaitingMergeProgress::Merged) => {
+                                                let check_result = update_task_check(
+                                                    &task_file_abs,
+                                                    &entry.id,
+                                                    true,
+                                                )?;
+                                                task_done_now =
+                                                    task_checklist_done_count(&task_file_abs)?;
+                                                task_loops_completed = task_done_now
+                                                    .saturating_sub(manifest.task_done_baseline);
 
-                                                    let elapsed_suffix = task_elapsed_suffix(
-                                                        runner_state
-                                                            .current_task_started_at
-                                                            .as_ref(),
-                                                        now,
-                                                    );
-                                                    runner_state.last_task_id =
-                                                        Some(entry.id.clone());
-                                                    runner_state.last_task_state =
-                                                        Some(RunnerTaskState::Done);
-                                                    runner_state.last_task_at = Some(now);
-                                                    runner_state.last_task_reason = Some(
-                                                        "PR merged while waiting_merge".into(),
-                                                    );
-                                                    runner_state.last_task_pr_url =
-                                                        Some(pr_url.clone());
-                                                    runner_state.current_task_id = None;
-                                                    runner_state.current_task_text = None;
-                                                    runner_state.current_task_line = None;
-                                                    runner_state.current_task_started_at = None;
-                                                    runner_state.current_task_state = None;
-                                                    runner_state.current_task_blocked_reason = None;
-                                                    runner_state.current_task_pr_url = None;
+                                                let elapsed_suffix = task_elapsed_suffix(
+                                                    runner_state.current_task_started_at.as_ref(),
+                                                    now,
+                                                );
+                                                runner_state.last_task_id = Some(entry.id.clone());
+                                                runner_state.last_task_state =
+                                                    Some(RunnerTaskState::Done);
+                                                runner_state.last_task_at = Some(now);
+                                                runner_state.last_task_reason =
+                                                    Some("PR merged while waiting_merge".into());
+                                                runner_state.last_task_pr_url =
+                                                    Some(pr_url.clone());
+                                                runner_state.current_task_id = None;
+                                                runner_state.current_task_text = None;
+                                                runner_state.current_task_line = None;
+                                                runner_state.current_task_started_at = None;
+                                                runner_state.current_task_state = None;
+                                                runner_state.current_task_blocked_reason = None;
+                                                runner_state.current_task_pr_url = None;
 
-                                                    append_event(
-                                                        &dir,
-                                                        "task_waiting_merge_resolved",
-                                                        serde_json::json!({
-                                                            "task_id": entry.id,
-                                                            "pr_url": pr_url,
-                                                            "check_result": check_result,
-                                                            "done": task_done_now,
-                                                        }),
-                                                    )?;
+                                                append_event(
+                                                    &dir,
+                                                    "task_waiting_merge_resolved",
+                                                    serde_json::json!({
+                                                        "task_id": entry.id,
+                                                        "pr_url": pr_url,
+                                                        "check_result": check_result,
+                                                        "done": task_done_now,
+                                                    }),
+                                                )?;
 
-                                                    queue_notification(
-                                                        &dir,
+                                                queue_notification(
+                                                    &dir,
+                                                    &manifest,
+                                                    "task_done",
+                                                    format!(
+                                                        "task {} merged while waiting; done={} PR_URL={}{}",
+                                                        entry.id,
+                                                        task_done_now,
+                                                        pr_url,
+                                                        elapsed_suffix
+                                                    ),
+                                                )?;
+
+                                                state.status = LoopStatus::Running;
+                                                state.summary =
+                                                    format!("task merged: {}", entry.id);
+                                                state.waiting_reason = format!(
+                                                    "merge confirmed for task {}",
+                                                    entry.id
+                                                );
+                                            }
+                                            Ok(WaitingMergeProgress::Waiting) => {
+                                                state.summary =
+                                                    format!("task waiting_merge: {}", entry.id);
+                                                state.waiting_reason =
+                                                    format!("TASK_WAITING_MERGE PR_URL={pr_url}");
+                                            }
+                                            Ok(WaitingMergeProgress::Blocked(reason)) => {
+                                                let reason = clip_text(&reason, 200);
+                                                runner_state.current_task_state =
+                                                    Some(RunnerTaskState::Blocked);
+                                                runner_state.current_task_blocked_reason =
+                                                    Some(reason.clone());
+                                                runner_state.last_task_id = Some(entry.id.clone());
+                                                runner_state.last_task_state =
+                                                    Some(RunnerTaskState::Blocked);
+                                                runner_state.last_task_at = Some(now);
+                                                runner_state.last_task_reason = runner_state
+                                                    .current_task_blocked_reason
+                                                    .clone();
+                                                runner_state.last_task_pr_url =
+                                                    Some(pr_url.clone());
+
+                                                state.status = LoopStatus::Blocked;
+                                                state.summary =
+                                                    format!("task blocked: {}", entry.id);
+                                                state.waiting_reason = reason.clone();
+
+                                                append_event(
+                                                    &dir,
+                                                    "task_waiting_merge_blocked",
+                                                    serde_json::json!({
+                                                        "task_id": entry.id,
+                                                        "pr_url": pr_url,
+                                                        "reason": reason,
+                                                    }),
+                                                )?;
+
+                                                let blocked_message =
+                                                    format_task_blocked_notification(
                                                         &manifest,
-                                                        "task_done",
-                                                        format!(
-                                                            "task {} merged while waiting; done={} PR_URL={}{}",
-                                                            entry.id,
-                                                            task_done_now,
-                                                            pr_url,
-                                                            elapsed_suffix
-                                                        ),
-                                                    )?;
-
-                                                    state.status = LoopStatus::Running;
-                                                    state.summary =
-                                                        format!("task merged: {}", entry.id);
-                                                    state.waiting_reason = format!(
-                                                        "merge confirmed for task {}",
-                                                        entry.id
+                                                        &entry.id,
+                                                        &state.waiting_reason,
+                                                        Some(&pr_url),
                                                     );
-                                                }
-                                                Ok(false) => {
-                                                    state.summary =
-                                                        format!("task waiting_merge: {}", entry.id);
-                                                    state.waiting_reason = format!(
-                                                        "TASK_WAITING_MERGE PR_URL={pr_url}"
-                                                    );
-                                                }
-                                                Err(err) => {
-                                                    let err_text = clip_text(&err.to_string(), 160);
-                                                    append_event(
-                                                        &dir,
-                                                        "task_waiting_merge_recheck_failed",
-                                                        serde_json::json!({
-                                                            "task_id": entry.id,
-                                                            "pr_url": pr_url,
-                                                            "error": err_text,
-                                                        }),
-                                                    )?;
-                                                    state.summary =
-                                                        format!("task waiting_merge: {}", entry.id);
-                                                    state.waiting_reason = format!(
-                                                        "TASK_WAITING_MERGE PR_URL={} (recheck_error={})",
-                                                        pr_url, err_text
-                                                    );
-                                                }
-                                            },
+                                                queue_notification(
+                                                    &dir,
+                                                    &manifest,
+                                                    "task_blocked",
+                                                    blocked_message,
+                                                )?;
+                                            }
                                             Err(err) => {
                                                 let err_text = clip_text(&err.to_string(), 200);
                                                 runner_state.current_task_state =
                                                     Some(RunnerTaskState::Blocked);
-                                                runner_state.current_task_blocked_reason = Some(
-                                                    format!(
-                                                        "waiting_merge auto-merge enable failed: {}",
+                                                runner_state.current_task_blocked_reason =
+                                                    Some(format!(
+                                                        "waiting_merge transition failed: {}",
                                                         err_text
-                                                    ),
-                                                );
+                                                    ));
                                                 runner_state.last_task_id = Some(entry.id.clone());
                                                 runner_state.last_task_state =
                                                     Some(RunnerTaskState::Blocked);
@@ -2567,7 +2746,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
 
                                                 append_event(
                                                     &dir,
-                                                    "task_waiting_merge_auto_merge_failed",
+                                                    "task_waiting_merge_transition_failed",
                                                     serde_json::json!({
                                                         "task_id": entry.id,
                                                         "pr_url": pr_url,
@@ -4199,18 +4378,19 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeadLetterEntry, DeliveryAck, DeliveryAttempt, DispatchedNotification, LoopStatus,
-        Manifest, Notification, NotificationDeliveryMode, RunnerState, TaskChecklistEntry,
-        ack_retry_policy, append_jsonl, apply_status_establish_retry_override,
+        DeadLetterEntry, DeliveryAck, DeliveryAttempt, DispatchedNotification, GhPrView,
+        GhStatusCheck, LoopStatus, Manifest, Notification, NotificationDeliveryMode, RunnerState,
+        TaskChecklistEntry, WaitingMergeProgress, ack_retry_policy, append_jsonl,
+        apply_status_establish_retry_override, auto_merge_unavailable_error,
         auto_recover_guard_reason, blocked_reason_from_runner, blocked_recovery_hint,
         classify_ack_failure_category, completion_guard_waiting_fallback_line,
         compute_auto_stop_reason, compute_backoff_sec, dead_letter_path, delivery_ack_path,
         delivery_attempts_path, delivery_retry_backoff_sec, emit_all_tasks_completed_notifications,
-        extract_pr_url, flush_notifications, format_orphan_blocked_notification,
-        format_task_blocked_notification, lease_window_sec, normalize_blocked_reason_for_recovery,
-        normalize_error_reason, notification_delivery_mode, openclaw_notify_timeout_sec_from,
-        parse_openclaw_message_id, parse_task_checklist_entry, queue_main_feedback_summary,
-        queue_notification, read_jsonl, select_next_task_entry,
+        ensure_waiting_merge_progress_with, extract_pr_url, flush_notifications,
+        format_orphan_blocked_notification, format_task_blocked_notification, lease_window_sec,
+        normalize_blocked_reason_for_recovery, normalize_error_reason, notification_delivery_mode,
+        openclaw_notify_timeout_sec_from, parse_openclaw_message_id, parse_task_checklist_entry,
+        queue_main_feedback_summary, queue_notification, read_jsonl, select_next_task_entry,
         should_force_status_establish_retry, should_suppress_waiting_stuck, task_contract_line,
         update_waiting_stuck_tracker, validate_task_done_contract_with,
     };
@@ -5198,5 +5378,85 @@ mod tests {
             ..RunnerState::default()
         };
         assert!(!should_suppress_waiting_stuck(&runner));
+    }
+
+    #[test]
+    fn auto_merge_unavailable_error_matches_repo_setting_failures() {
+        assert!(auto_merge_unavailable_error(
+            "GraphQL: Pull request Auto merge is not allowed for this repository"
+        ));
+        assert!(auto_merge_unavailable_error(
+            "repository has disabled auto-merge for this branch"
+        ));
+        assert!(!auto_merge_unavailable_error("permission denied"));
+    }
+
+    #[test]
+    fn ensure_waiting_merge_progress_falls_back_to_manual_merge_after_green_ci() {
+        let merged = std::cell::Cell::new(false);
+        let result = ensure_waiting_merge_progress_with(
+            "https://github.com/demo/repo/pull/123",
+            |_, _| {
+                Ok(GhPrView {
+                    state: if merged.get() { "MERGED" } else { "OPEN" }.into(),
+                    url: "https://github.com/demo/repo/pull/123".into(),
+                    merge_state_status: Some("CLEAN".into()),
+                    auto_merge_request: None,
+                    status_check_rollup: vec![GhStatusCheck {
+                        name: Some("ci".into()),
+                        status: Some("COMPLETED".into()),
+                        conclusion: Some("SUCCESS".into()),
+                    }],
+                })
+            },
+            |_, _, _| {
+                Err(anyhow::anyhow!(
+                    "gh pr merge --auto failed: GraphQL: Pull request Auto merge is not allowed for this repository"
+                ))
+            },
+            |_, _, _| {
+                merged.set(true);
+                Ok(())
+            },
+            |_| Ok(merged.get()),
+        )
+        .expect("waiting merge progress");
+
+        assert_eq!(result, WaitingMergeProgress::Merged);
+    }
+
+    #[test]
+    fn ensure_waiting_merge_progress_waits_for_ci_before_manual_merge() {
+        let merge_attempted = std::cell::Cell::new(false);
+        let result = ensure_waiting_merge_progress_with(
+            "https://github.com/demo/repo/pull/456",
+            |_, _| {
+                Ok(GhPrView {
+                    state: "OPEN".into(),
+                    url: "https://github.com/demo/repo/pull/456".into(),
+                    merge_state_status: Some("BLOCKED".into()),
+                    auto_merge_request: None,
+                    status_check_rollup: vec![GhStatusCheck {
+                        name: Some("ci".into()),
+                        status: Some("IN_PROGRESS".into()),
+                        conclusion: None,
+                    }],
+                })
+            },
+            |_, _, _| {
+                Err(anyhow::anyhow!(
+                    "gh pr merge --auto failed: GraphQL: Pull request Auto merge is not allowed for this repository"
+                ))
+            },
+            |_, _, _| {
+                merge_attempted.set(true);
+                Ok(())
+            },
+            |_| Ok(false),
+        )
+        .expect("waiting merge progress");
+
+        assert_eq!(result, WaitingMergeProgress::Waiting);
+        assert!(!merge_attempted.get());
     }
 }

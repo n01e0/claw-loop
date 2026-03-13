@@ -16,7 +16,7 @@ Collect all of these before start:
 - safety guard (`--max-task-loops` / `--max-ticks`), with `max_task_loops` defaulting to `10`
 - `--max-runtime-sec` only when needed (omit for long pause-oriented operation)
 - dogfood runner command (`--task-runner-cmd`), monitor-only when omitted
-- recommended runner: `scripts/rl-task-agent.sh` (PR creation → auto-merge enforced → merge confirmation; auto-merge/CI failures are fail-closed as blocked for auto-recovery; missing required checks policy is surfaced as waiting warning)
+- recommended runner: `scripts/rl-task-agent.sh` (PR creation → auto-merge preferred → merge confirmation; if repo auto-merge is unavailable, daemon keeps watching CI and squash-merges after green; auto-merge/CI failures are fail-closed as blocked for auto-recovery; missing required checks policy is surfaced as waiting warning)
 - `--task-agent-id <agent_id>` (dedicated loop agent; split per loop for parallel operation)
 - approved tasklist gate:
   - `claw-loopd task-approve --file <task_file> --approved-by <name>`
