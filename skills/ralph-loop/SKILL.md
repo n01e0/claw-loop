@@ -18,6 +18,10 @@ Collect all of these before start:
 - dogfood runner command (`--task-runner-cmd`), monitor-only when omitted
 - recommended runner: `scripts/rl-task-agent.sh` (PR creation → auto-merge enforced → merge confirmation; auto-merge/CI failures are fail-closed as blocked for auto-recovery; missing required checks policy is surfaced as waiting warning)
 - `--task-agent-id <agent_id>` (dedicated loop agent; split per loop for parallel operation)
+- approved tasklist gate:
+  - `claw-loopd task-approve --file <task_file> --approved-by <name>`
+  - `--approved-tasklist-hash <hash>` is required on `start`
+  - start fails if approval markers/hash are missing or mismatched
 - `--auto-check-on-success` defaults to `true` (auto-check on runner success)
 - `--auto-recover-blocked` (enable blocked→recovery-task auto-resume)
 - `--auto-recover-blocked-max-attempts <n>` (default `3`)
@@ -40,12 +44,16 @@ Never start without `thread_id` + `session_key`.
    - use project-specific agent id (e.g., `loop-worker-<project>`)
 4. Resolve aggregation target:
    - use main control thread id as `<feedback_thread_id>`
-5. Start daemon:
-   - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --requester-user-id <discord_user_id> --task-agent-id <agent_id> --feedback-thread-id <feedback_thread_id> --feedback-channel discord --tick-sec 60 --deliver-openclaw --max-task-loops 10 --task-runner-cmd './scripts/rl-task-agent.sh' --auto-recover-blocked --auto-recover-blocked-max-attempts 3`
+5. Stamp and hash the approved tasklist:
+   - `claw-loopd task-approve --file <task_file> --approved-by <name>`
+   - capture `approved_tasklist_hash` from JSON output
+6. Start daemon:
+   - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --requester-user-id <discord_user_id> --task-agent-id <agent_id> --feedback-thread-id <feedback_thread_id> --feedback-channel discord --tick-sec 60 --deliver-openclaw --max-task-loops 10 --task-runner-cmd './scripts/rl-task-agent.sh' --approved-tasklist-hash <hash> --auto-recover-blocked --auto-recover-blocked-max-attempts 3`
    - default: auto-check and continue on runner success (`--auto-check-on-success=true`)
    - with `--auto-check-on-success=false`, run in completion-gated mode (do not start the next task until the active task is checked complete)
-6. Post `run_id` in-thread immediately.
-7. Record first planned loop item.
+   - daemon blocks the run if the approved plan markers/hash drift after start
+7. Post `run_id` in-thread immediately.
+8. Record first planned loop item.
 
 ## Command set (operator minimum)
 - Status:
