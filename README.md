@@ -113,8 +113,9 @@ A task is considered complete only when runner output contract is satisfied:
 
 The default runner (`scripts/rl-task-agent.sh`) does all of the following:
 
-- requests/arms auto-merge for task PRs
+- requests/arms auto-merge for task PRs when the repository supports it
 - re-applies `gh pr merge --auto --squash` while waiting (to avoid “enabled once but not armed” drift)
+- if the repository does not allow auto-merge, keeps watching CI and performs a normal squash merge itself once checks are green
 - checks PR CI rollup; if checks fail, returns `TASK_BLOCKED` with failed-check details
 
 This allows daemon auto-recovery flow to turn CI failures into explicit recovery work instead of silently waiting forever.

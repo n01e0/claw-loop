@@ -95,6 +95,14 @@ is_pr_merged() {
 }
 
 AUTO_MERGE_LAST_ERROR=""
+AUTO_MERGE_MODE="auto"
+MANUAL_MERGE_LAST_ERROR=""
+
+is_auto_merge_unavailable_error() {
+  local lowered
+  lowered="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  [[ "$lowered" == *"auto merge is not allowed"*     || "$lowered" == *"auto-merge is not allowed"*     || "$lowered" == *"pull request auto merge is not allowed for this repository"*     || "$lowered" == *"auto merge is disabled"*     || "$lowered" == *"auto-merge is disabled"*     || "$lowered" == *"repository does not allow auto-merge"*     || "$lowered" == *"repository has disabled auto-merge"* ]]
+}
 
 is_auto_merge_armed_or_merged() {
   local pr_url="$1"
@@ -114,6 +122,7 @@ is_auto_merge_armed_or_merged() {
 enable_pr_auto_merge() {
   local pr_url="$1"
   AUTO_MERGE_LAST_ERROR=""
+  AUTO_MERGE_MODE="auto"
 
   if [[ -z "$pr_url" ]]; then
     AUTO_MERGE_LAST_ERROR="missing PR_URL"
@@ -133,11 +142,16 @@ enable_pr_auto_merge() {
 
   local merge_out merge_rc
   set +e
-  merge_out="$(gh pr merge "$pr_url" --repo "$gh_repo" --auto --squash 2>&1)"
+  merge_out="$(gh pr merge "$pr_url" --repo "$gh_repo" --auto --squash --delete-branch 2>&1)"
   merge_rc=$?
   set -e
   if [[ "$merge_rc" -ne 0 ]]; then
     AUTO_MERGE_LAST_ERROR="$(clip_one_line "$merge_out")"
+    if is_auto_merge_unavailable_error "$AUTO_MERGE_LAST_ERROR"; then
+      AUTO_MERGE_MODE="manual"
+      AUTO_MERGE_LAST_ERROR=""
+      return 0
+    fi
     return 1
   fi
 
@@ -146,8 +160,8 @@ enable_pr_auto_merge() {
   fi
 
   if ! is_auto_merge_armed_or_merged "$pr_url"; then
-    AUTO_MERGE_LAST_ERROR="auto-merge is not armed after request (check repository settings/permissions)"
-    return 1
+    AUTO_MERGE_MODE="manual"
+    return 0
   fi
 
   return 0
@@ -164,6 +178,114 @@ pr_failed_checks_csv() {
     return 0
   fi
   gh pr view "$pr_url" --repo "$gh_repo" --json statusCheckRollup --jq '[.statusCheckRollup[]? | select((.status // "") == "COMPLETED" and ((.conclusion // "") == "FAILURE" or (.conclusion // "") == "TIMED_OUT" or (.conclusion // "") == "CANCELLED" or (.conclusion // "") == "ACTION_REQUIRED" or (.conclusion // "") == "STARTUP_FAILURE")) | ((.name // "unknown") + ":" + (.conclusion // "UNKNOWN"))] | join(", ")' 2>/dev/null || true
+}
+
+pr_pending_checks_csv() {
+  local pr_url="$1"
+  if [[ -z "$pr_url" ]]; then
+    return 0
+  fi
+  local gh_repo
+  gh_repo="$(resolve_gh_repo || true)"
+  if [[ -z "$gh_repo" ]]; then
+    return 0
+  fi
+  gh pr view "$pr_url" --repo "$gh_repo" --json statusCheckRollup --jq '[.statusCheckRollup[]? | select((.status // "") != "COMPLETED" and (.status // "") != "") | (.name // "unknown")] | join(", ")' 2>/dev/null || true
+}
+
+pr_successful_checks_count() {
+  local pr_url="$1"
+  if [[ -z "$pr_url" ]]; then
+    echo 0
+    return 0
+  fi
+  local gh_repo
+  gh_repo="$(resolve_gh_repo || true)"
+  if [[ -z "$gh_repo" ]]; then
+    echo 0
+    return 0
+  fi
+  gh pr view "$pr_url" --repo "$gh_repo" --json statusCheckRollup --jq '[.statusCheckRollup[]? | select((.status // "") == "COMPLETED" and ((.conclusion // "") == "SUCCESS" or (.conclusion // "") == "NEUTRAL" or (.conclusion // "") == "SKIPPED"))] | length' 2>/dev/null || echo 0
+}
+
+manual_merge_pr() {
+  local pr_url="$1"
+  MANUAL_MERGE_LAST_ERROR=""
+
+  if [[ -z "$pr_url" ]]; then
+    MANUAL_MERGE_LAST_ERROR="missing PR_URL"
+    return 1
+  fi
+
+  local gh_repo
+  gh_repo="$(resolve_gh_repo || true)"
+  if [[ -z "$gh_repo" ]]; then
+    MANUAL_MERGE_LAST_ERROR="failed to resolve GitHub repo from remote.origin.url"
+    return 1
+  fi
+
+  local merge_out merge_rc
+  set +e
+  merge_out="$(gh pr merge "$pr_url" --repo "$gh_repo" --squash --delete-branch 2>&1)"
+  merge_rc=$?
+  set -e
+  if [[ "$merge_rc" -ne 0 ]]; then
+    MANUAL_MERGE_LAST_ERROR="$(clip_one_line "$merge_out")"
+    return 1
+  fi
+
+  return 0
+}
+
+handle_waiting_pr() {
+  local pr_url="$1"
+
+  if ! enable_pr_auto_merge "$pr_url"; then
+    local err
+    err="${AUTO_MERGE_LAST_ERROR:-unknown auto-merge error}"
+    echo "TASK_BLOCKED: auto-merge enable failed for PR_URL=${pr_url} error=${err}" >&2
+    return 2
+  fi
+
+  if is_pr_merged "$pr_url"; then
+    echo "TASK_DONE PR_URL=${pr_url}"
+    return 0
+  fi
+
+  local failed_checks
+  failed_checks="$(pr_failed_checks_csv "$pr_url")"
+  if [[ -n "$failed_checks" ]]; then
+    echo "TASK_BLOCKED: CI failed for PR_URL=${pr_url} checks=${failed_checks}" >&2
+    return 2
+  fi
+
+  if [[ "$AUTO_MERGE_MODE" == "manual" ]]; then
+    local pending_checks successful_checks_count
+    pending_checks="$(pr_pending_checks_csv "$pr_url")"
+    successful_checks_count="$(pr_successful_checks_count "$pr_url")"
+    if [[ -z "$pending_checks" && "$successful_checks_count" =~ ^[0-9]+$ ]] && (( successful_checks_count > 0 )); then
+      if ! manual_merge_pr "$pr_url"; then
+        local err
+        err="${MANUAL_MERGE_LAST_ERROR:-unknown manual merge error}"
+        echo "TASK_BLOCKED: manual merge failed for PR_URL=${pr_url} error=${err}" >&2
+        return 2
+      fi
+      if is_pr_merged "$pr_url"; then
+        echo "TASK_DONE PR_URL=${pr_url}"
+        return 0
+      fi
+    fi
+  fi
+
+  local checks_warning
+  checks_warning="$(required_checks_missing_warning "$pr_url")"
+  if [[ -n "$checks_warning" ]]; then
+    echo "TASK_WAITING_MERGE PR_URL=${pr_url} WARN_REQUIRED_CHECKS_MISSING=1"
+    echo "$checks_warning"
+  else
+    echo "TASK_WAITING_MERGE PR_URL=${pr_url}"
+  fi
+  return 10
 }
 
 required_checks_missing_warning() {
@@ -258,30 +380,8 @@ if [[ -f "$state_file" ]]; then
   # shellcheck disable=SC1090
   source "$state_file"
   if [[ -n "${PR_URL:-}" ]]; then
-    if ! enable_pr_auto_merge "$PR_URL"; then
-      err="${AUTO_MERGE_LAST_ERROR:-unknown auto-merge error}"
-      echo "TASK_BLOCKED: auto-merge enable failed for PR_URL=${PR_URL} error=${err}" >&2
-      exit 2
-    fi
-    if is_pr_merged "$PR_URL"; then
-      echo "TASK_DONE PR_URL=${PR_URL}"
-      exit 0
-    fi
-
-    failed_checks="$(pr_failed_checks_csv "$PR_URL")"
-    if [[ -n "$failed_checks" ]]; then
-      echo "TASK_BLOCKED: CI failed for PR_URL=${PR_URL} checks=${failed_checks}" >&2
-      exit 2
-    fi
-
-    checks_warning="$(required_checks_missing_warning "$PR_URL")"
-    if [[ -n "$checks_warning" ]]; then
-      echo "TASK_WAITING_MERGE PR_URL=${PR_URL} WARN_REQUIRED_CHECKS_MISSING=1"
-      echo "$checks_warning"
-    else
-      echo "TASK_WAITING_MERGE PR_URL=${PR_URL}"
-    fi
-    exit 10
+    handle_waiting_pr "$PR_URL"
+    exit $?
   fi
 fi
 
@@ -292,9 +392,10 @@ Hard requirements:
 - Work only in the specified repository path.
 - Complete exactly the specified task.
 - Commit/push your changes.
-- Create PR for this task and enable auto-merge.
+- Create PR for this task. Prefer enabling auto-merge when the repository supports it.
 - If CI checks fail on that PR, fix the failure and push follow-up commits until checks pass.
-- If auto-merge is not complete yet, return waiting with PR URL.
+- If the repository does not support auto-merge, return waiting with PR URL after pushing; claw-loopd will watch CI and merge when it turns green.
+- If merge is not complete yet, return waiting with PR URL.
 - If task is fully complete and PR merged, first line MUST be:
   TASK_DONE PR_URL=<url>
 - If PR exists but merge is pending, first line MUST be:
@@ -338,32 +439,11 @@ if [[ "$first_line" == TASK_DONE* ]]; then
     echo "TASK_BLOCKED: TASK_DONE without PR_URL" >&2
     exit 2
   fi
-  if ! enable_pr_auto_merge "$pr_url"; then
-    err="${AUTO_MERGE_LAST_ERROR:-unknown auto-merge error}"
-    echo "TASK_BLOCKED: auto-merge enable failed for PR_URL=${pr_url} error=${err}" >&2
-    exit 2
-  fi
-  if is_pr_merged "$pr_url"; then
-    exit 0
-  fi
-
-  failed_checks="$(pr_failed_checks_csv "$pr_url")"
-  if [[ -n "$failed_checks" ]]; then
-    echo "TASK_BLOCKED: CI failed for PR_URL=${pr_url} checks=${failed_checks}" >&2
-    exit 2
-  fi
-
   {
     echo "PR_URL='${pr_url}'"
   } >"$state_file"
-  checks_warning="$(required_checks_missing_warning "$pr_url")"
-  if [[ -n "$checks_warning" ]]; then
-    echo "TASK_WAITING_MERGE PR_URL=${pr_url} WARN_REQUIRED_CHECKS_MISSING=1"
-    echo "$checks_warning"
-  else
-    echo "TASK_WAITING_MERGE PR_URL=${pr_url}"
-  fi
-  exit 10
+  handle_waiting_pr "$pr_url"
+  exit $?
 fi
 
 if [[ "$first_line" == TASK_WAITING_MERGE* ]]; then
@@ -371,22 +451,8 @@ if [[ "$first_line" == TASK_WAITING_MERGE* ]]; then
     {
       echo "PR_URL='${pr_url}'"
     } >"$state_file"
-    if ! enable_pr_auto_merge "$pr_url"; then
-      err="${AUTO_MERGE_LAST_ERROR:-unknown auto-merge error}"
-      echo "TASK_BLOCKED: auto-merge enable failed for PR_URL=${pr_url} error=${err}" >&2
-      exit 2
-    fi
-    failed_checks="$(pr_failed_checks_csv "$pr_url")"
-    if [[ -n "$failed_checks" ]]; then
-      echo "TASK_BLOCKED: CI failed for PR_URL=${pr_url} checks=${failed_checks}" >&2
-      exit 2
-    fi
-    checks_warning="$(required_checks_missing_warning "$pr_url")"
-    if [[ -n "$checks_warning" ]]; then
-      echo "TASK_WAITING_MERGE PR_URL=${pr_url} WARN_REQUIRED_CHECKS_MISSING=1"
-      echo "$checks_warning"
-      exit 10
-    fi
+    handle_waiting_pr "$pr_url"
+    exit $?
   fi
   exit 10
 fi
