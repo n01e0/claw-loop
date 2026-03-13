@@ -940,6 +940,7 @@ struct TaskRunOutcome {
 
 struct TaskRunOptions<'a> {
     task_file: &'a Path,
+    selected_task: Option<TaskChecklistEntry>,
     cmd: &'a str,
     auto_check_on_success: bool,
     dry_run: bool,
@@ -1368,9 +1369,50 @@ fn select_next_task_entry(
     entries.iter().find(|entry| !entry.done).cloned()
 }
 
+fn task_contract_line(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| line.starts_with("TASK_"))
+        .next_back()
+        .map(ToString::to_string)
+}
+
+fn blocked_reason_from_runner(stderr: &str, stdout: &str) -> String {
+    let stderr_first = stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| clip_text(line, 200));
+    if let Some(stderr_first) = stderr_first {
+        return stderr_first;
+    }
+
+    if let Some(contract_line) = task_contract_line(stdout) {
+        return clip_text(&contract_line, 200);
+    }
+
+    let stdout_last = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .next_back()
+        .map(|line| clip_text(line, 200));
+    if let Some(stdout_last) = stdout_last {
+        return stdout_last;
+    }
+
+    "runner produced no stderr/stdout detail".to_string()
+}
+
 fn run_task_once(opts: TaskRunOptions<'_>) -> Result<TaskRunOutcome> {
-    let (_, _, entries) = load_task_checklist(opts.task_file)?;
-    let next = select_next_task_entry(&entries, None);
+    let next = if let Some(selected) = opts.selected_task.clone() {
+        Some(selected)
+    } else {
+        let (_, _, entries) = load_task_checklist(opts.task_file)?;
+        select_next_task_entry(&entries, None)
+    };
 
     let mut outcome = TaskRunOutcome {
         task: next.clone(),
@@ -1433,13 +1475,15 @@ fn run_task_once(opts: TaskRunOptions<'_>) -> Result<TaskRunOutcome> {
     outcome.stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
     if outcome.success && opts.auto_check_on_success {
-        let first_stdout_line = outcome
-            .stdout
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        let first_stdout_line = task_contract_line(&outcome.stdout).unwrap_or_else(|| {
+            outcome
+                .stdout
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or("")
+                .to_string()
+        });
 
         match validate_task_done_contract(&first_stdout_line) {
             Ok(_) => {
@@ -2685,6 +2729,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
 
                         let runner = run_task_once(TaskRunOptions {
                             task_file: &task_file_abs,
+                            selected_task: Some(queued_task.clone()),
                             cmd,
                             auto_check_on_success: manifest.auto_check_on_success,
                             dry_run: false,
@@ -2715,13 +2760,16 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             }),
                         )?;
 
-                        let first_stdout_line = runner
-                            .stdout
-                            .lines()
-                            .next()
-                            .unwrap_or("")
-                            .trim()
-                            .to_string();
+                        let first_stdout_line =
+                            task_contract_line(&runner.stdout).unwrap_or_else(|| {
+                                runner
+                                    .stdout
+                                    .lines()
+                                    .map(str::trim)
+                                    .find(|line| !line.is_empty())
+                                    .unwrap_or("")
+                                    .to_string()
+                            });
                         let first_line_pr_url = extract_pr_url(&first_stdout_line);
                         let task_label = runner
                             .task
@@ -2775,7 +2823,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             state.waiting_reason = format!(
                                 "runner exit={:?}: {}",
                                 runner.exit_code,
-                                clip_text(&runner.stderr, 200)
+                                blocked_reason_from_runner(&runner.stderr, &runner.stdout)
                             );
                             state.updated_at = now;
 
@@ -3996,6 +4044,7 @@ fn cmd_task_run_once(
 ) -> Result<()> {
     let outcome = run_task_once(TaskRunOptions {
         task_file: &file,
+        selected_task: None,
         cmd: &cmd,
         auto_check_on_success,
         dry_run,
@@ -4153,15 +4202,16 @@ mod tests {
         DeadLetterEntry, DeliveryAck, DeliveryAttempt, DispatchedNotification, LoopStatus,
         Manifest, Notification, NotificationDeliveryMode, RunnerState, TaskChecklistEntry,
         ack_retry_policy, append_jsonl, apply_status_establish_retry_override,
-        auto_recover_guard_reason, blocked_recovery_hint, classify_ack_failure_category,
-        completion_guard_waiting_fallback_line, compute_auto_stop_reason, compute_backoff_sec,
-        dead_letter_path, delivery_ack_path, delivery_attempts_path, delivery_retry_backoff_sec,
-        emit_all_tasks_completed_notifications, extract_pr_url, flush_notifications,
-        format_orphan_blocked_notification, format_task_blocked_notification, lease_window_sec,
-        normalize_blocked_reason_for_recovery, normalize_error_reason, notification_delivery_mode,
-        openclaw_notify_timeout_sec_from, parse_openclaw_message_id, parse_task_checklist_entry,
-        queue_main_feedback_summary, queue_notification, read_jsonl, select_next_task_entry,
-        should_force_status_establish_retry, should_suppress_waiting_stuck,
+        auto_recover_guard_reason, blocked_reason_from_runner, blocked_recovery_hint,
+        classify_ack_failure_category, completion_guard_waiting_fallback_line,
+        compute_auto_stop_reason, compute_backoff_sec, dead_letter_path, delivery_ack_path,
+        delivery_attempts_path, delivery_retry_backoff_sec, emit_all_tasks_completed_notifications,
+        extract_pr_url, flush_notifications, format_orphan_blocked_notification,
+        format_task_blocked_notification, lease_window_sec, normalize_blocked_reason_for_recovery,
+        normalize_error_reason, notification_delivery_mode, openclaw_notify_timeout_sec_from,
+        parse_openclaw_message_id, parse_task_checklist_entry, queue_main_feedback_summary,
+        queue_notification, read_jsonl, select_next_task_entry,
+        should_force_status_establish_retry, should_suppress_waiting_stuck, task_contract_line,
         update_waiting_stuck_tracker, validate_task_done_contract_with,
     };
     use chrono::{Duration, Utc};
@@ -4799,6 +4849,22 @@ mod tests {
 
         let next = select_next_task_entry(&entries, Some("H1-RECOVER")).expect("next task");
         assert_eq!(next.id, "H2");
+    }
+
+    #[test]
+    fn task_contract_line_uses_last_protocol_line() {
+        let stdout = "progress one\nTASK_WAITING_MERGE PR_URL=https://example/pull/1\n";
+        assert_eq!(
+            task_contract_line(stdout).as_deref(),
+            Some("TASK_WAITING_MERGE PR_URL=https://example/pull/1")
+        );
+    }
+
+    #[test]
+    fn blocked_reason_from_runner_uses_protocol_line_when_stderr_empty() {
+        let stdout = "chatty preface\nTASK_BLOCKED: auto-merge enable failed\n";
+        let reason = blocked_reason_from_runner("", stdout);
+        assert_eq!(reason, "TASK_BLOCKED: auto-merge enable failed");
     }
 
     #[test]
