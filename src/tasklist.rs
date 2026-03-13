@@ -1,5 +1,7 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8,6 +10,19 @@ pub(crate) struct TaskChecklistEntry {
     pub(crate) done: bool,
     pub(crate) id: String,
     pub(crate) text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TaskApprovalMetadata {
+    pub(crate) approved_by: String,
+    pub(crate) approved_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TaskApprovalStatus {
+    pub(crate) approved_by: Option<String>,
+    pub(crate) approved_at: Option<DateTime<Utc>>,
+    pub(crate) approved_tasklist_hash: String,
 }
 
 pub(crate) fn parse_task_checklist_entry(line_no: usize, line: &str) -> Option<TaskChecklistEntry> {
@@ -61,6 +76,118 @@ pub(crate) fn load_task_checklist(
         .filter_map(|(idx, line)| parse_task_checklist_entry(idx + 1, line))
         .collect();
     Ok((content, lines, entries))
+}
+
+fn parse_task_approval_metadata_from_content(
+    content: &str,
+) -> Result<Option<TaskApprovalMetadata>> {
+    let mut approved_by: Option<String> = None;
+    let mut approved_at: Option<String> = None;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("Approved-By:") {
+            let value = value.trim();
+            if !value.is_empty() {
+                approved_by = Some(value.to_string());
+            }
+        } else if let Some(value) = trimmed.strip_prefix("Approved-At:") {
+            let value = value.trim();
+            if !value.is_empty() {
+                approved_at = Some(value.to_string());
+            }
+        }
+    }
+
+    match (approved_by, approved_at) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => {
+            bail!("tasklist approval markers must include both Approved-By and Approved-At")
+        }
+        (Some(approved_by), Some(approved_at)) => {
+            let approved_at = DateTime::parse_from_rfc3339(&approved_at)
+                .with_context(|| format!("parse Approved-At timestamp: {approved_at}"))?
+                .with_timezone(&Utc);
+            Ok(Some(TaskApprovalMetadata {
+                approved_by,
+                approved_at,
+            }))
+        }
+    }
+}
+
+fn task_plan_hash_from_entries(entries: &[TaskChecklistEntry]) -> String {
+    let mut hasher = Sha256::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        hasher.update(idx.to_string().as_bytes());
+        hasher.update(b"\t");
+        hasher.update(entry.id.as_bytes());
+        hasher.update(b"\t");
+        hasher.update(entry.text.as_bytes());
+        hasher.update(b"\n");
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+pub(crate) fn task_approval_status(file: &Path) -> Result<TaskApprovalStatus> {
+    let (content, _, entries) = load_task_checklist(file)?;
+    let approval = parse_task_approval_metadata_from_content(&content)?;
+    Ok(TaskApprovalStatus {
+        approved_by: approval.as_ref().map(|m| m.approved_by.clone()),
+        approved_at: approval.as_ref().map(|m| m.approved_at),
+        approved_tasklist_hash: task_plan_hash_from_entries(&entries),
+    })
+}
+
+pub(crate) fn task_plan_hash(file: &Path) -> Result<String> {
+    Ok(task_approval_status(file)?.approved_tasklist_hash)
+}
+
+pub(crate) fn write_task_approval(file: &Path, approved_by: &str) -> Result<TaskApprovalStatus> {
+    let content = fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+    let had_trailing_newline = content.ends_with('\n');
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    lines.retain(|line| {
+        let trimmed = line.trim_start();
+        !trimmed.starts_with("Approved-By:") && !trimmed.starts_with("Approved-At:")
+    });
+
+    let approved_by = approved_by.trim();
+    if approved_by.is_empty() {
+        bail!("approved_by must not be empty")
+    }
+
+    let approved_at = Utc::now();
+    let mut insert_at = 0usize;
+    if lines
+        .first()
+        .is_some_and(|line| line.trim_start().starts_with('#'))
+    {
+        insert_at = 1;
+        if lines
+            .get(insert_at)
+            .is_some_and(|line| line.trim().is_empty())
+        {
+            insert_at += 1;
+        }
+    }
+
+    let marker_lines = vec![
+        format!("Approved-By: {}", approved_by),
+        format!("Approved-At: {}", approved_at.to_rfc3339()),
+        String::new(),
+    ];
+    for (idx, marker) in marker_lines.into_iter().enumerate() {
+        lines.insert(insert_at + idx, marker);
+    }
+
+    let mut rebuilt = lines.join("\n");
+    if had_trailing_newline || !rebuilt.ends_with('\n') {
+        rebuilt.push('\n');
+    }
+    fs::write(file, rebuilt).with_context(|| format!("write {}", file.display()))?;
+
+    task_approval_status(file)
 }
 
 fn clip_recovery_reason(reason: &str, max_chars: usize) -> String {
@@ -163,7 +290,8 @@ pub(crate) fn update_task_check(file: &Path, id: &str, done: bool) -> Result<ser
 mod tests {
     use super::{
         append_recovery_task_for_blocked, load_task_checklist, parse_task_checklist_entry,
-        task_checklist_done_count, update_task_check,
+        task_approval_status, task_checklist_done_count, task_plan_hash, update_task_check,
+        write_task_approval,
     };
     use std::{fs, path::PathBuf};
     use uuid::Uuid;
@@ -269,5 +397,41 @@ mod tests {
 
         assert!(entry.text.len() < 260);
         assert!(!entry.text.contains('\n'));
+    }
+
+    #[test]
+    fn task_plan_hash_ignores_checkbox_state() {
+        let file = temp_file("plan-hash-checkbox");
+        fs::write(&file, "- [ ] A1: alpha\n- [x] A2: bravo\n").expect("write file");
+        let hash1 = task_plan_hash(&file).expect("hash1");
+
+        fs::write(&file, "- [x] A1: alpha\n- [ ] A2: bravo\n").expect("rewrite file");
+        let hash2 = task_plan_hash(&file).expect("hash2");
+
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn write_task_approval_writes_markers_and_hash() {
+        let file = temp_file("task-approve");
+        fs::write(&file, "# Title\n\n- [ ] A1: alpha\n").expect("write file");
+
+        let status = write_task_approval(&file, "n01e0").expect("write approval");
+        let content = fs::read_to_string(&file).expect("read file");
+
+        assert!(content.contains("Approved-By: n01e0"));
+        assert!(content.contains("Approved-At: "));
+        assert_eq!(status.approved_by.as_deref(), Some("n01e0"));
+        assert!(status.approved_at.is_some());
+        assert!(!status.approved_tasklist_hash.is_empty());
+    }
+
+    #[test]
+    fn task_approval_status_requires_both_markers_when_partial() {
+        let file = temp_file("task-approval-partial");
+        fs::write(&file, "Approved-By: n01e0\n- [ ] A1: alpha\n").expect("write file");
+
+        let err = task_approval_status(&file).expect_err("partial approval should fail");
+        assert!(err.to_string().contains("Approved-By and Approved-At"));
     }
 }

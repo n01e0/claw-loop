@@ -17,8 +17,9 @@ use std::process::{self, Command, Stdio};
 #[cfg(test)]
 use tasklist::parse_task_checklist_entry;
 use tasklist::{
-    TaskChecklistEntry, append_recovery_task_for_blocked, load_task_checklist,
-    task_checklist_done_count, update_task_check,
+    TaskApprovalMetadata, TaskChecklistEntry, append_recovery_task_for_blocked,
+    load_task_checklist, task_approval_status, task_checklist_done_count, task_plan_hash,
+    update_task_check, write_task_approval,
 };
 use uuid::Uuid;
 
@@ -69,6 +70,8 @@ enum Commands {
         task_file: PathBuf,
         #[arg(long)]
         task_runner_cmd: Option<String>,
+        #[arg(long)]
+        approved_tasklist_hash: Option<String>,
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         auto_check_on_success: bool,
         #[arg(long, default_value_t = false)]
@@ -174,6 +177,12 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
+    TaskApprove {
+        #[arg(long, default_value = "docs/roadmaps/ack-integration-tasklist.md")]
+        file: PathBuf,
+        #[arg(long)]
+        approved_by: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -208,6 +217,9 @@ struct Manifest {
     task_done_baseline: u64,
     #[serde(default)]
     task_runner_cmd: Option<String>,
+    approved_tasklist_hash: String,
+    approved_by: String,
+    approved_at: DateTime<Utc>,
     #[serde(default = "default_auto_check_on_success")]
     auto_check_on_success: bool,
     #[serde(default)]
@@ -435,6 +447,7 @@ struct StartOptions {
     max_task_loops: u64,
     task_file: PathBuf,
     task_runner_cmd: Option<String>,
+    approved_tasklist_hash: Option<String>,
     auto_check_on_success: bool,
     auto_recover_blocked: bool,
     auto_recover_blocked_max_attempts: u64,
@@ -469,6 +482,85 @@ fn resolve_task_file_path(repo: &Path, task_file: &Path) -> PathBuf {
         task_file.to_path_buf()
     } else {
         repo.join(task_file)
+    }
+}
+
+fn require_tasklist_approval(
+    task_file: &Path,
+    approved_tasklist_hash: Option<&str>,
+) -> Result<(TaskApprovalMetadata, String)> {
+    let expected_hash = approved_tasklist_hash
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "start requires --approved-tasklist-hash; run `claw-loopd task-approve --file <task_file> --approved-by <name>` first"
+            )
+        })?;
+
+    let status = task_approval_status(task_file)?;
+    let approval = TaskApprovalMetadata {
+        approved_by: status
+            .approved_by
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("tasklist is missing Approved-By marker"))?,
+        approved_at: status
+            .approved_at
+            .ok_or_else(|| anyhow::anyhow!("tasklist is missing Approved-At marker"))?,
+    };
+
+    if status.approved_tasklist_hash != expected_hash {
+        bail!(
+            "approved tasklist hash mismatch: expected={} actual={}",
+            expected_hash,
+            status.approved_tasklist_hash
+        );
+    }
+
+    Ok((approval, status.approved_tasklist_hash))
+}
+
+fn sync_manifest_tasklist_hash(
+    manifest_path: &Path,
+    manifest: &mut Manifest,
+    task_file: &Path,
+) -> Result<()> {
+    manifest.approved_tasklist_hash = task_plan_hash(task_file)?;
+    write_json(manifest_path, manifest)?;
+    Ok(())
+}
+
+fn tasklist_approval_violation_reason(task_file: &Path, manifest: &Manifest) -> String {
+    match task_approval_status(task_file) {
+        Ok(status) => {
+            if status.approved_by.as_deref() != Some(manifest.approved_by.as_str()) {
+                return format!(
+                    "tasklist approval invalidated: Approved-By changed (expected={} actual={})",
+                    manifest.approved_by,
+                    status
+                        .approved_by
+                        .unwrap_or_else(|| "<missing>".to_string())
+                );
+            }
+            if status.approved_at != Some(manifest.approved_at) {
+                return format!(
+                    "tasklist approval invalidated: Approved-At changed (expected={} actual={})",
+                    manifest.approved_at.to_rfc3339(),
+                    status
+                        .approved_at
+                        .map(|ts| ts.to_rfc3339())
+                        .unwrap_or_else(|| "<missing>".to_string())
+                );
+            }
+            if status.approved_tasklist_hash != manifest.approved_tasklist_hash {
+                return format!(
+                    "tasklist approval invalidated: approved task hash changed (expected={} actual={})",
+                    manifest.approved_tasklist_hash, status.approved_tasklist_hash
+                );
+            }
+            String::new()
+        }
+        Err(err) => format!("tasklist approval invalidated: {}", err),
     }
 }
 
@@ -2023,6 +2115,12 @@ fn reduce_pr_tracking(run_dir: &Path, manifest: &Manifest, state: &mut State) ->
 }
 
 fn cmd_start(opts: StartOptions) -> Result<()> {
+    let task_file = opts.task_file.clone();
+    let task_file_abs = resolve_task_file_path(&opts.repo, &task_file);
+    let (approval, approved_tasklist_hash) =
+        require_tasklist_approval(&task_file_abs, opts.approved_tasklist_hash.as_deref())?;
+    let task_done_baseline = task_checklist_done_count(&task_file_abs)?;
+
     let run_id = Uuid::new_v4();
     let dir = run_dir(&opts.repo, run_id);
     fs::create_dir_all(&dir)?;
@@ -2041,10 +2139,6 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
         .stderr(Stdio::null())
         .spawn()
         .context("spawn daemon")?;
-
-    let task_file = opts.task_file;
-    let task_file_abs = resolve_task_file_path(&opts.repo, &task_file);
-    let task_done_baseline = task_checklist_done_count(&task_file_abs)?;
 
     let now = Utc::now();
     let manifest = Manifest {
@@ -2067,6 +2161,9 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
         task_file,
         task_done_baseline,
         task_runner_cmd: opts.task_runner_cmd,
+        approved_tasklist_hash,
+        approved_by: approval.approved_by,
+        approved_at: approval.approved_at,
         auto_check_on_success: opts.auto_check_on_success,
         auto_recover_blocked: opts.auto_recover_blocked,
         auto_recover_blocked_max_attempts: opts.auto_recover_blocked_max_attempts,
@@ -2108,13 +2205,14 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
         bail!("run directory not found: {}", dir.display());
     }
 
-    let mut manifest: Manifest = read_json(&dir.join("manifest.json"))?;
+    let manifest_path = dir.join("manifest.json");
+    let mut manifest: Manifest = read_json(&manifest_path)?;
     let _daemon_lock = acquire_daemon_lock(&dir, run_id)?;
 
     if manifest.daemon_pid != process::id() {
         let old_pid = manifest.daemon_pid;
         manifest.daemon_pid = process::id();
-        write_json(&dir.join("manifest.json"), &manifest)?;
+        write_json(&manifest_path, &manifest)?;
         append_event(
             &dir,
             "daemon_pid_rebound",
@@ -2157,6 +2255,36 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
         let now = Utc::now();
 
         let task_file_abs = resolve_task_file_path(&manifest.repo_path, &manifest.task_file);
+        let approval_violation = tasklist_approval_violation_reason(&task_file_abs, &manifest);
+        if !approval_violation.is_empty() {
+            state.version += 1;
+            state.status = LoopStatus::Blocked;
+            state.summary = "tasklist approval invalidated".into();
+            state.waiting_reason = approval_violation.clone();
+            state.updated_at = now;
+            write_json(&dir.join("state.json"), &state)?;
+            append_event(
+                &dir,
+                "tasklist_approval_invalidated",
+                serde_json::json!({
+                    "reason": approval_violation,
+                    "task_file": task_file_abs,
+                }),
+            )?;
+            let mention = completion_mention_prefix(&manifest);
+            queue_notification(
+                &dir,
+                &manifest,
+                "blocked",
+                format!(
+                    "{mention}run blocked: tasklist approval invalidated\nrecovery: rerun `claw-loopd task-approve --file {}` and restart with the new --approved-tasklist-hash",
+                    manifest.task_file.display()
+                ),
+            )?;
+            let _ = flush_notifications(&dir, &manifest)?;
+            break;
+        }
+
         let mut task_done_now = match task_checklist_done_count(&task_file_abs) {
             Ok(v) => v,
             Err(err) => {
@@ -2629,6 +2757,11 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                         &task_file_abs,
                                         &blocked_task.id,
                                         &state.waiting_reason,
+                                    )?;
+                                    sync_manifest_tasklist_hash(
+                                        &manifest_path,
+                                        &mut manifest,
+                                        &task_file_abs,
                                     )?;
                                     let _ =
                                         update_task_check(&task_file_abs, &blocked_task.id, true)?;
@@ -3806,6 +3939,20 @@ fn cmd_task_run_once(
     Ok(())
 }
 
+fn cmd_task_approve(file: PathBuf, approved_by: String) -> Result<()> {
+    let status = write_task_approval(&file, &approved_by)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "file": file,
+            "approved_by": status.approved_by,
+            "approved_at": status.approved_at,
+            "approved_tasklist_hash": status.approved_tasklist_hash,
+        }))?
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -3827,6 +3974,7 @@ fn main() -> Result<()> {
             max_task_loops,
             task_file,
             task_runner_cmd,
+            approved_tasklist_hash,
             auto_check_on_success,
             auto_recover_blocked,
             auto_recover_blocked_max_attempts,
@@ -3847,6 +3995,7 @@ fn main() -> Result<()> {
             max_task_loops,
             task_file,
             task_runner_cmd,
+            approved_tasklist_hash,
             auto_check_on_success,
             auto_recover_blocked,
             auto_recover_blocked_max_attempts,
@@ -3899,6 +4048,7 @@ fn main() -> Result<()> {
             auto_check_on_success,
             dry_run,
         } => cmd_task_run_once(file, cmd, auto_check_on_success, dry_run),
+        Commands::TaskApprove { file, approved_by } => cmd_task_approve(file, approved_by),
     }
     .map_err(|e| {
         eprintln!("error: {e:?}");
@@ -3970,6 +4120,9 @@ mod tests {
             task_file: PathBuf::from("docs/roadmaps/ack-integration-tasklist.md"),
             task_done_baseline: 0,
             task_runner_cmd: None,
+            approved_tasklist_hash: "test-approved-hash".to_string(),
+            approved_by: "test-approver".to_string(),
+            approved_at: Utc::now(),
             auto_check_on_success: true,
             auto_recover_blocked: false,
             auto_recover_blocked_max_attempts: 3,
