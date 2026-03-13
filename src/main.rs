@@ -1000,24 +1000,24 @@ fn blocked_recovery_hint(reason: &str) -> &'static str {
     let normalized = reason.to_ascii_lowercase();
     if normalized.contains("session file locked") || normalized.contains("task_waiting_agent_lock")
     {
-        "wait for the active agent session lock to clear, then retry with a dedicated --task-agent-id to avoid contention"
+        "別の agent session がロックを保持しているので、ロック解放を待つか `--task-agent-id` を分離して再実行する"
     } else if normalized.contains("unexpected eof")
         || normalized.contains("syntax error")
         || normalized.contains("command not found")
     {
-        "fix the runner/script syntax or missing command in the repository, then rerun the blocked task"
+        "runner / script の構文エラーや不足コマンドを直してから、同じタスクを再実行する"
     } else if normalized.contains("timeout") || normalized.contains("timed out") {
-        "retry after the transient timeout and consider increasing command/agent timeout if it is consistently slow"
+        "一時的な timeout の可能性が高い。再試行しつつ、恒常的なら command/agent timeout を引き上げる"
     } else if normalized.contains("permission denied")
         || normalized.contains("401")
         || normalized.contains("403")
         || normalized.contains("forbidden")
     {
-        "fix the required auth/permission for this action (repo/channel/token), then rerun the task"
+        "必要な認証・権限（repo / channel / token など）を修正してから再実行する"
     } else if normalized.contains("without pr_url") || normalized.contains("pr_url") {
-        "ensure the runner returns TASK_DONE PR_URL=<url> and that the PR reaches merged state"
+        "runner が `TASK_DONE PR_URL=<url>` を返し、PR が merged まで到達するように修正する"
     } else {
-        "inspect runner stderr, fix the blocker in code/config, then rerun the task"
+        "runner stderr と関連ログを確認し、詰まっているコード/設定を直してから再実行する"
     }
 }
 
@@ -1029,15 +1029,15 @@ fn format_task_blocked_notification(
 ) -> String {
     let mention = completion_mention_prefix(manifest);
     let reason = if blocked_reason.trim().is_empty() {
-        "unknown blocker".to_string()
+        "不明なブロック理由".to_string()
     } else {
         clip_text(blocked_reason.trim(), 240)
     };
     let recovery = blocked_recovery_hint(&reason);
     let next = if manifest.auto_recover_blocked {
-        "next: auto-recovery is enabled; daemon will queue a recovery task automatically (guard limits apply)"
+        "次の動作: auto-recover が有効なので、daemon がこの原因を解消する recovery task を自動で積んで再開する"
     } else {
-        "next: auto-recovery is disabled; fix manually and rerun (or start with --auto-recover-blocked)"
+        "次の動作: auto-recover は無効。原因を手動で直してから再実行する（または `--auto-recover-blocked` 付きで再起動する）"
     };
     let pr_suffix = pr_url
         .map(str::trim)
@@ -1046,14 +1046,14 @@ fn format_task_blocked_notification(
         .unwrap_or_default();
 
     format!(
-        "{mention}task blocked: {task_label}{pr_suffix}\nreason: {reason}\nrecovery: {recovery}\n{next}"
+        "{mention}タスクが block された: {task_label}{pr_suffix}\n- 原因: {reason}\n- 解決方法: {recovery}\n- {next}"
     )
 }
 
 fn format_orphan_blocked_notification(manifest: &Manifest, daemon_pid: u32) -> String {
     let mention = completion_mention_prefix(manifest);
     format!(
-        "{mention}run blocked: daemon pid {daemon_pid} missing after lease expiry\nreason: daemon process is gone while lease expired\nrecovery: restart the run with the latest binary and verify stale pid/lock state before resuming"
+        "{mention}run が block された: daemon pid {daemon_pid} が lease expiry 後に見つからない\n- 原因: daemon process が終了したまま stale run が残っている\n- 解決方法: 最新 binary で run を再開する前に stale pid / lock 状態を確認し、必要なら古い run を archive へ退避する"
     )
 }
 
@@ -4582,7 +4582,8 @@ mod tests {
     #[test]
     fn blocked_recovery_hint_maps_common_lock_error() {
         let hint = blocked_recovery_hint("Error: session file locked (timeout 10000ms)");
-        assert!(hint.contains("dedicated --task-agent-id"));
+        assert!(hint.contains("--task-agent-id"));
+        assert!(hint.contains("ロック"));
     }
 
     #[test]
@@ -4600,10 +4601,10 @@ mod tests {
             Some("https://github.com/n01e0/claw-loop/pull/999"),
         );
 
-        assert!(msg.starts_with("<@test-user-id> task blocked: S5-2"));
-        assert!(msg.contains("reason:"));
-        assert!(msg.contains("recovery:"));
-        assert!(msg.contains("next: auto-recovery is enabled"));
+        assert!(msg.starts_with("<@test-user-id> タスクが block された: S5-2"));
+        assert!(msg.contains("- 原因:"));
+        assert!(msg.contains("- 解決方法:"));
+        assert!(msg.contains("次の動作: auto-recover が有効"));
         assert!(msg.contains("PR_URL=https://github.com/n01e0/claw-loop/pull/999"));
     }
 
@@ -4615,8 +4616,9 @@ mod tests {
         manifest.requester_user_id = Some("test-user-id".to_string());
 
         let msg = format_orphan_blocked_notification(&manifest, 12345);
-        assert!(msg.starts_with("<@test-user-id> run blocked: daemon pid 12345"));
-        assert!(msg.contains("recovery:"));
+        assert!(msg.starts_with("<@test-user-id> run が block された: daemon pid 12345"));
+        assert!(msg.contains("- 原因:"));
+        assert!(msg.contains("- 解決方法:"));
     }
 
     #[test]
