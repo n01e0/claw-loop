@@ -15,10 +15,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
+approve_task_file() {
+  local task_file="$1"
+  mkdir -p "$(dirname "$task_file")"
+  if [[ ! -f "$task_file" ]]; then
+    cat > "$task_file" <<'EOF'
+- [ ] T1: smoke
+EOF
+  fi
+  $BIN task-approve --file "$task_file" --approved-by e2e-smoke | python3 -c 'import json,sys; print(json.load(sys.stdin)["approved_tasklist_hash"])'
+}
+
 run_start() {
   local tick="$1"
+  local task_file="$WORKDIR/docs/roadmaps/default-tasklist.md"
+  local approved_hash
+  approved_hash="$(approve_task_file "$task_file")"
   local out
-  out="$($BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec "$tick")"
+  out="$($BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec "$tick" --task-file "$task_file" --approved-tasklist-hash "$approved_hash")"
   local run_id pid
   run_id="$(echo "$out" | awk -F= '/^run_id=/{print $2}')"
   pid="$(echo "$out" | awk -F= '/^daemon_pid=/{print $2}')"
@@ -69,7 +83,12 @@ STATUS1B="$($BIN status --repo "$WORKDIR" --run-id "$RUN1")"
 assert_json_field "$STATUS1B" status stopped
 
 echo "[e2e-smoke] case1b auto-stop guard start"
-OUT1B="$($BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --max-ticks 1)"
+TASKFILE1B="$WORKDIR/docs/roadmaps/auto-stop-tasklist.md"
+cat > "$TASKFILE1B" <<'EOF'
+- [ ] S1: auto-stop
+EOF
+APPROVED1B="$(approve_task_file "$TASKFILE1B")"
+OUT1B="$($BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --max-ticks 1 --task-file "$TASKFILE1B" --approved-tasklist-hash "$APPROVED1B")"
 RUN1B="$(echo "$OUT1B" | awk -F= '/^run_id=/{print $2}')"
 if [[ -z "$RUN1B" ]]; then
   echo "[e2e-smoke] failed to parse run1b id"
@@ -97,7 +116,8 @@ cat > "$TASKFILE" <<'EOF'
 - [ ] R1: first
 - [ ] R2: second
 EOF
-OUT1C="$($BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --task-runner-cmd 'echo start:$CLAW_TASK_ID' --auto-check-on-success false --max-task-loops 10)"
+APPROVED1C="$(approve_task_file "$TASKFILE")"
+OUT1C="$($BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --task-file "$TASKFILE" --task-runner-cmd 'echo start:$CLAW_TASK_ID' --auto-check-on-success false --max-task-loops 10 --approved-tasklist-hash "$APPROVED1C")"
 RUN1C="$(echo "$OUT1C" | awk -F= '/^run_id=/{print $2}')"
 if [[ -z "$RUN1C" ]]; then
   echo "[e2e-smoke] failed to parse run1c id"
@@ -147,11 +167,27 @@ sleep 1
 
 
 echo "[e2e-smoke] case1d runner waiting state (no block)"
+WAIT_MOCKDIR="$WORKDIR/mockbin-waiting"
+mkdir -p "$WAIT_MOCKDIR"
+cat > "$WAIT_MOCKDIR/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "pr" && "${2:-}" == "view" ]]; then
+  cat <<'JSON'
+{"state":"OPEN","url":"https://github.com/demo/repo/pull/1","mergeStateStatus":"BLOCKED","autoMergeRequest":{"enabledAt":"2026-03-14T00:00:00Z"},"statusCheckRollup":[]}
+JSON
+  exit 0
+fi
+echo "unsupported mock gh args: $*" >&2
+exit 1
+EOF
+chmod +x "$WAIT_MOCKDIR/gh"
 TASKFILE_W="$WORKDIR/docs/roadmaps/waiting-tasklist.md"
 cat > "$TASKFILE_W" <<'EOF'
 - [ ] W1: wait merge
 EOF
-OUT1D="$(CLAW_LOOPD_STUCK_WAIT_TICKS=2 $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --task-file "$TASKFILE_W" --task-runner-cmd 'echo "TASK_WAITING_MERGE PR_URL=https://example.invalid/pr/1"; exit 10' --auto-check-on-success true --max-task-loops 10)"
+APPROVED1D="$(approve_task_file "$TASKFILE_W")"
+OUT1D="$(CLAW_LOOPD_GH_BIN="$WAIT_MOCKDIR/gh" CLAW_LOOPD_STUCK_WAIT_TICKS=2 $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --task-file "$TASKFILE_W" --task-runner-cmd 'echo "TASK_WAITING_MERGE PR_URL=https://github.com/demo/repo/pull/1"; exit 10' --auto-check-on-success true --max-task-loops 10 --approved-tasklist-hash "$APPROVED1D")"
 RUN1D="$(echo "$OUT1D" | awk -F= '/^run_id=/{print $2}')"
 if [[ -z "$RUN1D" ]]; then
   echo "[e2e-smoke] failed to parse run1d id"
@@ -238,7 +274,12 @@ exit 1
 EOF
 chmod +x "$MOCKDIR/gh"
 
-OUT4="$(CLAW_LOOPD_GH_BIN="$MOCKDIR/gh" $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1)"
+TASKFILE4="$WORKDIR/docs/roadmaps/pr-track-tasklist.md"
+cat > "$TASKFILE4" <<'EOF'
+- [ ] P1: track pr
+EOF
+APPROVED4="$(approve_task_file "$TASKFILE4")"
+OUT4="$(CLAW_LOOPD_GH_BIN="$MOCKDIR/gh" $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --task-file "$TASKFILE4" --approved-tasklist-hash "$APPROVED4")"
 RUN4="$(echo "$OUT4" | awk -F= '/^run_id=/{print $2}')"
 if [[ -z "$RUN4" ]]; then
   echo "[e2e-smoke] failed to parse run4 id"
@@ -280,7 +321,12 @@ EOF
 chmod +x "$MOCKDIR/openclaw"
 MOCK_STATE="$WORKDIR/mock-openclaw-count.txt"
 
-OUT5="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw" CLAW_LOOPD_MOCK_OPENCLAW_STATE="$MOCK_STATE" $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw)"
+TASKFILE5="$WORKDIR/docs/roadmaps/delivery-retry-tasklist.md"
+cat > "$TASKFILE5" <<'EOF'
+- [ ] D1: delivery retry
+EOF
+APPROVED5="$(approve_task_file "$TASKFILE5")"
+OUT5="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw" CLAW_LOOPD_MOCK_OPENCLAW_STATE="$MOCK_STATE" $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw --task-file "$TASKFILE5" --approved-tasklist-hash "$APPROVED5")"
 RUN5="$(echo "$OUT5" | awk -F= '/^run_id=/{print $2}')"
 if [[ -z "$RUN5" ]]; then
   echo "[e2e-smoke] failed to parse run5 id"
@@ -340,7 +386,12 @@ exit 1
 EOF
 chmod +x "$MOCKDIR/openclaw-fail"
 
-OUT6="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-fail" CLAW_LOOPD_DELIVERY_MAX_ATTEMPTS=1 $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw)"
+TASKFILE6="$WORKDIR/docs/roadmaps/dead-letter-tasklist.md"
+cat > "$TASKFILE6" <<'EOF'
+- [ ] D2: dead letter
+EOF
+APPROVED6="$(approve_task_file "$TASKFILE6")"
+OUT6="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-fail" CLAW_LOOPD_DELIVERY_MAX_ATTEMPTS=1 $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw --task-file "$TASKFILE6" --approved-tasklist-hash "$APPROVED6")"
 RUN6="$(echo "$OUT6" | awk -F= '/^run_id=/{print $2}')"
 if [[ -z "$RUN6" ]]; then
   echo "[e2e-smoke] failed to parse run6 id"
@@ -471,7 +522,12 @@ exit 0
 EOF
 chmod +x "$MOCKDIR/openclaw-ok"
 
-OUT8="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-fail" CLAW_LOOPD_DELIVERY_MAX_ATTEMPTS=1 $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw)"
+TASKFILE8="$WORKDIR/docs/roadmaps/resend-ack-tasklist.md"
+cat > "$TASKFILE8" <<'EOF'
+- [ ] D3: resend ack
+EOF
+APPROVED8="$(approve_task_file "$TASKFILE8")"
+OUT8="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-fail" CLAW_LOOPD_DELIVERY_MAX_ATTEMPTS=1 $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw --task-file "$TASKFILE8" --approved-tasklist-hash "$APPROVED8")"
 RUN8="$(echo "$OUT8" | awk -F= '/^run_id=/{print $2}')"
 if [[ -z "$RUN8" ]]; then
   echo "[e2e-smoke] failed to parse run8 id"
@@ -594,7 +650,12 @@ if len(keys) != len(rows):
 PY
 
 echo "[e2e-smoke] case9 recovery reconcile + ack dedupe"
-OUT9="$($BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1)"
+TASKFILE9="$WORKDIR/docs/roadmaps/recovery-reconcile-tasklist.md"
+cat > "$TASKFILE9" <<'EOF'
+- [ ] R9: reconcile
+EOF
+APPROVED9="$(approve_task_file "$TASKFILE9")"
+OUT9="$($BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --task-file "$TASKFILE9" --approved-tasklist-hash "$APPROVED9")"
 RUN9="$(echo "$OUT9" | awk -F= '/^run_id=/{print $2}')"
 if [[ -z "$RUN9" ]]; then
   echo "[e2e-smoke] failed to parse run9 id"
@@ -722,7 +783,12 @@ EOF
 chmod +x "$MOCKDIR/openclaw-status-mode"
 
 STATUS_MOCK_DIR="$WORKDIR/status-mock"
-OUT10="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-status-mode" CLAW_LOOPD_STATUS_MOCK_DIR="$STATUS_MOCK_DIR" $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw)"
+TASKFILE10="$WORKDIR/docs/roadmaps/status-mode-tasklist.md"
+cat > "$TASKFILE10" <<'EOF'
+- [ ] S10: status mode
+EOF
+APPROVED10="$(approve_task_file "$TASKFILE10")"
+OUT10="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-status-mode" CLAW_LOOPD_STATUS_MOCK_DIR="$STATUS_MOCK_DIR" $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw --task-file "$TASKFILE10" --approved-tasklist-hash "$APPROVED10")"
 RUN10="$(echo "$OUT10" | awk -F= '/^run_id=/{print $2}')"
 if [[ -z "$RUN10" ]]; then
   echo "[e2e-smoke] failed to parse run10 id"
@@ -832,7 +898,8 @@ cat > "$TASKFILE11" <<'EOF'
 EOF
 
 STATUS_MOCK_DIR11="$WORKDIR/status-mock-case11"
-OUT11="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-task-fallback" CLAW_LOOPD_STATUS_MOCK_DIR="$STATUS_MOCK_DIR11" CLAW_LOOPD_GH_BIN="$MOCKDIR/gh" $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw --task-file "$TASKFILE11" --task-runner-cmd 'echo "TASK_DONE PR_URL=https://example.invalid/pr/200"')"
+APPROVED11="$(approve_task_file "$TASKFILE11")"
+OUT11="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-task-fallback" CLAW_LOOPD_STATUS_MOCK_DIR="$STATUS_MOCK_DIR11" CLAW_LOOPD_GH_BIN="$MOCKDIR/gh" $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw --task-file "$TASKFILE11" --task-runner-cmd 'echo "TASK_DONE PR_URL=https://example.invalid/pr/200"' --approved-tasklist-hash "$APPROVED11")"
 RUN11="$(echo "$OUT11" | awk -F= '/^run_id=/{print $2}')"
 if [[ -z "$RUN11" ]]; then
   echo "[e2e-smoke] failed to parse run11 id"
@@ -942,7 +1009,12 @@ EOF
 chmod +x "$MOCKDIR/openclaw-delay"
 
 STATUS_MOCK_DIR12A="$WORKDIR/status-mock-case12a"
-OUT12A="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-delay" CLAW_LOOPD_STATUS_MOCK_DIR="$STATUS_MOCK_DIR12A" CLAW_LOOPD_TIMEOUT_MOCK_DELAY_SEC=2 CLAW_LOOPD_OPENCLAW_TIMEOUT_SEC=1 $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw)"
+TASKFILE12A="$WORKDIR/docs/roadmaps/timeout-delay-a-tasklist.md"
+cat > "$TASKFILE12A" <<'EOF'
+- [ ] T12A: timeout delay a
+EOF
+APPROVED12A="$(approve_task_file "$TASKFILE12A")"
+OUT12A="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-delay" CLAW_LOOPD_STATUS_MOCK_DIR="$STATUS_MOCK_DIR12A" CLAW_LOOPD_TIMEOUT_MOCK_DELAY_SEC=2 CLAW_LOOPD_OPENCLAW_TIMEOUT_SEC=1 $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw --task-file "$TASKFILE12A" --approved-tasklist-hash "$APPROVED12A")"
 RUN12A="$(echo "$OUT12A" | awk -F= '/^run_id=/{print $2}')"
 if [[ -z "$RUN12A" ]]; then
   echo "[e2e-smoke] failed to parse run12a id"
@@ -966,7 +1038,12 @@ $BIN stop --repo "$WORKDIR" --run-id "$RUN12A" --immediate >/dev/null || true
 sleep 1
 
 STATUS_MOCK_DIR12B="$WORKDIR/status-mock-case12b"
-OUT12B="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-delay" CLAW_LOOPD_STATUS_MOCK_DIR="$STATUS_MOCK_DIR12B" CLAW_LOOPD_TIMEOUT_MOCK_DELAY_SEC=1 CLAW_LOOPD_OPENCLAW_TIMEOUT_SEC=3 $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw)"
+TASKFILE12B="$WORKDIR/docs/roadmaps/timeout-delay-b-tasklist.md"
+cat > "$TASKFILE12B" <<'EOF'
+- [ ] T12B: timeout delay b
+EOF
+APPROVED12B="$(approve_task_file "$TASKFILE12B")"
+OUT12B="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-delay" CLAW_LOOPD_STATUS_MOCK_DIR="$STATUS_MOCK_DIR12B" CLAW_LOOPD_TIMEOUT_MOCK_DELAY_SEC=1 CLAW_LOOPD_OPENCLAW_TIMEOUT_SEC=3 $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw --task-file "$TASKFILE12B" --approved-tasklist-hash "$APPROVED12B")"
 RUN12B="$(echo "$OUT12B" | awk -F= '/^run_id=/{print $2}')"
 if [[ -z "$RUN12B" ]]; then
   echo "[e2e-smoke] failed to parse run12b id"
@@ -998,7 +1075,8 @@ cat > "$TASKFILE13" <<'EOF'
 - [ ] S5X-1: blocked sample task
 EOF
 
-OUT13="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-ok" CLAW_LOOPD_GH_BIN="$MOCKDIR/gh" $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw --task-file "$TASKFILE13" --task-runner-cmd 'if [[ "$CLAW_TASK_ID" == *"-RECOVER"* ]]; then echo "TASK_DONE PR_URL=https://example.invalid/pr/313"; exit 0; fi; echo "simulated blocked" >&2; exit 2' --auto-recover-blocked)"
+APPROVED13="$(approve_task_file "$TASKFILE13")"
+OUT13="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-ok" CLAW_LOOPD_GH_BIN="$MOCKDIR/gh" $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw --task-file "$TASKFILE13" --task-runner-cmd 'if [[ "$CLAW_TASK_ID" == *"-RECOVER"* ]]; then echo "TASK_DONE PR_URL=https://example.invalid/pr/313"; exit 0; fi; echo "simulated blocked" >&2; exit 2' --auto-recover-blocked --approved-tasklist-hash "$APPROVED13")"
 RUN13="$(echo "$OUT13" | awk -F= '/^run_id=/{print $2}')"
 if [[ -z "$RUN13" ]]; then
   echo "[e2e-smoke] failed to parse run13 id"
