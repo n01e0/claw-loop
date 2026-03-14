@@ -1277,6 +1277,138 @@ fn auto_recover_guard_reason(
     None
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum AutoRecoverBlockedOutcome {
+    NotTriggered,
+    Recovered,
+    Halted,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_auto_recover_blocked_task(
+    run_dir: &Path,
+    manifest_path: &Path,
+    manifest: &mut Manifest,
+    task_file_abs: &Path,
+    runner_state: &mut RunnerState,
+    state: &mut State,
+    blocked_task_id: &str,
+    now: DateTime<Utc>,
+    task_done_now: &mut u64,
+    task_loops_completed: &mut u64,
+) -> Result<AutoRecoverBlockedOutcome> {
+    if !manifest.auto_recover_blocked {
+        return Ok(AutoRecoverBlockedOutcome::NotTriggered);
+    }
+
+    let reason_key = normalize_blocked_reason_for_recovery(&state.waiting_reason);
+    let guard_reason = auto_recover_guard_reason(
+        blocked_task_id,
+        &reason_key,
+        runner_state,
+        manifest.auto_recover_blocked_max_attempts,
+    );
+
+    if let Some(reason) = guard_reason {
+        runner_state.paused = true;
+        runner_state.pause_reason = Some(reason.clone());
+        runner_state.auto_recover_last_reason = Some(reason_key.clone());
+        runner_state.auto_recover_same_reason_count = runner_state
+            .auto_recover_same_reason_count
+            .saturating_add(1);
+        runner_state.auto_recover_last_at = Some(now);
+        write_runner_state(run_dir, runner_state)?;
+
+        state.status = LoopStatus::Stopped;
+        state.summary = "auto-recovery halted".to_string();
+        state.waiting_reason = reason.clone();
+        state.updated_at = now;
+        state.version += 1;
+
+        append_event(
+            run_dir,
+            "task_blocked_auto_recover_guard_hit",
+            serde_json::json!({
+                "blocked_task_id": blocked_task_id,
+                "blocked_reason_key": reason_key,
+                "guard_reason": reason,
+                "attempts": runner_state.auto_recover_attempts,
+                "max_attempts": manifest.auto_recover_blocked_max_attempts,
+            }),
+        )?;
+
+        write_json(&run_dir.join("state.json"), state)?;
+        let _ = flush_notifications(run_dir, manifest)?;
+        return Ok(AutoRecoverBlockedOutcome::Halted);
+    }
+
+    let recovery_task =
+        append_recovery_task_for_blocked(task_file_abs, blocked_task_id, &state.waiting_reason)?;
+    sync_manifest_tasklist_hash(manifest_path, manifest, task_file_abs)?;
+    let _ = update_task_check(task_file_abs, blocked_task_id, true)?;
+    *task_done_now = task_checklist_done_count(task_file_abs)?;
+    *task_loops_completed = (*task_done_now).saturating_sub(manifest.task_done_baseline);
+
+    runner_state.auto_recover_attempts = runner_state.auto_recover_attempts.saturating_add(1);
+    if runner_state.auto_recover_last_reason.as_deref() == Some(reason_key.as_str()) {
+        runner_state.auto_recover_same_reason_count = runner_state
+            .auto_recover_same_reason_count
+            .saturating_add(1);
+    } else {
+        runner_state.auto_recover_same_reason_count = 1;
+    }
+    runner_state.auto_recover_last_reason = Some(reason_key);
+    runner_state.auto_recover_last_task_id = Some(recovery_task.id.clone());
+    runner_state.auto_recover_last_at = Some(now);
+
+    runner_state.current_task_id = None;
+    runner_state.current_task_text = None;
+    runner_state.current_task_line = None;
+    runner_state.current_task_started_at = None;
+    runner_state.current_task_state = None;
+    runner_state.current_task_blocked_reason = None;
+    runner_state.current_task_pr_url = None;
+    runner_state.paused = false;
+    runner_state.pause_reason = None;
+
+    state.version += 1;
+    state.status = LoopStatus::Running;
+    state.summary = format!("auto-recovery queued: {}", recovery_task.id);
+    state.waiting_reason = format!(
+        "auto-recovery generated from blocked task {}",
+        blocked_task_id
+    );
+    state.updated_at = now;
+
+    write_runner_state(run_dir, runner_state)?;
+    write_json(&run_dir.join("state.json"), state)?;
+
+    append_event(
+        run_dir,
+        "task_blocked_auto_recovered",
+        serde_json::json!({
+            "blocked_task_id": blocked_task_id,
+            "blocked_reason": runner_state.last_task_reason.clone(),
+            "recovery_task_id": recovery_task.id,
+            "recovery_task_line": recovery_task.line_no,
+            "auto_recover_attempts": runner_state.auto_recover_attempts,
+            "auto_recover_same_reason_count": runner_state.auto_recover_same_reason_count,
+        }),
+    )?;
+
+    queue_notification(
+        run_dir,
+        manifest,
+        "task_progress",
+        format!(
+            "auto-recovery task queued: {} (from blocked task {})",
+            recovery_task.id, blocked_task_id
+        ),
+    )?;
+
+    Ok(AutoRecoverBlockedOutcome::Recovered)
+}
+
 fn should_suppress_waiting_stuck(runner_state: &RunnerState) -> bool {
     runner_state.paused
         && runner_state.pause_reason.as_deref() == Some("all tasklist items completed")
@@ -2627,7 +2759,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
         let mut task_loops_completed = task_done_now.saturating_sub(manifest.task_done_baseline);
         let mut runner_state = read_runner_state(&dir)?;
 
-        if let Some(cmd) = manifest.task_runner_cmd.as_deref() {
+        if let Some(cmd) = manifest.task_runner_cmd.clone() {
             if runner_state.paused {
                 state.status = LoopStatus::Waiting;
                 state.summary = "runner paused".into();
@@ -2777,10 +2909,12 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                                 runner_state.last_task_pr_url =
                                                     Some(pr_url.clone());
 
+                                                state.version += 1;
                                                 state.status = LoopStatus::Blocked;
                                                 state.summary =
                                                     format!("task blocked: {}", entry.id);
                                                 state.waiting_reason = reason.clone();
+                                                state.updated_at = now;
 
                                                 append_event(
                                                     &dir,
@@ -2805,6 +2939,25 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                                     "task_blocked",
                                                     blocked_message,
                                                 )?;
+
+                                                match maybe_auto_recover_blocked_task(
+                                                    &dir,
+                                                    &manifest_path,
+                                                    &mut manifest,
+                                                    &task_file_abs,
+                                                    &mut runner_state,
+                                                    &mut state,
+                                                    &entry.id,
+                                                    now,
+                                                    &mut task_done_now,
+                                                    &mut task_loops_completed,
+                                                )? {
+                                                    AutoRecoverBlockedOutcome::Recovered => {
+                                                        continue;
+                                                    }
+                                                    AutoRecoverBlockedOutcome::Halted => break,
+                                                    AutoRecoverBlockedOutcome::NotTriggered => {}
+                                                }
                                             }
                                             Err(err) => {
                                                 let err_text = clip_text(&err.to_string(), 200);
@@ -2998,7 +3151,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                         let runner = run_task_once(TaskRunOptions {
                             task_file: &task_file_abs,
                             selected_task: Some(queued_task.clone()),
-                            cmd,
+                            cmd: &cmd,
                             auto_check_on_success: manifest.auto_check_on_success,
                             dry_run: false,
                             cwd: Some(&manifest.repo_path),
@@ -3116,129 +3269,22 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
 
                             if manifest.auto_recover_blocked {
                                 if let Some(blocked_task) = runner.task.as_ref() {
-                                    let reason_key = normalize_blocked_reason_for_recovery(
-                                        &state.waiting_reason,
-                                    );
-                                    let guard_reason = auto_recover_guard_reason(
-                                        &blocked_task.id,
-                                        &reason_key,
-                                        &runner_state,
-                                        manifest.auto_recover_blocked_max_attempts,
-                                    );
-
-                                    if let Some(reason) = guard_reason {
-                                        runner_state.paused = true;
-                                        runner_state.pause_reason = Some(reason.clone());
-                                        runner_state.auto_recover_last_reason =
-                                            Some(reason_key.clone());
-                                        runner_state.auto_recover_same_reason_count = runner_state
-                                            .auto_recover_same_reason_count
-                                            .saturating_add(1);
-                                        runner_state.auto_recover_last_at = Some(now);
-                                        write_runner_state(&dir, &runner_state)?;
-
-                                        state.status = LoopStatus::Stopped;
-                                        state.summary = "auto-recovery halted".to_string();
-                                        state.waiting_reason = reason.clone();
-                                        state.updated_at = now;
-                                        state.version += 1;
-
-                                        append_event(
-                                            &dir,
-                                            "task_blocked_auto_recover_guard_hit",
-                                            serde_json::json!({
-                                                "blocked_task_id": blocked_task.id,
-                                                "blocked_reason_key": reason_key,
-                                                "guard_reason": reason,
-                                                "attempts": runner_state.auto_recover_attempts,
-                                                "max_attempts": manifest.auto_recover_blocked_max_attempts,
-                                            }),
-                                        )?;
-
-                                        write_json(&dir.join("state.json"), &state)?;
-                                        let _ = flush_notifications(&dir, &manifest)?;
-                                        break;
-                                    }
-
-                                    let recovery_task = append_recovery_task_for_blocked(
-                                        &task_file_abs,
-                                        &blocked_task.id,
-                                        &state.waiting_reason,
-                                    )?;
-                                    sync_manifest_tasklist_hash(
+                                    match maybe_auto_recover_blocked_task(
+                                        &dir,
                                         &manifest_path,
                                         &mut manifest,
                                         &task_file_abs,
-                                    )?;
-                                    let _ =
-                                        update_task_check(&task_file_abs, &blocked_task.id, true)?;
-                                    task_done_now = task_checklist_done_count(&task_file_abs)?;
-                                    task_loops_completed =
-                                        task_done_now.saturating_sub(manifest.task_done_baseline);
-
-                                    runner_state.auto_recover_attempts =
-                                        runner_state.auto_recover_attempts.saturating_add(1);
-                                    if runner_state.auto_recover_last_reason.as_deref()
-                                        == Some(reason_key.as_str())
-                                    {
-                                        runner_state.auto_recover_same_reason_count = runner_state
-                                            .auto_recover_same_reason_count
-                                            .saturating_add(1);
-                                    } else {
-                                        runner_state.auto_recover_same_reason_count = 1;
+                                        &mut runner_state,
+                                        &mut state,
+                                        &blocked_task.id,
+                                        now,
+                                        &mut task_done_now,
+                                        &mut task_loops_completed,
+                                    )? {
+                                        AutoRecoverBlockedOutcome::Recovered => continue,
+                                        AutoRecoverBlockedOutcome::Halted => break,
+                                        AutoRecoverBlockedOutcome::NotTriggered => {}
                                     }
-                                    runner_state.auto_recover_last_reason = Some(reason_key);
-                                    runner_state.auto_recover_last_task_id =
-                                        Some(recovery_task.id.clone());
-                                    runner_state.auto_recover_last_at = Some(now);
-
-                                    runner_state.current_task_id = None;
-                                    runner_state.current_task_text = None;
-                                    runner_state.current_task_line = None;
-                                    runner_state.current_task_started_at = None;
-                                    runner_state.current_task_state = None;
-                                    runner_state.current_task_blocked_reason = None;
-                                    runner_state.current_task_pr_url = None;
-                                    runner_state.paused = false;
-                                    runner_state.pause_reason = None;
-
-                                    state.version += 1;
-                                    state.status = LoopStatus::Running;
-                                    state.summary =
-                                        format!("auto-recovery queued: {}", recovery_task.id);
-                                    state.waiting_reason = format!(
-                                        "auto-recovery generated from blocked task {}",
-                                        blocked_task.id
-                                    );
-                                    state.updated_at = now;
-
-                                    write_runner_state(&dir, &runner_state)?;
-                                    write_json(&dir.join("state.json"), &state)?;
-
-                                    append_event(
-                                        &dir,
-                                        "task_blocked_auto_recovered",
-                                        serde_json::json!({
-                                            "blocked_task_id": blocked_task.id,
-                                            "blocked_reason": runner_state.last_task_reason.clone(),
-                                            "recovery_task_id": recovery_task.id,
-                                            "recovery_task_line": recovery_task.line_no,
-                                            "auto_recover_attempts": runner_state.auto_recover_attempts,
-                                            "auto_recover_same_reason_count": runner_state.auto_recover_same_reason_count,
-                                        }),
-                                    )?;
-
-                                    queue_notification(
-                                        &dir,
-                                        &manifest,
-                                        "task_progress",
-                                        format!(
-                                            "auto-recovery task queued: {} (from blocked task {})",
-                                            recovery_task.id, blocked_task.id
-                                        ),
-                                    )?;
-
-                                    continue;
                                 }
 
                                 append_event(
@@ -4467,9 +4513,10 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeadLetterEntry, DeliveryAck, DeliveryAttempt, DispatchedNotification, GhPrView,
-        GhStatusCheck, LoopStatus, Manifest, Notification, NotificationDeliveryMode, RunnerState,
-        TaskChecklistEntry, WaitingMergeProgress, ack_retry_policy, append_jsonl,
+        AutoRecoverBlockedOutcome, DeadLetterEntry, DeliveryAck, DeliveryAttempt,
+        DispatchedNotification, GhPrView, GhStatusCheck, LoopStatus, Manifest, Notification,
+        NotificationDeliveryMode, RunnerState, RunnerTaskState, State, TaskChecklistEntry,
+        WaitingMergeProgress, ack_retry_policy, append_jsonl,
         apply_status_establish_retry_override, auto_merge_unavailable_error,
         auto_recover_guard_reason, blocked_reason_from_runner, blocked_recovery_hint,
         classify_ack_failure_category, completion_guard_waiting_fallback_line,
@@ -4477,11 +4524,12 @@ mod tests {
         delivery_attempts_path, delivery_retry_backoff_sec, emit_all_tasks_completed_notifications,
         ensure_task_agent_exists_with, ensure_waiting_merge_progress_with, extract_pr_url,
         flush_notifications, format_orphan_blocked_notification, format_task_blocked_notification,
-        lease_window_sec, normalize_blocked_reason_for_recovery, normalize_error_reason,
-        notification_delivery_mode, openclaw_notify_timeout_sec_from, parse_openclaw_message_id,
-        parse_task_checklist_entry, queue_main_feedback_summary, queue_notification, read_jsonl,
-        select_next_task_entry, should_force_status_establish_retry, should_suppress_waiting_stuck,
-        task_contract_line, update_waiting_stuck_tracker, validate_task_done_contract_with,
+        lease_window_sec, maybe_auto_recover_blocked_task, normalize_blocked_reason_for_recovery,
+        normalize_error_reason, notification_delivery_mode, openclaw_notify_timeout_sec_from,
+        parse_openclaw_message_id, parse_task_checklist_entry, queue_main_feedback_summary,
+        queue_notification, read_jsonl, select_next_task_entry,
+        should_force_status_establish_retry, should_suppress_waiting_stuck, task_contract_line,
+        update_waiting_stuck_tracker, validate_task_done_contract_with, write_json,
     };
     use chrono::{Duration, Utc};
     use std::{
@@ -5061,6 +5109,89 @@ mod tests {
         assert!(normalized.contains("runner exit=2:"));
         assert!(normalized.contains("timeout error"));
         assert!(!normalized.contains('\n'));
+    }
+
+    #[test]
+    fn maybe_auto_recover_blocked_task_queues_recovery_for_waiting_merge_ci_failures() {
+        let run = TestRunDir::new("waiting-merge-auto-recover");
+        let run_id = Uuid::new_v4();
+        let task_file = run.path.join("tasklist.md");
+        fs::write(&task_file, "- [ ] A2: original task\n").expect("write task file");
+
+        let manifest_path = run.path.join("manifest.json");
+        let mut manifest = test_manifest(&run.path, run_id, false);
+        manifest.auto_recover_blocked = true;
+        manifest.task_file = task_file.clone();
+        write_json(&manifest_path, &manifest).expect("write manifest");
+
+        let now = Utc::now();
+        let mut runner_state = RunnerState {
+            current_task_id: Some("A2".into()),
+            current_task_text: Some("original task".into()),
+            current_task_line: Some(1),
+            current_task_started_at: Some(now),
+            current_task_state: Some(RunnerTaskState::Blocked),
+            current_task_blocked_reason: Some(
+                "CI failed for PR_URL=https://example.test/pull/1 checks=rust:FAILURE".into(),
+            ),
+            current_task_pr_url: Some("https://example.test/pull/1".into()),
+            last_task_id: Some("A2".into()),
+            last_task_state: Some(RunnerTaskState::Blocked),
+            last_task_at: Some(now),
+            last_task_reason: Some(
+                "CI failed for PR_URL=https://example.test/pull/1 checks=rust:FAILURE".into(),
+            ),
+            last_task_pr_url: Some("https://example.test/pull/1".into()),
+            ..RunnerState::default()
+        };
+        let mut state = State {
+            version: 1,
+            status: LoopStatus::Blocked,
+            summary: "task blocked: A2".into(),
+            waiting_reason: "CI failed for PR_URL=https://example.test/pull/1 checks=rust:FAILURE"
+                .into(),
+            lease_expires_at: now,
+            updated_at: now,
+            ticks: 0,
+        };
+        let mut task_done_now = 0;
+        let mut task_loops_completed = 0;
+
+        let outcome = maybe_auto_recover_blocked_task(
+            &run.path,
+            &manifest_path,
+            &mut manifest,
+            &task_file,
+            &mut runner_state,
+            &mut state,
+            "A2",
+            now,
+            &mut task_done_now,
+            &mut task_loops_completed,
+        )
+        .expect("auto recover waiting-merge blocked task");
+
+        assert_eq!(outcome, AutoRecoverBlockedOutcome::Recovered);
+        assert_eq!(state.status, LoopStatus::Running);
+        assert!(
+            state
+                .summary
+                .starts_with("auto-recovery queued: A2-RECOVER")
+        );
+        assert_eq!(task_done_now, 1);
+        assert_eq!(task_loops_completed, 1);
+        assert_eq!(runner_state.current_task_id, None);
+        assert!(
+            runner_state
+                .auto_recover_last_task_id
+                .as_deref()
+                .expect("recovery task id")
+                .starts_with("A2-RECOVER")
+        );
+
+        let content = fs::read_to_string(&task_file).expect("read task file");
+        assert!(content.contains("- [x] A2: original task"));
+        assert!(content.contains("- [ ] A2-RECOVER"));
     }
 
     #[test]
