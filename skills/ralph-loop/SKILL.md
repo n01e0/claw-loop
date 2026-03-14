@@ -17,7 +17,7 @@ Collect all of these before start:
 - `--max-runtime-sec` only when needed (omit for long pause-oriented operation)
 - dogfood runner command (`--task-runner-cmd`), monitor-only when omitted
 - recommended runner: `scripts/rl-task-agent.sh` (PR creation → auto-merge preferred → merge confirmation; if repo auto-merge is unavailable, daemon keeps watching CI and squash-merges after green; auto-merge/CI failures are fail-closed as blocked for auto-recovery; missing required checks policy is surfaced as waiting warning)
-- `--task-agent-id <agent_id>` (dedicated loop agent; split per loop for parallel operation)
+- `--task-agent-id <agent_id>` (dedicated loop agent; split per loop for parallel operation; `claw-loopd start` auto-creates it if missing)
 - approved tasklist gate:
   - `claw-loopd task-approve --file <task_file> --approved-by <name>`
   - `--approved-tasklist-hash <hash>` is required on `start`
@@ -42,6 +42,7 @@ Never start without `thread_id` + `session_key`.
    - use current message `sender_id` as `<discord_user_id>`
 3. Resolve loop agent id:
    - use project-specific agent id (e.g., `loop-worker-<project>`)
+   - if it is missing locally, `claw-loopd start` will create it before the run starts; if creation fails, start must fail immediately instead of letting the first task crash
 4. Resolve aggregation target:
    - use main control thread id as `<feedback_thread_id>`
 5. Stamp and hash the approved tasklist:

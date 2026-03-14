@@ -758,6 +758,90 @@ fn openclaw_bin() -> String {
     std::env::var("CLAW_LOOPD_OPENCLAW_BIN").unwrap_or_else(|_| "openclaw".to_string())
 }
 
+#[derive(Debug, Deserialize)]
+struct OpenclawAgentListEntry {
+    id: String,
+}
+
+fn openclaw_agent_timeout_sec() -> u64 {
+    15
+}
+
+fn configured_openclaw_agent_ids_with(bin: &str, timeout_sec: u64) -> Result<HashSet<String>> {
+    let args: Vec<String> = vec!["agents".into(), "list".into(), "--json".into()];
+    let output = run_with_timeout_cmd(bin, &args, timeout_sec)?;
+    if !output.status.success() {
+        bail!(
+            "openclaw agents list failed: status={:?} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let agents: Vec<OpenclawAgentListEntry> =
+        serde_json::from_slice(&output.stdout).context("parse openclaw agents list json")?;
+    Ok(agents.into_iter().map(|agent| agent.id).collect())
+}
+
+fn ensure_task_agent_exists(task_agent_id: &str, workspace: &Path) -> Result<bool> {
+    ensure_task_agent_exists_with(
+        &openclaw_bin(),
+        task_agent_id,
+        workspace,
+        openclaw_agent_timeout_sec(),
+    )
+}
+
+fn ensure_task_agent_exists_with(
+    bin: &str,
+    task_agent_id: &str,
+    workspace: &Path,
+    timeout_sec: u64,
+) -> Result<bool> {
+    let agent_id = task_agent_id.trim();
+    if agent_id.is_empty() {
+        bail!("task agent id cannot be empty");
+    }
+
+    let configured = configured_openclaw_agent_ids_with(bin, timeout_sec)?;
+    if configured.contains(agent_id) {
+        return Ok(false);
+    }
+
+    let args: Vec<String> = vec![
+        "agents".into(),
+        "add".into(),
+        agent_id.into(),
+        "--workspace".into(),
+        workspace.display().to_string(),
+        "--non-interactive".into(),
+        "--json".into(),
+    ];
+    let output = run_with_timeout_cmd(bin, &args, timeout_sec)?;
+    if !output.status.success() {
+        let configured_after = configured_openclaw_agent_ids_with(bin, timeout_sec)?;
+        if configured_after.contains(agent_id) {
+            return Ok(false);
+        }
+        bail!(
+            "openclaw agents add {} failed: status={:?} stderr={}",
+            agent_id,
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let configured_after = configured_openclaw_agent_ids_with(bin, timeout_sec)?;
+    if configured_after.contains(agent_id) {
+        return Ok(true);
+    }
+
+    bail!(
+        "openclaw agents add {} succeeded but agent is still missing from agents list",
+        agent_id
+    )
+}
+
 fn openclaw_notify_timeout_sec_from(raw: Option<&str>) -> u64 {
     const DEFAULT_TIMEOUT_SEC: u64 = 15;
 
@@ -2351,6 +2435,11 @@ fn reduce_pr_tracking(run_dir: &Path, manifest: &Manifest, state: &mut State) ->
 }
 
 fn cmd_start(opts: StartOptions) -> Result<()> {
+    if let Some(task_agent_id) = opts.task_agent_id.as_deref() {
+        ensure_task_agent_exists(task_agent_id, &opts.repo)
+            .with_context(|| format!("ensure task agent exists before start: {task_agent_id}"))?;
+    }
+
     let task_file = opts.task_file.clone();
     let task_file_abs = resolve_task_file_path(&opts.repo, &task_file);
     let (approval, approved_tasklist_hash) =
@@ -4386,13 +4475,13 @@ mod tests {
         classify_ack_failure_category, completion_guard_waiting_fallback_line,
         compute_auto_stop_reason, compute_backoff_sec, dead_letter_path, delivery_ack_path,
         delivery_attempts_path, delivery_retry_backoff_sec, emit_all_tasks_completed_notifications,
-        ensure_waiting_merge_progress_with, extract_pr_url, flush_notifications,
-        format_orphan_blocked_notification, format_task_blocked_notification, lease_window_sec,
-        normalize_blocked_reason_for_recovery, normalize_error_reason, notification_delivery_mode,
-        openclaw_notify_timeout_sec_from, parse_openclaw_message_id, parse_task_checklist_entry,
-        queue_main_feedback_summary, queue_notification, read_jsonl, select_next_task_entry,
-        should_force_status_establish_retry, should_suppress_waiting_stuck, task_contract_line,
-        update_waiting_stuck_tracker, validate_task_done_contract_with,
+        ensure_task_agent_exists_with, ensure_waiting_merge_progress_with, extract_pr_url,
+        flush_notifications, format_orphan_blocked_notification, format_task_blocked_notification,
+        lease_window_sec, normalize_blocked_reason_for_recovery, normalize_error_reason,
+        notification_delivery_mode, openclaw_notify_timeout_sec_from, parse_openclaw_message_id,
+        parse_task_checklist_entry, queue_main_feedback_summary, queue_notification, read_jsonl,
+        select_next_task_entry, should_force_status_establish_retry, should_suppress_waiting_stuck,
+        task_contract_line, update_waiting_stuck_tracker, validate_task_done_contract_with,
     };
     use chrono::{Duration, Utc};
     use std::{
@@ -4418,6 +4507,30 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn write_mock_openclaw_script(dir: &TestRunDir) -> (PathBuf, PathBuf) {
+        let script_path = dir.path.join("mock-openclaw.sh");
+        let state_path = dir.path.join("agents.json");
+        fs::write(&state_path, r#"[{"id":"main"}]"#).expect("write mock agents state");
+        fs::write(
+            &script_path,
+            format!(
+                "#!/usr/bin/env bash\nset -euo pipefail\nSTATE_FILE=\"{}\"\nFAIL_ADD_MARKER=\"$(dirname \"$STATE_FILE\")/fail-add\"\nif [[ \"${{1:-}}\" == \"agents\" && \"${{2:-}}\" == \"list\" ]]; then\n  cat \"$STATE_FILE\"\n  exit 0\nfi\nif [[ \"${{1:-}}\" == \"agents\" && \"${{2:-}}\" == \"add\" ]]; then\n  if [[ -f \"$FAIL_ADD_MARKER\" ]]; then\n    echo \"mock add failed\" >&2\n    exit 1\n  fi\n  name=\"${{3:?missing agent id}}\"\n  python3 - <<'PY' \"$STATE_FILE\" \"$name\"\nimport json, pathlib, sys\npath = pathlib.Path(sys.argv[1])\nname = sys.argv[2]\ndata = json.loads(path.read_text())\nif not any(entry.get('id') == name for entry in data):\n    data.append({{'id': name}})\npath.write_text(json.dumps(data))\nPY\n  printf '{{\"id\":\"%s\"}}\\n' \"$name\"\n  exit 0\nfi\necho \"unsupported mock openclaw args: $*\" >&2\nexit 1\n",
+                state_path.display(),
+            ),
+        )
+        .expect("write mock openclaw script");
+        let mut perms = fs::metadata(&script_path)
+            .expect("stat mock openclaw script")
+            .permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+        }
+        fs::set_permissions(&script_path, perms).expect("chmod mock openclaw script");
+        (script_path, state_path)
     }
 
     fn test_manifest(run_dir: &Path, run_id: Uuid, deliver_openclaw: bool) -> Manifest {
@@ -5378,6 +5491,57 @@ mod tests {
             ..RunnerState::default()
         };
         assert!(!should_suppress_waiting_stuck(&runner));
+    }
+
+    #[test]
+    fn ensure_task_agent_exists_auto_creates_missing_agent() {
+        let dir = TestRunDir::new("ensure-task-agent-create");
+        let (mock_openclaw, state_path) = write_mock_openclaw_script(&dir);
+
+        let created = ensure_task_agent_exists_with(
+            mock_openclaw.to_str().expect("mock openclaw path"),
+            "loop-rta-rbac",
+            Path::new("/tmp/workspace"),
+            5,
+        )
+        .expect("create missing task agent");
+        assert!(created);
+
+        let agents: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&state_path).expect("read mock agent state"))
+                .expect("parse mock agent state");
+        assert!(agents.as_array().expect("agent state array").iter().any(
+            |entry| entry.get("id") == Some(&serde_json::Value::String("loop-rta-rbac".into()))
+        ));
+
+        let created_again = ensure_task_agent_exists_with(
+            mock_openclaw.to_str().expect("mock openclaw path"),
+            "loop-rta-rbac",
+            Path::new("/tmp/workspace"),
+            5,
+        )
+        .expect("skip existing task agent");
+        assert!(!created_again);
+    }
+
+    #[test]
+    fn ensure_task_agent_exists_surfaces_add_failure_before_start() {
+        let dir = TestRunDir::new("ensure-task-agent-fail");
+        let (mock_openclaw, _state_path) = write_mock_openclaw_script(&dir);
+        fs::write(dir.path.join("fail-add"), "1").expect("write fail-add marker");
+
+        let result = ensure_task_agent_exists_with(
+            mock_openclaw.to_str().expect("mock openclaw path"),
+            "loop-rta-rbac",
+            Path::new("/tmp/workspace"),
+            5,
+        );
+
+        let err = result.expect_err("missing task agent should fail when add fails");
+        assert!(
+            err.to_string()
+                .contains("openclaw agents add loop-rta-rbac failed")
+        );
     }
 
     #[test]

@@ -61,6 +61,9 @@ Start will fail if:
 - approval markers are missing
 - `--approved-tasklist-hash` is missing
 - current task plan hash does not match the approved hash
+- `--task-agent-id` creation/check fails before daemon start
+
+If `--task-agent-id` does not exist yet, `claw-loopd start` now auto-creates it with `openclaw agents add --workspace <repo>` before spawning the daemon.
 
 ### 4) Inspect status
 
