@@ -1503,6 +1503,7 @@ enum WaitingMergeProgress {
     Waiting,
     Merged,
     Blocked(String),
+    Retryable(String),
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1551,6 +1552,21 @@ fn auto_merge_unavailable_error(err: &str) -> bool {
     .any(|needle| lowered.contains(needle))
 }
 
+fn retryable_waiting_merge_error(err: &str) -> bool {
+    let lowered = err.to_ascii_lowercase();
+    lowered.contains("status=some(124)")
+        || lowered.contains("timed out")
+        || lowered.contains("timeout")
+}
+
+fn waiting_merge_retryable_reason(pr_url: &str, err: &str) -> String {
+    format!(
+        "waiting_merge retryable error for PR_URL={} error={}",
+        pr_url,
+        clip_text(err, 200)
+    )
+}
+
 fn ensure_waiting_merge_progress(pr_url: &str) -> Result<WaitingMergeProgress> {
     ensure_waiting_merge_progress_with(
         pr_url,
@@ -1575,7 +1591,17 @@ where
     FMerged: FnMut(&str) -> Result<bool>,
 {
     let (gh_repo, pr) = parse_github_pr_url(pr_url)?;
-    let mut view = view_fn(&gh_repo, pr)?;
+    let mut view = match view_fn(&gh_repo, pr) {
+        Ok(view) => view,
+        Err(err) => {
+            if retryable_waiting_merge_error(&err.to_string()) {
+                return Ok(WaitingMergeProgress::Retryable(
+                    waiting_merge_retryable_reason(pr_url, &err.to_string()),
+                ));
+            }
+            return Err(err);
+        }
+    };
     if view.state.eq_ignore_ascii_case("MERGED") {
         return Ok(WaitingMergeProgress::Merged);
     }
@@ -1584,7 +1610,17 @@ where
     if view.state.eq_ignore_ascii_case("OPEN") && view.auto_merge_request.is_none() {
         match arm_auto_merge_fn(&gh_repo, pr, "squash") {
             Ok(()) => {
-                view = view_fn(&gh_repo, pr)?;
+                view = match view_fn(&gh_repo, pr) {
+                    Ok(view) => view,
+                    Err(err) => {
+                        if retryable_waiting_merge_error(&err.to_string()) {
+                            return Ok(WaitingMergeProgress::Retryable(
+                                waiting_merge_retryable_reason(pr_url, &err.to_string()),
+                            ));
+                        }
+                        return Err(err);
+                    }
+                };
                 if view.state.eq_ignore_ascii_case("MERGED") {
                     return Ok(WaitingMergeProgress::Merged);
                 }
@@ -1593,6 +1629,10 @@ where
             Err(err) => {
                 if auto_merge_unavailable_error(&err.to_string()) {
                     manual_fallback = true;
+                } else if retryable_waiting_merge_error(&err.to_string()) {
+                    return Ok(WaitingMergeProgress::Retryable(
+                        waiting_merge_retryable_reason(pr_url, &err.to_string()),
+                    ));
                 } else {
                     return Err(err);
                 }
@@ -1617,12 +1657,20 @@ where
     }
 
     match merge_now_fn(&gh_repo, pr, "squash") {
-        Ok(()) => {
-            if is_merged_fn(pr_url)? {
-                Ok(WaitingMergeProgress::Merged)
-            } else {
-                Ok(WaitingMergeProgress::Waiting)
+        Ok(()) => match is_merged_fn(pr_url) {
+            Ok(true) => Ok(WaitingMergeProgress::Merged),
+            Ok(false) => Ok(WaitingMergeProgress::Waiting),
+            Err(err) if retryable_waiting_merge_error(&err.to_string()) => {
+                Ok(WaitingMergeProgress::Retryable(
+                    waiting_merge_retryable_reason(pr_url, &err.to_string()),
+                ))
             }
+            Err(err) => Err(err),
+        },
+        Err(err) if retryable_waiting_merge_error(&err.to_string()) => {
+            Ok(WaitingMergeProgress::Retryable(
+                waiting_merge_retryable_reason(pr_url, &err.to_string()),
+            ))
         }
         Err(err) => Ok(WaitingMergeProgress::Blocked(format!(
             "manual merge failed for PR_URL={} error={}",
@@ -2958,6 +3006,26 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                                     AutoRecoverBlockedOutcome::Halted => break,
                                                     AutoRecoverBlockedOutcome::NotTriggered => {}
                                                 }
+                                            }
+                                            Ok(WaitingMergeProgress::Retryable(reason)) => {
+                                                let reason = clip_text(&reason, 200);
+                                                runner_state.current_task_state =
+                                                    Some(RunnerTaskState::WaitingMerge);
+                                                runner_state.current_task_blocked_reason = None;
+                                                state.summary =
+                                                    format!("task waiting_merge: {}", entry.id);
+                                                state.waiting_reason = reason.clone();
+                                                state.updated_at = now;
+
+                                                append_event(
+                                                    &dir,
+                                                    "task_waiting_merge_retryable_error",
+                                                    serde_json::json!({
+                                                        "task_id": entry.id,
+                                                        "pr_url": pr_url,
+                                                        "reason": reason,
+                                                    }),
+                                                )?;
                                             }
                                             Err(err) => {
                                                 let err_text = clip_text(&err.to_string(), 200);
@@ -4527,7 +4595,7 @@ mod tests {
         lease_window_sec, maybe_auto_recover_blocked_task, normalize_blocked_reason_for_recovery,
         normalize_error_reason, notification_delivery_mode, openclaw_notify_timeout_sec_from,
         parse_openclaw_message_id, parse_task_checklist_entry, queue_main_feedback_summary,
-        queue_notification, read_jsonl, select_next_task_entry,
+        queue_notification, read_jsonl, retryable_waiting_merge_error, select_next_task_entry,
         should_force_status_establish_retry, should_suppress_waiting_stuck, task_contract_line,
         update_waiting_stuck_tracker, validate_task_done_contract_with, write_json,
     };
@@ -5672,6 +5740,38 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("openclaw agents add loop-rta-rbac failed")
+        );
+    }
+
+    #[test]
+    fn retryable_waiting_merge_error_matches_timeout_failures() {
+        assert!(retryable_waiting_merge_error(
+            "gh pr view failed: status=Some(124) stderr="
+        ));
+        assert!(retryable_waiting_merge_error("request timed out"));
+        assert!(!retryable_waiting_merge_error("permission denied"));
+    }
+
+    #[test]
+    fn ensure_waiting_merge_progress_returns_retryable_on_timeout() {
+        let result = ensure_waiting_merge_progress_with(
+            "https://github.com/demo/repo/pull/789",
+            |_, _| {
+                Err(anyhow::anyhow!(
+                    "gh pr view failed: status=Some(124) stderr="
+                ))
+            },
+            |_, _, _| Ok(()),
+            |_, _, _| Ok(()),
+            |_| Ok(false),
+        )
+        .expect("waiting merge progress");
+
+        assert_eq!(
+            result,
+            WaitingMergeProgress::Retryable(
+                "waiting_merge retryable error for PR_URL=https://github.com/demo/repo/pull/789 error=gh pr view failed: status=Some(124) stderr=".into()
+            )
         );
     }
 
