@@ -1567,6 +1567,17 @@ fn waiting_merge_retryable_reason(pr_url: &str, err: &str) -> String {
     )
 }
 
+fn waiting_merge_nonprogress_reason(view: &GhPrView, pr_url: &str) -> Option<String> {
+    let status = view.merge_state_status.as_deref().unwrap_or_default();
+    if status.eq_ignore_ascii_case("DIRTY") {
+        return Some(format!(
+            "PR_URL={} merge state is DIRTY (merge conflict or unmergeable branch)",
+            pr_url
+        ));
+    }
+    None
+}
+
 fn ensure_waiting_merge_progress(pr_url: &str) -> Result<WaitingMergeProgress> {
     ensure_waiting_merge_progress_with(
         pr_url,
@@ -1638,6 +1649,10 @@ where
                 }
             }
         }
+    }
+
+    if let Some(reason) = waiting_merge_nonprogress_reason(&view, pr_url) {
+        return Ok(WaitingMergeProgress::Blocked(reason));
     }
 
     if !manual_fallback {
@@ -4597,7 +4612,8 @@ mod tests {
         parse_openclaw_message_id, parse_task_checklist_entry, queue_main_feedback_summary,
         queue_notification, read_jsonl, retryable_waiting_merge_error, select_next_task_entry,
         should_force_status_establish_retry, should_suppress_waiting_stuck, task_contract_line,
-        update_waiting_stuck_tracker, validate_task_done_contract_with, write_json,
+        update_waiting_stuck_tracker, validate_task_done_contract_with,
+        waiting_merge_nonprogress_reason, write_json,
     };
     use chrono::{Duration, Utc};
     use std::{
@@ -5771,6 +5787,52 @@ mod tests {
             result,
             WaitingMergeProgress::Retryable(
                 "waiting_merge retryable error for PR_URL=https://github.com/demo/repo/pull/789 error=gh pr view failed: status=Some(124) stderr=".into()
+            )
+        );
+    }
+
+    #[test]
+    fn waiting_merge_nonprogress_reason_detects_dirty_prs() {
+        let view = GhPrView {
+            state: "OPEN".into(),
+            url: "https://github.com/demo/repo/pull/123".into(),
+            merge_state_status: Some("DIRTY".into()),
+            auto_merge_request: None,
+            status_check_rollup: vec![],
+        };
+        assert_eq!(
+            waiting_merge_nonprogress_reason(&view, "https://github.com/demo/repo/pull/123"),
+            Some(
+                "PR_URL=https://github.com/demo/repo/pull/123 merge state is DIRTY (merge conflict or unmergeable branch)".into()
+            )
+        );
+    }
+
+    #[test]
+    fn ensure_waiting_merge_progress_blocks_dirty_prs() {
+        let result = ensure_waiting_merge_progress_with(
+            "https://github.com/demo/repo/pull/253",
+            |_, _| {
+                Ok(GhPrView {
+                    state: "OPEN".into(),
+                    url: "https://github.com/demo/repo/pull/253".into(),
+                    merge_state_status: Some("DIRTY".into()),
+                    auto_merge_request: Some(
+                        serde_json::json!({"enabledAt": "2026-03-14T00:00:00Z"}),
+                    ),
+                    status_check_rollup: vec![],
+                })
+            },
+            |_, _, _| Ok(()),
+            |_, _, _| Ok(()),
+            |_| Ok(false),
+        )
+        .expect("waiting merge progress");
+
+        assert_eq!(
+            result,
+            WaitingMergeProgress::Blocked(
+                "PR_URL=https://github.com/demo/repo/pull/253 merge state is DIRTY (merge conflict or unmergeable branch)".into()
             )
         );
     }
