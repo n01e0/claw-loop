@@ -50,7 +50,7 @@ Start only after a clear yes.
 ## Loop start template
 After approval, start with explicit runner mode.
 Resolve `<discord_user_id>` from inbound `sender_id` of the request message (never hardcode in repo files).
-Resolve `<agent_id>` as project-specific loop agent id (avoid `main` when running loops in parallel).
+Resolve `<agent_id>` as project-specific loop agent id (avoid `main` when running loops in parallel). If it does not exist yet, `claw-loopd start` should auto-create it before daemon launch.
 Resolve `<feedback_thread_id>` as the main control thread for completion aggregation.
 
 ```bash
