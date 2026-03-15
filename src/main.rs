@@ -1098,6 +1098,15 @@ fn blocked_recovery_hint(reason: &str) -> &'static str {
     if normalized.contains("session file locked") || normalized.contains("task_waiting_agent_lock")
     {
         "別の agent session がロックを保持しているので、ロック解放を待つか `--task-agent-id` を分離して再実行する"
+    } else if normalized.contains("cannot be shipped as an isolated green pr")
+        || normalized.contains("still cannot be shipped as an isolated green pr")
+        || normalized.contains("isolated green pr without also doing")
+    {
+        "この task 単体では green PR にできない。依存タスクを同時に進めるか、tasklist の切り方を見直して分離不能な変更をまとめる"
+    } else if normalized.contains("merge state is dirty")
+        || normalized.contains("unmergeable branch")
+    {
+        "PR ブランチが衝突していて merge 不能。base の取り込みや競合解消コミットを入れてから再確認する"
     } else if normalized.contains("unexpected eof")
         || normalized.contains("syntax error")
         || normalized.contains("command not found")
@@ -1118,6 +1127,30 @@ fn blocked_recovery_hint(reason: &str) -> &'static str {
     }
 }
 
+fn compact_blocked_reason(reason: &str) -> String {
+    let compact = reason
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.is_empty() {
+        "不明なブロック理由".to_string()
+    } else {
+        compact
+    }
+}
+
+fn blocked_next_step(manifest: &Manifest, task_label: &str) -> &'static str {
+    if !manifest.auto_recover_blocked {
+        "次の動作: auto-recover は無効。原因を手動で直してから再実行する（または `--auto-recover-blocked` 付きで再起動する）"
+    } else if task_label.contains("-RECOVER") {
+        "次の動作: 生成された recovery task 自体が失敗したので、auto-recover はここで停止する。task 分割や依存関係を見直してから再開する"
+    } else {
+        "次の動作: auto-recover が有効なので、daemon がこの原因を解消する recovery task を自動で積んで再開する"
+    }
+}
+
 fn format_task_blocked_notification(
     manifest: &Manifest,
     task_label: &str,
@@ -1125,17 +1158,15 @@ fn format_task_blocked_notification(
     pr_url: Option<&str>,
 ) -> String {
     let mention = completion_mention_prefix(manifest);
-    let reason = if blocked_reason.trim().is_empty() {
-        "不明なブロック理由".to_string()
+    let compact_reason = compact_blocked_reason(blocked_reason);
+    let reason_summary = clip_text(&compact_reason, 240);
+    let detail_line = if compact_reason.chars().count() > 240 {
+        format!("\n- 詳細: {}", clip_text(&compact_reason, 600))
     } else {
-        clip_text(blocked_reason.trim(), 240)
+        String::new()
     };
-    let recovery = blocked_recovery_hint(&reason);
-    let next = if manifest.auto_recover_blocked {
-        "次の動作: auto-recover が有効なので、daemon がこの原因を解消する recovery task を自動で積んで再開する"
-    } else {
-        "次の動作: auto-recover は無効。原因を手動で直してから再実行する（または `--auto-recover-blocked` 付きで再起動する）"
-    };
+    let recovery = blocked_recovery_hint(&compact_reason);
+    let next = blocked_next_step(manifest, task_label);
     let pr_suffix = pr_url
         .map(str::trim)
         .filter(|v| !v.is_empty())
@@ -1143,7 +1174,7 @@ fn format_task_blocked_notification(
         .unwrap_or_default();
 
     format!(
-        "{mention}タスクが block された: {task_label}{pr_suffix}\n- 原因: {reason}\n- 解決方法: {recovery}\n- {next}"
+        "{mention}タスクが block された: {task_label}{pr_suffix}\n- 原因: {reason_summary}{detail_line}\n- 解決方法: {recovery}\n- {next}"
     )
 }
 
@@ -5176,6 +5207,28 @@ mod tests {
         assert!(msg.contains("- 解決方法:"));
         assert!(msg.contains("次の動作: auto-recover が有効"));
         assert!(msg.contains("PR_URL=https://github.com/n01e0/claw-loop/pull/999"));
+    }
+
+    #[test]
+    fn format_task_blocked_notification_shows_detail_and_recovery_halt_for_recover_task() {
+        let run = TestRunDir::new("blocked-notify-recover");
+        let run_id = Uuid::new_v4();
+        let mut manifest = test_manifest(&run.path, run_id, false);
+        manifest.auto_recover_blocked = true;
+
+        let msg = format_task_blocked_notification(
+            &manifest,
+            "B2-RECOVER",
+            "runner exit=Some(2): TASK_BLOCKED: B2 still cannot be shipped as an isolated green PR without also doing B3, because the current runtime response types/handlers still expose the very staff-visible fields the requested regression needs to change before this can pass in isolation",
+            None,
+        );
+
+        assert!(msg.contains("- 詳細:"));
+        assert!(msg.contains("green PR"));
+        assert!(msg.contains("依存タスクを同時に進めるか"));
+        assert!(msg.contains(
+            "生成された recovery task 自体が失敗したので、auto-recover はここで停止する"
+        ));
     }
 
     #[test]
