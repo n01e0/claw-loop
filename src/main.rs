@@ -1224,15 +1224,18 @@ fn emit_all_tasks_completed_notifications(
     manifest: &Manifest,
     runner_state: &RunnerState,
     task_done_now: u64,
+    now: DateTime<Utc>,
 ) -> Result<()> {
     let mention = completion_mention_prefix(manifest);
     let last_task = runner_state
         .last_task_id
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
+    let total_elapsed =
+        format_elapsed_compact((now - manifest.started_at).num_seconds().max(0) as u64);
     let summary = format!(
-        "{mention}all tasks completed (run_id={}, loops_started={}, done={}, last_task={}); waiting for instruction",
-        manifest.run_id, runner_state.task_loops_started, task_done_now, last_task,
+        "{mention}all tasks completed (run_id={}, loops_started={}, done={}, last_task={}, total_elapsed={}); waiting for instruction",
+        manifest.run_id, runner_state.task_loops_started, task_done_now, last_task, total_elapsed,
     );
 
     queue_notification(run_dir, manifest, "all_tasks_completed", summary.clone())?;
@@ -3188,6 +3191,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             &manifest,
                             &runner_state,
                             task_done_now,
+                            now,
                         )?;
 
                         append_event(
@@ -4942,13 +4946,11 @@ mod tests {
             ..RunnerState::default()
         };
 
-        emit_all_tasks_completed_notifications(
-            &run.path,
-            &test_manifest(&run.path, run_id, false),
-            &runner,
-            3,
-        )
-        .expect("emit all tasks completed notifications");
+        let manifest = test_manifest(&run.path, run_id, false);
+        let now = manifest.started_at + Duration::seconds(3723);
+
+        emit_all_tasks_completed_notifications(&run.path, &manifest, &runner, 3, now)
+            .expect("emit all tasks completed notifications");
 
         let dispatched =
             read_jsonl::<DispatchedNotification>(&run.path.join("notify-dispatched.jsonl"))
@@ -4957,6 +4959,7 @@ mod tests {
         assert_eq!(dispatched[0].kind, "all_tasks_completed");
         assert!(dispatched[0].message.contains("all tasks completed"));
         assert!(dispatched[0].message.contains("last_task=S4-2"));
+        assert!(dispatched[0].message.contains("total_elapsed=1h02m03s"));
 
         assert!(
             read_jsonl::<Notification>(&run.path.join("notify-queue.jsonl"))
@@ -4979,7 +4982,8 @@ mod tests {
         manifest.feedback_channel = Some("discord".to_string());
         manifest.feedback_thread_id = Some("main-thread".to_string());
 
-        emit_all_tasks_completed_notifications(&run.path, &manifest, &runner, 4)
+        let now = manifest.started_at + Duration::seconds(65);
+        emit_all_tasks_completed_notifications(&run.path, &manifest, &runner, 4, now)
             .expect("emit all tasks completed notifications");
 
         let dispatched =
