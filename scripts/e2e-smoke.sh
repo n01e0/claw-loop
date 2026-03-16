@@ -1142,6 +1142,65 @@ PY
 $BIN stop --repo "$WORKDIR" --run-id "$RUN13" --immediate >/dev/null || true
 sleep 1
 
+echo "[e2e-smoke] case13b auto-recover halt notification for failed recovery task"
+TASKFILE13B="$WORKDIR/docs/roadmaps/s5-case13b-tasklist.md"
+mkdir -p "$(dirname "$TASKFILE13B")"
+cat > "$TASKFILE13B" <<'EOF'
+- [ ] S5X-13B: blocked sample task for halt
+EOF
+
+APPROVED13B="$(approve_task_file "$TASKFILE13B")"
+OUT13B="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-ok" CLAW_LOOPD_GH_BIN="$MOCKDIR/gh" $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw --task-file "$TASKFILE13B" --task-runner-cmd 'if [[ "$CLAW_TASK_ID" == *"-RECOVER"* ]]; then echo "recovery still blocked" >&2; exit 2; fi; echo "initial blocked" >&2; exit 2' --auto-recover-blocked --approved-tasklist-hash "$APPROVED13B")"
+RUN13B="$(echo "$OUT13B" | awk -F= '/^run_id=/{print $2}')"
+if [[ -z "$RUN13B" ]]; then
+  echo "[e2e-smoke] failed to parse run13b id"
+  echo "$OUT13B"
+  exit 1
+fi
+
+STATUS13B=""
+for _ in {1..25}; do
+  STATUS13B="$($BIN status --repo "$WORKDIR" --run-id "$RUN13B")"
+  if python3 - <<'PY' "$STATUS13B"
+import json, sys
+obj = json.loads(sys.argv[1])
+runner = obj.get("runner") or {}
+ok = (
+    obj.get("status") == "stopped"
+    and isinstance(runner.get("pause_reason"), str)
+    and "generated recovery task failed" in runner.get("pause_reason")
+)
+raise SystemExit(0 if ok else 1)
+PY
+  then
+    break
+  fi
+  sleep 1
+done
+
+python3 - <<'PY' "$STATUS13B" "$WORKDIR/.ralph/runs/$RUN13B/notify-dispatched.jsonl"
+import json, pathlib, sys
+status = json.loads(sys.argv[1])
+dispatched_path = pathlib.Path(sys.argv[2])
+
+runner = status.get("runner") or {}
+pause_reason = runner.get("pause_reason") or ""
+if "generated recovery task failed" not in pause_reason:
+    raise SystemExit(f"expected generated recovery task failure pause_reason, got {pause_reason!r}")
+
+dispatched = [json.loads(line) for line in dispatched_path.read_text().splitlines() if line.strip()]
+halt_notes = [d for d in dispatched if d.get("kind") == "task_recovery_halted"]
+if not halt_notes:
+    raise SystemExit(f"expected task_recovery_halted notification, got {dispatched}")
+msg = halt_notes[-1].get("message") or ""
+for needle in ["- 停止理由:", "- 原因:", "- 次に見るポイント:", "- 失敗した recovery task:", "- 元タスク: S5X-13B", "- stderr: recovery still blocked", "- 手動での解決方針:"]:
+    if needle not in msg:
+        raise SystemExit(f"expected {needle!r} in recovery halt notification, got: {msg!r}")
+PY
+
+$BIN stop --repo "$WORKDIR" --run-id "$RUN13B" --immediate >/dev/null || true
+sleep 1
+
 echo "[e2e-smoke] case14 rl-task-agent ignores leading empty payload before TASK_DONE"
 RUNNER_MOCKDIR="$WORKDIR/mockbin-runner"
 mkdir -p "$RUNNER_MOCKDIR"
