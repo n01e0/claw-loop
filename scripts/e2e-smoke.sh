@@ -1076,7 +1076,7 @@ cat > "$TASKFILE13" <<'EOF'
 EOF
 
 APPROVED13="$(approve_task_file "$TASKFILE13")"
-OUT13="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-ok" CLAW_LOOPD_GH_BIN="$MOCKDIR/gh" $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw --task-file "$TASKFILE13" --task-runner-cmd 'if [[ "$CLAW_TASK_ID" == *"-RECOVER"* ]]; then echo "TASK_DONE PR_URL=https://example.invalid/pr/313"; exit 0; fi; echo "simulated blocked" >&2; exit 2' --auto-recover-blocked --approved-tasklist-hash "$APPROVED13")"
+OUT13="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-ok" CLAW_LOOPD_GH_BIN="$MOCKDIR/gh" $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw --task-file "$TASKFILE13" --task-runner-cmd 'if [[ "$CLAW_TASK_ID" == *"-RECOVER"* ]]; then echo "TASK_DONE PR_URL=https://example.invalid/pr/313"; exit 0; fi; printf "simulated blocked\nmissing fixture in generated workspace\n" >&2; exit 2' --auto-recover-blocked --approved-tasklist-hash "$APPROVED13")"
 RUN13="$(echo "$OUT13" | awk -F= '/^run_id=/{print $2}')"
 if [[ -z "$RUN13" ]]; then
   echo "[e2e-smoke] failed to parse run13 id"
@@ -1125,6 +1125,14 @@ if not any(e.get("kind") == "task_blocked_auto_recovered" for e in events):
     raise SystemExit("expected task_blocked_auto_recovered event")
 
 dispatched = [json.loads(line) for line in dispatched_path.read_text().splitlines() if line.strip()]
+blocked_notes = [d for d in dispatched if d.get("kind") == "task_blocked"]
+if not blocked_notes:
+    raise SystemExit(f"expected task_blocked notification, got {dispatched}")
+blocked_msg = blocked_notes[-1].get("message") or ""
+for needle in ["- 原因: runner exit=Some(2): simulated blocked", "- 詳細: runner exit=Some(2): simulated blocked missing fixture in generated workspace", "- 解決方法:"]:
+    if needle not in blocked_msg:
+        raise SystemExit(f"expected {needle!r} in blocked notification, got: {blocked_msg!r}")
+
 recovery_notes = [d for d in dispatched if d.get("kind") == "task_recovery_decision"]
 if not recovery_notes:
     raise SystemExit(f"expected task_recovery_decision notification, got {dispatched}")
@@ -1132,6 +1140,15 @@ msg = recovery_notes[-1].get("message") or ""
 for needle in ["- 原因:", "- 解決方針:", "- 実際に積んだ recovery task:", "- 状態: auto-recover 継続"]:
     if needle not in msg:
         raise SystemExit(f"expected {needle!r} in recovery decision notification, got: {msg!r}")
+
+kind_order = [d.get("kind") for d in dispatched]
+try:
+    blocked_idx = kind_order.index("task_blocked")
+    decision_idx = kind_order.index("task_recovery_decision")
+except ValueError as exc:
+    raise SystemExit(f"expected blocked and decision notifications, got {kind_order}") from exc
+if blocked_idx >= decision_idx:
+    raise SystemExit(f"expected task_blocked before task_recovery_decision, got {kind_order}")
 
 runner = status.get("runner") or {}
 last_id = runner.get("last_task_id")
@@ -1189,6 +1206,10 @@ if "generated recovery task failed" not in pause_reason:
     raise SystemExit(f"expected generated recovery task failure pause_reason, got {pause_reason!r}")
 
 dispatched = [json.loads(line) for line in dispatched_path.read_text().splitlines() if line.strip()]
+blocked_notes = [d for d in dispatched if d.get("kind") == "task_blocked"]
+if not blocked_notes:
+    raise SystemExit(f"expected task_blocked notification for halt path, got {dispatched}")
+
 halt_notes = [d for d in dispatched if d.get("kind") == "task_recovery_halted"]
 if not halt_notes:
     raise SystemExit(f"expected task_recovery_halted notification, got {dispatched}")
@@ -1196,6 +1217,15 @@ msg = halt_notes[-1].get("message") or ""
 for needle in ["- 停止理由:", "- 原因:", "- 次に見るポイント:", "- 失敗した recovery task:", "- 元タスク: S5X-13B", "- stderr: recovery still blocked", "- 手動での解決方針:"]:
     if needle not in msg:
         raise SystemExit(f"expected {needle!r} in recovery halt notification, got: {msg!r}")
+
+kind_order = [d.get("kind") for d in dispatched]
+try:
+    blocked_idx = kind_order.index("task_blocked")
+    halt_idx = kind_order.index("task_recovery_halted")
+except ValueError as exc:
+    raise SystemExit(f"expected blocked and halted notifications, got {kind_order}") from exc
+if blocked_idx >= halt_idx:
+    raise SystemExit(f"expected task_blocked before task_recovery_halted, got {kind_order}")
 PY
 
 $BIN stop --repo "$WORKDIR" --run-id "$RUN13B" --immediate >/dev/null || true
