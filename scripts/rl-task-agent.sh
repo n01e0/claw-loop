@@ -304,6 +304,40 @@ handle_waiting_pr() {
   return 10
 }
 
+fetch_detailed_rulesets_json() {
+  local gh_repo="$1"
+  local ruleset_ids details_json
+
+  ruleset_ids="$(gh api "repos/${gh_repo}/rulesets" --jq '.[]?.id' 2>/dev/null || true)"
+  if [[ -z "$ruleset_ids" ]]; then
+    echo '[]'
+    return 0
+  fi
+
+  details_json="$({
+    while IFS= read -r ruleset_id; do
+      [[ -n "$ruleset_id" ]] || continue
+      gh api "repos/${gh_repo}/rulesets/${ruleset_id}" 2>/dev/null || true
+      printf '\n'
+    done <<<"$ruleset_ids"
+  } | python3 -c 'import json,sys; rows=[]
+for raw in sys.stdin:
+    raw=raw.strip()
+    if not raw:
+        continue
+    try:
+        rows.append(json.loads(raw))
+    except Exception:
+        pass
+print(json.dumps(rows, ensure_ascii=False))')"
+
+  if [[ -z "$details_json" ]]; then
+    echo '[]'
+  else
+    printf '%s\n' "$details_json"
+  fi
+}
+
 required_checks_missing_warning() {
   local pr_url="$1"
   if [[ -z "$pr_url" ]]; then
@@ -329,7 +363,7 @@ required_checks_missing_warning() {
     return 0
   fi
 
-  rulesets_json="$(gh api "repos/${gh_repo}/rulesets" 2>/dev/null || echo '[]')"
+  rulesets_json="$(fetch_detailed_rulesets_json "$gh_repo")"
 
   if REQ_CHECKS_ENFORCED="$(RULESETS_JSON="$rulesets_json" BASE_BRANCH="$base_branch" DEFAULT_BRANCH="$default_branch" python3 - <<'PY'
 import json, os

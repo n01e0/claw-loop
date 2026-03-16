@@ -1305,4 +1305,86 @@ if [[ "$OUT15" != *"TASK_DONE PR_URL=https://github.com/demo/repo/pull/315"* ]];
   exit 1
 fi
 
+echo "[e2e-smoke] case16 rl-task-agent sees required checks from ruleset detail endpoint"
+RULESET_MOCKDIR="$WORKDIR/mockbin-ruleset"
+mkdir -p "$RULESET_MOCKDIR"
+cat > "$RULESET_MOCKDIR/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "api" && "${2:-}" == "repos/demo/repo" ]]; then
+  echo 'main'
+  exit 0
+fi
+if [[ "${1:-}" == "api" && "${2:-}" == "repos/demo/repo/branches/feature/user/protection" ]]; then
+  echo 'not protected' >&2
+  exit 1
+fi
+if [[ "${1:-}" == "api" && "${2:-}" == "repos/demo/repo/rulesets" ]]; then
+  if [[ "${3:-}" == "--jq" ]]; then
+    echo '12451868'
+  else
+    cat <<'JSON'
+[{"id":12451868,"name":"main","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH","refs/heads/feature/user"],"exclude":[]}},"rules":null}]
+JSON
+  fi
+  exit 0
+fi
+if [[ "${1:-}" == "api" && "${2:-}" == "repos/demo/repo/rulesets/12451868" ]]; then
+  cat <<'JSON'
+{"id":12451868,"name":"main","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH","refs/heads/feature/user"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"rust","integration_id":15368}]}}]}
+JSON
+  exit 0
+fi
+if [[ "${1:-}" == "pr" && "${2:-}" == "view" ]]; then
+  joined="$*"
+  if [[ "$joined" == *"baseRefName"* ]]; then
+    echo 'feature/user'
+    exit 0
+  fi
+  if [[ "$joined" == *"state,mergedAt"* ]]; then
+    echo 'OPEN|'
+    exit 0
+  fi
+  if [[ "$joined" == *"state,autoMergeRequest"* ]]; then
+    echo '1'
+    exit 0
+  fi
+  if [[ "$joined" == *"statusCheckRollup"* ]]; then
+    echo ''
+    exit 0
+  fi
+fi
+if [[ "${1:-}" == "pr" && "${2:-}" == "merge" ]]; then
+  exit 0
+fi
+
+echo "unsupported mock gh args: $*" >&2
+exit 1
+EOF
+chmod +x "$RULESET_MOCKDIR/gh"
+mkdir -p "$WORKDIR/.ralph/runner-agent-state/run16"
+cat > "$WORKDIR/.ralph/runner-agent-state/run16/S5X-16.env" <<'EOF'
+PR_URL='https://github.com/demo/repo/pull/316'
+EOF
+set +e
+OUT16="$(cd "$WORKDIR" && PATH="$RULESET_MOCKDIR:$PATH" CLAW_GH_REPO="demo/repo" CLAW_TASK_ID="S5X-16" CLAW_TASK_TEXT="ruleset detail required checks" CLAW_RUN_ID="run16" bash /home/shioriko/src/github.com/n01e0/claw-loop/scripts/rl-task-agent.sh)"
+RC16=$?
+set -e
+if [[ "$RC16" -ne 10 ]]; then
+  echo "[e2e-smoke] expected case16 rc=10, got $RC16"
+  printf '%s\n' "$OUT16"
+  exit 1
+fi
+FIRST16="$(printf '%s\n' "$OUT16" | awk 'NF { print; exit }')"
+if [[ "$FIRST16" != "TASK_WAITING_MERGE PR_URL=https://github.com/demo/repo/pull/316" ]]; then
+  echo "[e2e-smoke] unexpected case16 first line"
+  printf '%s\n' "$OUT16"
+  exit 1
+fi
+if [[ "$OUT16" == *"WARN_REQUIRED_CHECKS_MISSING=1"* ]]; then
+  echo "[e2e-smoke] case16 should not warn when ruleset detail enforces checks"
+  printf '%s\n' "$OUT16"
+  exit 1
+fi
+
 echo "[e2e-smoke] ok"
