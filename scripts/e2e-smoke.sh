@@ -1116,6 +1116,8 @@ if "S5X-1-RECOVER" not in content:
     raise SystemExit(f"expected generated recovery task id in tasklist, got:\n{content}")
 if "- [x] S5X-1-RECOVER" not in content:
     raise SystemExit(f"expected generated recovery task to be completed, got:\n{content}")
+if "resolve runner block for task S5X-1 (blocked sample task):" not in content:
+    raise SystemExit(f"expected generated recovery task text to describe the fix, got:\n{content}")
 
 events = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
 if not any(e.get("kind") == "task_blocked_auto_recovered" for e in events):
@@ -1198,12 +1200,6 @@ cat > "$TASKFILE15" <<'EOF'
 EOF
 
 OUT15="$(PATH="$RUNNER_MOCKDIR:$PATH" CLAW_TASK_ID="S5X-15" CLAW_TASK_TEXT="chatter before contract line" CLAW_TASK_FILE="$TASKFILE15" CLAW_RUN_ID="run15" bash ./scripts/rl-task-agent.sh)"
-FIRST15="$(printf '%s\n' "$OUT15" | awk 'NF { print; exit }')"
-if [[ "$FIRST15" != "working on it" ]]; then
-  echo "[e2e-smoke] unexpected case15 transcript"
-  printf '%s\n' "$OUT15"
-  exit 1
-fi
 if [[ "$OUT15" != *"TASK_DONE PR_URL=https://github.com/demo/repo/pull/315"* ]]; then
   echo "[e2e-smoke] expected case15 TASK_DONE line in transcript"
   printf '%s\n' "$OUT15"

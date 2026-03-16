@@ -190,11 +190,11 @@ pub(crate) fn write_task_approval(file: &Path, approved_by: &str) -> Result<Task
     task_approval_status(file)
 }
 
-fn clip_recovery_reason(reason: &str, max_chars: usize) -> String {
-    let flat = reason.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+fn clip_recovery_task_text(text: &str, blocked_id: &str, max_chars: usize) -> String {
+    let flat = text.lines().map(str::trim).collect::<Vec<_>>().join(" ");
     let clipped: String = flat.chars().take(max_chars).collect();
     if clipped.trim().is_empty() {
-        "blocked without reason".to_string()
+        format!("resolve blocked task {blocked_id}")
     } else {
         clipped
     }
@@ -203,7 +203,7 @@ fn clip_recovery_reason(reason: &str, max_chars: usize) -> String {
 pub(crate) fn append_recovery_task_for_blocked(
     file: &Path,
     blocked_id: &str,
-    blocked_reason: &str,
+    recovery_task_text: &str,
 ) -> Result<TaskChecklistEntry> {
     let (content, mut lines, entries) = load_task_checklist(file)?;
     let had_trailing_newline = content.ends_with('\n');
@@ -221,8 +221,7 @@ pub(crate) fn append_recovery_task_for_blocked(
         suffix = suffix.saturating_add(1);
     }
 
-    let clipped_reason = clip_recovery_reason(blocked_reason, 160);
-    let text = format!("auto-recover from {blocked_id}: {clipped_reason}");
+    let text = clip_recovery_task_text(recovery_task_text, blocked_id, 240);
     lines.push(format!("- [ ] {}: {}", candidate, text));
 
     let mut rebuilt = lines.join("\n");
@@ -374,16 +373,21 @@ mod tests {
         )
         .expect("write file");
 
-        let entry =
-            append_recovery_task_for_blocked(&file, "S5-6", "runner exit=2: command failed")
-                .expect("append recovery task");
+        let entry = append_recovery_task_for_blocked(
+            &file,
+            "S5-6",
+            "resolve runner block for task S5-6: restore missing command path",
+        )
+        .expect("append recovery task");
 
         assert_eq!(entry.id, "S5-6-RECOVER-2");
         assert!(!entry.done);
-        assert!(entry.text.contains("auto-recover from S5-6"));
+        assert!(entry.text.contains("resolve runner block for task S5-6"));
 
         let content = fs::read_to_string(&file).expect("read file");
-        assert!(content.contains("- [ ] S5-6-RECOVER-2: auto-recover from S5-6"));
+        assert!(content.contains(
+            "- [ ] S5-6-RECOVER-2: resolve runner block for task S5-6: restore missing command path"
+        ));
     }
 
     #[test]
@@ -391,12 +395,17 @@ mod tests {
         let file = temp_file("append-recovery-clip");
         fs::write(&file, "- [ ] S5-6: blocked base\n").expect("write file");
 
-        let long_reason = "line1\nline2\n".to_string() + &"x".repeat(300);
-        let entry = append_recovery_task_for_blocked(&file, "S5-6", &long_reason)
+        let long_text = "resolve runner block for task S5-6: ".to_string() + &"x".repeat(400);
+        let entry = append_recovery_task_for_blocked(&file, "S5-6", &long_text)
             .expect("append recovery task");
 
-        assert!(entry.text.len() < 260);
+        assert!(entry.text.len() <= 240);
         assert!(!entry.text.contains('\n'));
+        assert!(
+            entry
+                .text
+                .starts_with("resolve runner block for task S5-6:")
+        );
     }
 
     #[test]
