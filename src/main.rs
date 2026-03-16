@@ -262,6 +262,67 @@ enum RunnerTaskState {
     Done,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BlockedContextSource {
+    RunnerExit,
+    WaitingMerge,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AutoRecoverDecisionState {
+    Queued,
+    Halted,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+struct RecoveryTaskSnapshot {
+    id: String,
+    line: usize,
+    text: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+struct AutoRecoverDecisionSnapshot {
+    state: AutoRecoverDecisionState,
+    decided_at: DateTime<Utc>,
+    reason_key: String,
+    attempts: u64,
+    same_reason_count: u64,
+    max_attempts: u64,
+    #[serde(default)]
+    guard_reason: Option<String>,
+    #[serde(default)]
+    recovery_task: Option<RecoveryTaskSnapshot>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+struct BlockedContext {
+    task_id: String,
+    #[serde(default)]
+    task_text: Option<String>,
+    #[serde(default)]
+    task_line: Option<usize>,
+    #[serde(default)]
+    pr_url: Option<String>,
+    source: BlockedContextSource,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    blocked_at: DateTime<Utc>,
+    reason_summary: String,
+    #[serde(default)]
+    reason_detail: Option<String>,
+    #[serde(default)]
+    runner_stdout_excerpt: Option<String>,
+    #[serde(default)]
+    runner_stderr_excerpt: Option<String>,
+    #[serde(default)]
+    recovery_hint: Option<String>,
+    #[serde(default)]
+    auto_recover: Option<AutoRecoverDecisionSnapshot>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 struct RunnerState {
     #[serde(default, alias = "active_task_id")]
@@ -277,6 +338,8 @@ struct RunnerState {
     #[serde(default)]
     current_task_blocked_reason: Option<String>,
     #[serde(default)]
+    current_blocked_context: Option<BlockedContext>,
+    #[serde(default)]
     current_task_pr_url: Option<String>,
     #[serde(default)]
     last_task_id: Option<String>,
@@ -286,6 +349,8 @@ struct RunnerState {
     last_task_at: Option<DateTime<Utc>>,
     #[serde(default)]
     last_task_reason: Option<String>,
+    #[serde(default)]
+    last_blocked_context: Option<BlockedContext>,
     #[serde(default)]
     last_task_pr_url: Option<String>,
     #[serde(default)]
@@ -1055,6 +1120,132 @@ fn clip_text(input: &str, max_chars: usize) -> String {
     format!("{clipped}…")
 }
 
+fn clip_optional_text(input: &str, max_chars: usize) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(clip_text(trimmed, max_chars))
+    }
+}
+
+fn compact_multiline(input: &str) -> Option<String> {
+    let compact = input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.is_empty() {
+        None
+    } else {
+        Some(compact)
+    }
+}
+
+fn blocked_reason_detail_from_runner(stderr: &str, stdout: &str) -> Option<String> {
+    if let Some(stderr_detail) = compact_multiline(stderr) {
+        return Some(clip_text(&stderr_detail, 1200));
+    }
+
+    if let Some(contract_line) = task_contract_line(stdout) {
+        return Some(clip_text(&contract_line, 1200));
+    }
+
+    compact_multiline(stdout).map(|detail| clip_text(&detail, 1200))
+}
+
+fn build_runner_blocked_context(
+    task: Option<&TaskChecklistEntry>,
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    pr_url: Option<&str>,
+    blocked_at: DateTime<Utc>,
+) -> BlockedContext {
+    let reason_core = blocked_reason_from_runner(stderr, stdout);
+    let reason_summary = format!("runner exit={exit_code:?}: {reason_core}");
+    let reason_detail = blocked_reason_detail_from_runner(stderr, stdout)
+        .map(|detail| format!("runner exit={exit_code:?}: {detail}"))
+        .filter(|detail| detail != &reason_summary);
+    let recovery_hint = blocked_recovery_hint(&reason_summary).to_string();
+
+    BlockedContext {
+        task_id: task
+            .map(|entry| entry.id.clone())
+            .unwrap_or_else(|| "unknown".to_string()),
+        task_text: task.map(|entry| entry.text.clone()),
+        task_line: task.map(|entry| entry.line_no),
+        pr_url: pr_url.map(ToOwned::to_owned),
+        source: BlockedContextSource::RunnerExit,
+        exit_code,
+        blocked_at,
+        reason_summary,
+        reason_detail,
+        runner_stdout_excerpt: clip_optional_text(stdout, 2000),
+        runner_stderr_excerpt: clip_optional_text(stderr, 2000),
+        recovery_hint: Some(recovery_hint),
+        auto_recover: None,
+    }
+}
+
+fn build_waiting_merge_blocked_context(
+    task: &TaskChecklistEntry,
+    pr_url: Option<&str>,
+    reason: &str,
+    blocked_at: DateTime<Utc>,
+) -> BlockedContext {
+    let compact_reason = compact_blocked_reason(reason);
+    let reason_summary = clip_text(&compact_reason, 200);
+    let reason_detail = clip_optional_text(reason, 1200).filter(|detail| detail != &reason_summary);
+    let recovery_hint = blocked_recovery_hint(&compact_reason).to_string();
+
+    BlockedContext {
+        task_id: task.id.clone(),
+        task_text: Some(task.text.clone()),
+        task_line: Some(task.line_no),
+        pr_url: pr_url.map(ToOwned::to_owned),
+        source: BlockedContextSource::WaitingMerge,
+        exit_code: None,
+        blocked_at,
+        reason_summary,
+        reason_detail,
+        runner_stdout_excerpt: None,
+        runner_stderr_excerpt: None,
+        recovery_hint: Some(recovery_hint),
+        auto_recover: None,
+    }
+}
+
+fn apply_blocked_context(
+    runner_state: &mut RunnerState,
+    state: &mut State,
+    context: &BlockedContext,
+    now: DateTime<Utc>,
+) {
+    runner_state.current_task_state = Some(RunnerTaskState::Blocked);
+    runner_state.current_task_blocked_reason = Some(context.reason_summary.clone());
+    runner_state.current_blocked_context = Some(context.clone());
+    runner_state.current_task_pr_url = context.pr_url.clone();
+    runner_state.last_task_id = Some(context.task_id.clone());
+    runner_state.last_task_state = Some(RunnerTaskState::Blocked);
+    runner_state.last_task_at = Some(now);
+    runner_state.last_task_reason = Some(context.reason_summary.clone());
+    runner_state.last_blocked_context = Some(context.clone());
+    runner_state.last_task_pr_url = context.pr_url.clone();
+
+    state.version += 1;
+    state.status = LoopStatus::Blocked;
+    state.summary = format!("task blocked: {}", context.task_id);
+    state.waiting_reason = context.reason_summary.clone();
+    state.updated_at = now;
+}
+
+fn clear_current_blocked_context(runner_state: &mut RunnerState) {
+    runner_state.current_task_blocked_reason = None;
+    runner_state.current_blocked_context = None;
+}
+
 fn format_local_as_of(ts: DateTime<Utc>) -> String {
     ts.with_timezone(&Local)
         .format("%Y-%m-%d %H:%M:%S %Z")
@@ -1151,30 +1342,38 @@ fn blocked_next_step(manifest: &Manifest, task_label: &str) -> &'static str {
     }
 }
 
-fn format_task_blocked_notification(
-    manifest: &Manifest,
-    task_label: &str,
-    blocked_reason: &str,
-    pr_url: Option<&str>,
-) -> String {
+fn format_task_blocked_notification(manifest: &Manifest, blocked: &BlockedContext) -> String {
     let mention = completion_mention_prefix(manifest);
-    let compact_reason = compact_blocked_reason(blocked_reason);
+    let compact_reason = compact_blocked_reason(&blocked.reason_summary);
     let reason_summary = clip_text(&compact_reason, 240);
-    let detail_line = if compact_reason.chars().count() > 240 {
+    let detail_source = blocked
+        .reason_detail
+        .as_deref()
+        .unwrap_or(blocked.reason_summary.as_str());
+    let compact_detail = compact_blocked_reason(detail_source);
+    let detail_line = if compact_detail != compact_reason {
+        format!("\n- 詳細: {}", clip_text(&compact_detail, 600))
+    } else if compact_reason.chars().count() > 240 {
         format!("\n- 詳細: {}", clip_text(&compact_reason, 600))
     } else {
         String::new()
     };
-    let recovery = blocked_recovery_hint(&compact_reason);
-    let next = blocked_next_step(manifest, task_label);
-    let pr_suffix = pr_url
+    let recovery = blocked
+        .recovery_hint
+        .as_deref()
+        .unwrap_or_else(|| blocked_recovery_hint(&compact_reason));
+    let next = blocked_next_step(manifest, &blocked.task_id);
+    let pr_suffix = blocked
+        .pr_url
+        .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(|v| format!(" PR_URL={v}"))
         .unwrap_or_default();
 
     format!(
-        "{mention}タスクが block された: {task_label}{pr_suffix}\n- 原因: {reason_summary}{detail_line}\n- 解決方法: {recovery}\n- {next}"
+        "{mention}タスクが block された: {}{pr_suffix}\n- 原因: {reason_summary}{detail_line}\n- 解決方法: {recovery}\n- {next}",
+        blocked.task_id
     )
 }
 
@@ -1286,6 +1485,13 @@ fn normalize_blocked_reason_for_recovery(reason: &str) -> String {
     clip_text(&compact, 160)
 }
 
+fn blocked_reason_seed_for_auto_recovery(blocked: &BlockedContext) -> &str {
+    blocked
+        .reason_detail
+        .as_deref()
+        .unwrap_or(blocked.reason_summary.as_str())
+}
+
 fn auto_recover_guard_reason(
     blocked_task_id: &str,
     reason_key: &str,
@@ -1326,7 +1532,7 @@ fn maybe_auto_recover_blocked_task(
     task_file_abs: &Path,
     runner_state: &mut RunnerState,
     state: &mut State,
-    blocked_task_id: &str,
+    blocked: &BlockedContext,
     now: DateTime<Utc>,
     task_done_now: &mut u64,
     task_loops_completed: &mut u64,
@@ -1335,7 +1541,9 @@ fn maybe_auto_recover_blocked_task(
         return Ok(AutoRecoverBlockedOutcome::NotTriggered);
     }
 
-    let reason_key = normalize_blocked_reason_for_recovery(&state.waiting_reason);
+    let blocked_task_id = blocked.task_id.as_str();
+    let reason_key =
+        normalize_blocked_reason_for_recovery(blocked_reason_seed_for_auto_recovery(blocked));
     let guard_reason = auto_recover_guard_reason(
         blocked_task_id,
         &reason_key,
@@ -1351,6 +1559,22 @@ fn maybe_auto_recover_blocked_task(
             .auto_recover_same_reason_count
             .saturating_add(1);
         runner_state.auto_recover_last_at = Some(now);
+
+        let mut blocked_snapshot = blocked.clone();
+        blocked_snapshot.auto_recover = Some(AutoRecoverDecisionSnapshot {
+            state: AutoRecoverDecisionState::Halted,
+            decided_at: now,
+            reason_key: reason_key.clone(),
+            attempts: runner_state.auto_recover_attempts,
+            same_reason_count: runner_state.auto_recover_same_reason_count,
+            max_attempts: manifest.auto_recover_blocked_max_attempts,
+            guard_reason: Some(reason.clone()),
+            recovery_task: None,
+        });
+        runner_state.last_blocked_context = Some(blocked_snapshot.clone());
+        if runner_state.current_blocked_context.is_some() {
+            runner_state.current_blocked_context = Some(blocked_snapshot.clone());
+        }
         write_runner_state(run_dir, runner_state)?;
 
         state.status = LoopStatus::Stopped;
@@ -1368,6 +1592,7 @@ fn maybe_auto_recover_blocked_task(
                 "guard_reason": reason,
                 "attempts": runner_state.auto_recover_attempts,
                 "max_attempts": manifest.auto_recover_blocked_max_attempts,
+                "blocked_context": blocked_snapshot,
             }),
         )?;
 
@@ -1377,7 +1602,7 @@ fn maybe_auto_recover_blocked_task(
     }
 
     let recovery_task =
-        append_recovery_task_for_blocked(task_file_abs, blocked_task_id, &state.waiting_reason)?;
+        append_recovery_task_for_blocked(task_file_abs, blocked_task_id, &blocked.reason_summary)?;
     sync_manifest_tasklist_hash(manifest_path, manifest, task_file_abs)?;
     let _ = update_task_check(task_file_abs, blocked_task_id, true)?;
     *task_done_now = task_checklist_done_count(task_file_abs)?;
@@ -1391,16 +1616,34 @@ fn maybe_auto_recover_blocked_task(
     } else {
         runner_state.auto_recover_same_reason_count = 1;
     }
-    runner_state.auto_recover_last_reason = Some(reason_key);
+    runner_state.auto_recover_last_reason = Some(reason_key.clone());
     runner_state.auto_recover_last_task_id = Some(recovery_task.id.clone());
     runner_state.auto_recover_last_at = Some(now);
+
+    let recovery_task_snapshot = RecoveryTaskSnapshot {
+        id: recovery_task.id.clone(),
+        line: recovery_task.line_no,
+        text: recovery_task.text.clone(),
+    };
+    let mut blocked_snapshot = blocked.clone();
+    blocked_snapshot.auto_recover = Some(AutoRecoverDecisionSnapshot {
+        state: AutoRecoverDecisionState::Queued,
+        decided_at: now,
+        reason_key: reason_key.clone(),
+        attempts: runner_state.auto_recover_attempts,
+        same_reason_count: runner_state.auto_recover_same_reason_count,
+        max_attempts: manifest.auto_recover_blocked_max_attempts,
+        guard_reason: None,
+        recovery_task: Some(recovery_task_snapshot.clone()),
+    });
+    runner_state.last_blocked_context = Some(blocked_snapshot.clone());
 
     runner_state.current_task_id = None;
     runner_state.current_task_text = None;
     runner_state.current_task_line = None;
     runner_state.current_task_started_at = None;
     runner_state.current_task_state = None;
-    runner_state.current_task_blocked_reason = None;
+    clear_current_blocked_context(runner_state);
     runner_state.current_task_pr_url = None;
     runner_state.paused = false;
     runner_state.pause_reason = None;
@@ -1425,8 +1668,10 @@ fn maybe_auto_recover_blocked_task(
             "blocked_reason": runner_state.last_task_reason.clone(),
             "recovery_task_id": recovery_task.id,
             "recovery_task_line": recovery_task.line_no,
+            "recovery_task_text": recovery_task.text,
             "auto_recover_attempts": runner_state.auto_recover_attempts,
             "auto_recover_same_reason_count": runner_state.auto_recover_same_reason_count,
+            "blocked_context": blocked_snapshot,
         }),
     )?;
 
@@ -2893,7 +3138,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             runner_state.current_task_line = None;
                             runner_state.current_task_started_at = None;
                             runner_state.current_task_state = None;
-                            runner_state.current_task_blocked_reason = None;
+                            clear_current_blocked_context(&mut runner_state);
                             runner_state.current_task_pr_url = None;
                             write_runner_state(&dir, &runner_state)?;
                             task_done_now = task_checklist_done_count(&task_file_abs)?;
@@ -2949,7 +3194,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                                 runner_state.current_task_line = None;
                                                 runner_state.current_task_started_at = None;
                                                 runner_state.current_task_state = None;
-                                                runner_state.current_task_blocked_reason = None;
+                                                clear_current_blocked_context(&mut runner_state);
                                                 runner_state.current_task_pr_url = None;
 
                                                 append_event(
@@ -2991,27 +3236,19 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                                     format!("TASK_WAITING_MERGE PR_URL={pr_url}");
                                             }
                                             Ok(WaitingMergeProgress::Blocked(reason)) => {
-                                                let reason = clip_text(&reason, 200);
-                                                runner_state.current_task_state =
-                                                    Some(RunnerTaskState::Blocked);
-                                                runner_state.current_task_blocked_reason =
-                                                    Some(reason.clone());
-                                                runner_state.last_task_id = Some(entry.id.clone());
-                                                runner_state.last_task_state =
-                                                    Some(RunnerTaskState::Blocked);
-                                                runner_state.last_task_at = Some(now);
-                                                runner_state.last_task_reason = runner_state
-                                                    .current_task_blocked_reason
-                                                    .clone();
-                                                runner_state.last_task_pr_url =
-                                                    Some(pr_url.clone());
-
-                                                state.version += 1;
-                                                state.status = LoopStatus::Blocked;
-                                                state.summary =
-                                                    format!("task blocked: {}", entry.id);
-                                                state.waiting_reason = reason.clone();
-                                                state.updated_at = now;
+                                                let blocked_context =
+                                                    build_waiting_merge_blocked_context(
+                                                        entry,
+                                                        Some(&pr_url),
+                                                        &reason,
+                                                        now,
+                                                    );
+                                                apply_blocked_context(
+                                                    &mut runner_state,
+                                                    &mut state,
+                                                    &blocked_context,
+                                                    now,
+                                                );
 
                                                 append_event(
                                                     &dir,
@@ -3019,16 +3256,19 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                                     serde_json::json!({
                                                         "task_id": entry.id,
                                                         "pr_url": pr_url,
-                                                        "reason": reason,
+                                                        "reason": blocked_context.reason_summary,
+                                                        "blocked_context": blocked_context,
                                                     }),
                                                 )?;
 
+                                                let blocked_context = runner_state
+                                                    .last_blocked_context
+                                                    .clone()
+                                                    .expect("blocked context recorded");
                                                 let blocked_message =
                                                     format_task_blocked_notification(
                                                         &manifest,
-                                                        &entry.id,
-                                                        &state.waiting_reason,
-                                                        Some(&pr_url),
+                                                        &blocked_context,
                                                     );
                                                 queue_notification(
                                                     &dir,
@@ -3044,7 +3284,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                                     &task_file_abs,
                                                     &mut runner_state,
                                                     &mut state,
-                                                    &entry.id,
+                                                    &blocked_context,
                                                     now,
                                                     &mut task_done_now,
                                                     &mut task_loops_completed,
@@ -3060,7 +3300,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                                 let reason = clip_text(&reason, 200);
                                                 runner_state.current_task_state =
                                                     Some(RunnerTaskState::WaitingMerge);
-                                                runner_state.current_task_blocked_reason = None;
+                                                clear_current_blocked_context(&mut runner_state);
                                                 state.summary =
                                                     format!("task waiting_merge: {}", entry.id);
                                                 state.waiting_reason = reason.clone();
@@ -3078,30 +3318,22 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                             }
                                             Err(err) => {
                                                 let err_text = clip_text(&err.to_string(), 200);
-                                                runner_state.current_task_state =
-                                                    Some(RunnerTaskState::Blocked);
-                                                runner_state.current_task_blocked_reason =
-                                                    Some(format!(
-                                                        "waiting_merge transition failed: {}",
-                                                        err_text
-                                                    ));
-                                                runner_state.last_task_id = Some(entry.id.clone());
-                                                runner_state.last_task_state =
-                                                    Some(RunnerTaskState::Blocked);
-                                                runner_state.last_task_at = Some(now);
-                                                runner_state.last_task_reason = runner_state
-                                                    .current_task_blocked_reason
-                                                    .clone();
-                                                runner_state.last_task_pr_url =
-                                                    Some(pr_url.clone());
-
-                                                state.status = LoopStatus::Blocked;
-                                                state.summary =
-                                                    format!("task blocked: {}", entry.id);
-                                                state.waiting_reason = runner_state
-                                                    .current_task_blocked_reason
-                                                    .clone()
-                                                    .unwrap_or_else(|| err_text.clone());
+                                                let blocked_context =
+                                                    build_waiting_merge_blocked_context(
+                                                        entry,
+                                                        Some(&pr_url),
+                                                        &format!(
+                                                            "waiting_merge transition failed: {}",
+                                                            err_text
+                                                        ),
+                                                        now,
+                                                    );
+                                                apply_blocked_context(
+                                                    &mut runner_state,
+                                                    &mut state,
+                                                    &blocked_context,
+                                                    now,
+                                                );
 
                                                 append_event(
                                                     &dir,
@@ -3110,15 +3342,18 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                                         "task_id": entry.id,
                                                         "pr_url": pr_url,
                                                         "error": err_text,
+                                                        "blocked_context": blocked_context,
                                                     }),
                                                 )?;
 
+                                                let blocked_context = runner_state
+                                                    .last_blocked_context
+                                                    .clone()
+                                                    .expect("blocked context recorded");
                                                 let blocked_message =
                                                     format_task_blocked_notification(
                                                         &manifest,
-                                                        &entry.id,
-                                                        &state.waiting_reason,
-                                                        Some(&pr_url),
+                                                        &blocked_context,
                                                     );
                                                 queue_notification(
                                                     &dir,
@@ -3158,6 +3393,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             state.updated_at = now;
                             state.version += 1;
                             runner_state.current_task_state = Some(RunnerTaskState::Blocked);
+                            clear_current_blocked_context(&mut runner_state);
                             runner_state.current_task_blocked_reason =
                                 Some("task missing from checklist".into());
                             runner_state.last_task_id = Some(active_id.clone());
@@ -3185,6 +3421,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                     if runner_state.task_loops_started >= manifest.max_task_loops {
                         runner_state.paused = true;
                         runner_state.current_task_state = None;
+                        clear_current_blocked_context(&mut runner_state);
                         runner_state.current_task_pr_url = None;
                         runner_state.pause_reason = Some(format!(
                             "max_task_loops reached ({}/{})",
@@ -3206,6 +3443,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                     } else if next.is_none() {
                         runner_state.paused = true;
                         runner_state.current_task_state = None;
+                        clear_current_blocked_context(&mut runner_state);
                         runner_state.current_task_pr_url = None;
                         runner_state.pause_reason = Some("all tasklist items completed".into());
                         write_runner_state(&dir, &runner_state)?;
@@ -3247,7 +3485,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                         runner_state.current_task_line = Some(queued_task.line_no);
                         runner_state.current_task_started_at = Some(now);
                         runner_state.current_task_state = Some(RunnerTaskState::Queued);
-                        runner_state.current_task_blocked_reason = None;
+                        clear_current_blocked_context(&mut runner_state);
                         runner_state.current_task_pr_url = None;
                         runner_state.paused = false;
                         runner_state.pause_reason = None;
@@ -3330,7 +3568,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             state.updated_at = now;
 
                             runner_state.current_task_state = Some(RunnerTaskState::WaitingMerge);
-                            runner_state.current_task_blocked_reason = None;
+                            clear_current_blocked_context(&mut runner_state);
                             runner_state.current_task_pr_url = first_line_pr_url.clone();
                             write_runner_state(&dir, &runner_state)?;
                             write_json(&dir.join("state.json"), &state)?;
@@ -3356,37 +3594,41 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                 ),
                             )?;
                         } else if !runner.success {
-                            state.version += 1;
-                            state.status = LoopStatus::Blocked;
-                            state.summary = format!("task runner failed: {}", task_label);
-                            state.waiting_reason = format!(
-                                "runner exit={:?}: {}",
+                            let blocked_context = build_runner_blocked_context(
+                                runner.task.as_ref(),
                                 runner.exit_code,
-                                blocked_reason_from_runner(&runner.stderr, &runner.stdout)
-                            );
-                            state.updated_at = now;
-
-                            runner_state.current_task_state = Some(RunnerTaskState::Blocked);
-                            runner_state.current_task_blocked_reason =
-                                Some(state.waiting_reason.clone());
-                            runner_state.current_task_pr_url = first_line_pr_url.clone();
-                            runner_state.last_task_id = Some(task_label.clone());
-                            runner_state.last_task_state = Some(RunnerTaskState::Blocked);
-                            runner_state.last_task_at = Some(now);
-                            runner_state.last_task_reason = Some(state.waiting_reason.clone());
-                            runner_state.last_task_pr_url = first_line_pr_url.clone();
-                            write_runner_state(&dir, &runner_state)?;
-
-                            let blocked_message = format_task_blocked_notification(
-                                &manifest,
-                                &task_label,
-                                &state.waiting_reason,
+                                &runner.stdout,
+                                &runner.stderr,
                                 first_line_pr_url.as_deref(),
+                                now,
                             );
+                            apply_blocked_context(
+                                &mut runner_state,
+                                &mut state,
+                                &blocked_context,
+                                now,
+                            );
+                            state.summary = format!("task runner failed: {}", task_label);
+                            write_runner_state(&dir, &runner_state)?;
+                            append_event(
+                                &dir,
+                                "task_runner_blocked",
+                                serde_json::json!({
+                                    "task_label": task_label.clone(),
+                                    "blocked_context": runner_state.last_blocked_context.clone(),
+                                }),
+                            )?;
+
+                            let blocked_context = runner_state
+                                .last_blocked_context
+                                .clone()
+                                .expect("blocked context recorded");
+                            let blocked_message =
+                                format_task_blocked_notification(&manifest, &blocked_context);
                             queue_notification(&dir, &manifest, "task_blocked", blocked_message)?;
 
                             if manifest.auto_recover_blocked {
-                                if let Some(blocked_task) = runner.task.as_ref() {
+                                if runner.task.is_some() {
                                     match maybe_auto_recover_blocked_task(
                                         &dir,
                                         &manifest_path,
@@ -3394,7 +3636,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                         &task_file_abs,
                                         &mut runner_state,
                                         &mut state,
-                                        &blocked_task.id,
+                                        &blocked_context,
                                         now,
                                         &mut task_done_now,
                                         &mut task_loops_completed,
@@ -3403,16 +3645,17 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                         AutoRecoverBlockedOutcome::Halted => break,
                                         AutoRecoverBlockedOutcome::NotTriggered => {}
                                     }
+                                } else {
+                                    append_event(
+                                        &dir,
+                                        "task_blocked_auto_recover_skipped",
+                                        serde_json::json!({
+                                            "reason": "runner.task is missing",
+                                            "task_label": task_label,
+                                            "blocked_context": blocked_context,
+                                        }),
+                                    )?;
                                 }
-
-                                append_event(
-                                    &dir,
-                                    "task_blocked_auto_recover_skipped",
-                                    serde_json::json!({
-                                        "reason": "runner.task is missing",
-                                        "task_label": task_label,
-                                    }),
-                                )?;
                             }
 
                             write_json(&dir.join("state.json"), &state)?;
@@ -3442,7 +3685,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                 runner_state.current_task_line = None;
                                 runner_state.current_task_started_at = None;
                                 runner_state.current_task_state = None;
-                                runner_state.current_task_blocked_reason = None;
+                                clear_current_blocked_context(&mut runner_state);
                                 runner_state.current_task_pr_url = None;
 
                                 task_done_now = task_checklist_done_count(&task_file_abs)?;
@@ -3468,7 +3711,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                 runner_state.current_task_line = Some(task.line_no);
                                 runner_state.current_task_started_at = Some(now);
                                 runner_state.current_task_state = Some(RunnerTaskState::Running);
-                                runner_state.current_task_blocked_reason = None;
+                                clear_current_blocked_context(&mut runner_state);
                                 runner_state.current_task_pr_url = first_line_pr_url.clone();
                                 state.status = LoopStatus::Waiting;
                                 state.summary = format!("task running: {}", task.id);
@@ -3765,6 +4008,7 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
         "started_at": runner_state.current_task_started_at,
         "state": runner_state.current_task_state.clone(),
         "blocked_reason": runner_state.current_task_blocked_reason.clone(),
+        "blocked_context": runner_state.current_blocked_context.clone(),
         "pr_url": runner_state.current_task_pr_url.clone(),
     });
     let runner_last_view = serde_json::json!({
@@ -3798,11 +4042,13 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
         "current_task_started_at": runner_state.current_task_started_at,
         "current_task_state": runner_state.current_task_state.clone(),
         "current_task_blocked_reason": runner_state.current_task_blocked_reason.clone(),
+        "current_blocked_context": runner_state.current_blocked_context.clone(),
         "current_task_pr_url": runner_state.current_task_pr_url.clone(),
         "last_task_id": runner_state.last_task_id.clone(),
         "last_task_state": runner_state.last_task_state.clone(),
         "last_task_at": runner_state.last_task_at,
         "last_task_reason": runner_state.last_task_reason.clone(),
+        "last_blocked_context": runner_state.last_blocked_context.clone(),
         "last_task_pr_url": last_task_pr_url.clone(),
         "current": runner_current_view,
         "last": runner_last_view,
@@ -4631,11 +4877,11 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoRecoverBlockedOutcome, DeadLetterEntry, DeliveryAck, DeliveryAttempt,
-        DispatchedNotification, GhPrView, GhStatusCheck, LoopStatus, Manifest, Notification,
-        NotificationDeliveryMode, RunnerState, RunnerTaskState, State, TaskChecklistEntry,
-        WaitingMergeProgress, ack_retry_policy, append_jsonl,
-        apply_status_establish_retry_override, auto_merge_unavailable_error,
+        AutoRecoverBlockedOutcome, AutoRecoverDecisionState, BlockedContext, BlockedContextSource,
+        DeadLetterEntry, DeliveryAck, DeliveryAttempt, DispatchedNotification, GhPrView,
+        GhStatusCheck, LoopStatus, Manifest, Notification, NotificationDeliveryMode, RunnerState,
+        RunnerTaskState, State, TaskChecklistEntry, WaitingMergeProgress, ack_retry_policy,
+        append_jsonl, apply_status_establish_retry_override, auto_merge_unavailable_error,
         auto_recover_guard_reason, blocked_reason_from_runner, blocked_recovery_hint,
         classify_ack_failure_category, completion_guard_waiting_fallback_line,
         compute_auto_stop_reason, compute_backoff_sec, dead_letter_path, delivery_ack_path,
@@ -4727,6 +4973,32 @@ mod tests {
             auto_check_on_success: true,
             auto_recover_blocked: false,
             auto_recover_blocked_max_attempts: 3,
+        }
+    }
+
+    fn test_blocked_context(
+        task_id: &str,
+        task_text: &str,
+        task_line: usize,
+        pr_url: Option<&str>,
+        reason_summary: &str,
+        reason_detail: Option<&str>,
+        blocked_at: chrono::DateTime<Utc>,
+    ) -> BlockedContext {
+        BlockedContext {
+            task_id: task_id.to_string(),
+            task_text: Some(task_text.to_string()),
+            task_line: Some(task_line),
+            pr_url: pr_url.map(ToOwned::to_owned),
+            source: BlockedContextSource::WaitingMerge,
+            exit_code: None,
+            blocked_at,
+            reason_summary: reason_summary.to_string(),
+            reason_detail: reason_detail.map(ToOwned::to_owned),
+            runner_stdout_excerpt: None,
+            runner_stderr_excerpt: None,
+            recovery_hint: Some(blocked_recovery_hint(reason_summary).to_string()),
+            auto_recover: None,
         }
     }
 
@@ -5195,12 +5467,16 @@ mod tests {
         manifest.requester_user_id = Some("test-user-id".to_string());
         manifest.auto_recover_blocked = true;
 
-        let msg = format_task_blocked_notification(
-            &manifest,
+        let blocked = test_blocked_context(
             "S5-2",
-            r#"runner exit=2: unexpected EOF while looking for matching '"'"#,
+            "blocked task",
+            2,
             Some("https://github.com/n01e0/claw-loop/pull/999"),
+            r#"runner exit=2: unexpected EOF while looking for matching '"'"#,
+            None,
+            Utc::now(),
         );
+        let msg = format_task_blocked_notification(&manifest, &blocked);
 
         assert!(msg.starts_with("<@test-user-id> タスクが block された: S5-2"));
         assert!(msg.contains("- 原因:"));
@@ -5216,12 +5492,18 @@ mod tests {
         let mut manifest = test_manifest(&run.path, run_id, false);
         manifest.auto_recover_blocked = true;
 
-        let msg = format_task_blocked_notification(
-            &manifest,
+        let blocked = test_blocked_context(
             "B2-RECOVER",
-            "runner exit=Some(2): TASK_BLOCKED: B2 still cannot be shipped as an isolated green PR without also doing B3, because the current runtime response types/handlers still expose the very staff-visible fields the requested regression needs to change before this can pass in isolation",
+            "recovery task",
+            4,
             None,
+            "runner exit=Some(2): TASK_BLOCKED: B2 still cannot be shipped as an isolated green PR without also doing B3, because the current runtime response types/handlers still expose the very staff-visible fields the requested regression needs to change before this can pass in isolation",
+            Some(
+                "runner exit=Some(2): TASK_BLOCKED: B2 still cannot be shipped as an isolated green PR without also doing B3, because the current runtime response types/handlers still expose the very staff-visible fields the requested regression needs to change before this can pass in isolation\nextra detail",
+            ),
+            Utc::now(),
         );
+        let msg = format_task_blocked_notification(&manifest, &blocked);
 
         assert!(msg.contains("- 詳細:"));
         assert!(msg.contains("green PR"));
@@ -5253,6 +5535,59 @@ mod tests {
     }
 
     #[test]
+    fn build_runner_blocked_context_keeps_detail_and_output_excerpts() {
+        let task = TaskChecklistEntry {
+            line_no: 7,
+            done: false,
+            id: "N2".to_string(),
+            text: "blocked task".to_string(),
+        };
+        let now = Utc::now();
+        let blocked = super::build_runner_blocked_context(
+            Some(&task),
+            Some(2),
+            "progress line\nTASK_DONE PR_URL=https://example.test/pull/9",
+            "first line\nsecond line with more detail",
+            Some("https://example.test/pull/9"),
+            now,
+        );
+
+        assert_eq!(blocked.task_id, "N2");
+        assert_eq!(blocked.source, BlockedContextSource::RunnerExit);
+        assert_eq!(blocked.exit_code, Some(2));
+        assert_eq!(
+            blocked.pr_url.as_deref(),
+            Some("https://example.test/pull/9")
+        );
+        assert!(
+            blocked
+                .reason_summary
+                .contains("runner exit=Some(2): first line")
+        );
+        assert!(
+            blocked
+                .reason_detail
+                .as_deref()
+                .expect("reason detail")
+                .contains("second line with more detail")
+        );
+        assert!(
+            blocked
+                .runner_stdout_excerpt
+                .as_deref()
+                .expect("stdout excerpt")
+                .contains("TASK_DONE PR_URL=https://example.test/pull/9")
+        );
+        assert!(
+            blocked
+                .runner_stderr_excerpt
+                .as_deref()
+                .expect("stderr excerpt")
+                .contains("second line with more detail")
+        );
+    }
+
+    #[test]
     fn maybe_auto_recover_blocked_task_queues_recovery_for_waiting_merge_ci_failures() {
         let run = TestRunDir::new("waiting-merge-auto-recover");
         let run_id = Uuid::new_v4();
@@ -5266,22 +5601,31 @@ mod tests {
         write_json(&manifest_path, &manifest).expect("write manifest");
 
         let now = Utc::now();
+        let blocked = test_blocked_context(
+            "A2",
+            "original task",
+            1,
+            Some("https://example.test/pull/1"),
+            "CI failed for PR_URL=https://example.test/pull/1 checks=rust:FAILURE",
+            Some(
+                "CI failed for PR_URL=https://example.test/pull/1 checks=rust:FAILURE\njob rust failed in merge recheck",
+            ),
+            now,
+        );
         let mut runner_state = RunnerState {
             current_task_id: Some("A2".into()),
             current_task_text: Some("original task".into()),
             current_task_line: Some(1),
             current_task_started_at: Some(now),
             current_task_state: Some(RunnerTaskState::Blocked),
-            current_task_blocked_reason: Some(
-                "CI failed for PR_URL=https://example.test/pull/1 checks=rust:FAILURE".into(),
-            ),
+            current_task_blocked_reason: Some(blocked.reason_summary.clone()),
+            current_blocked_context: Some(blocked.clone()),
             current_task_pr_url: Some("https://example.test/pull/1".into()),
             last_task_id: Some("A2".into()),
             last_task_state: Some(RunnerTaskState::Blocked),
             last_task_at: Some(now),
-            last_task_reason: Some(
-                "CI failed for PR_URL=https://example.test/pull/1 checks=rust:FAILURE".into(),
-            ),
+            last_task_reason: Some(blocked.reason_summary.clone()),
+            last_blocked_context: Some(blocked.clone()),
             last_task_pr_url: Some("https://example.test/pull/1".into()),
             ..RunnerState::default()
         };
@@ -5289,8 +5633,7 @@ mod tests {
             version: 1,
             status: LoopStatus::Blocked,
             summary: "task blocked: A2".into(),
-            waiting_reason: "CI failed for PR_URL=https://example.test/pull/1 checks=rust:FAILURE"
-                .into(),
+            waiting_reason: blocked.reason_summary.clone(),
             lease_expires_at: now,
             updated_at: now,
             ticks: 0,
@@ -5305,7 +5648,7 @@ mod tests {
             &task_file,
             &mut runner_state,
             &mut state,
-            "A2",
+            &blocked,
             now,
             &mut task_done_now,
             &mut task_loops_completed,
@@ -5322,12 +5665,34 @@ mod tests {
         assert_eq!(task_done_now, 1);
         assert_eq!(task_loops_completed, 1);
         assert_eq!(runner_state.current_task_id, None);
+        assert!(runner_state.current_blocked_context.is_none());
         assert!(
             runner_state
                 .auto_recover_last_task_id
                 .as_deref()
                 .expect("recovery task id")
                 .starts_with("A2-RECOVER")
+        );
+        let last_blocked = runner_state
+            .last_blocked_context
+            .as_ref()
+            .expect("last blocked context");
+        let decision = last_blocked
+            .auto_recover
+            .as_ref()
+            .expect("auto-recover decision");
+        assert_eq!(decision.state, AutoRecoverDecisionState::Queued);
+        assert_eq!(
+            decision.reason_key,
+            "ci failed for pr_url=https://example.test/pull/1 checks=rust:failure job rust failed in merge recheck"
+        );
+        assert!(
+            decision
+                .recovery_task
+                .as_ref()
+                .expect("recovery task")
+                .text
+                .starts_with("auto-recover from A2:")
         );
 
         let content = fs::read_to_string(&task_file).expect("read task file");
