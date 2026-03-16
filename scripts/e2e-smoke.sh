@@ -1175,4 +1175,39 @@ if [[ "$FIRST14" != "TASK_DONE PR_URL=https://github.com/demo/repo/pull/314" ]];
   exit 1
 fi
 
+echo "[e2e-smoke] case15 rl-task-agent prefers TASK contract line over earlier chatter"
+cat > "$RUNNER_MOCKDIR/openclaw" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "agent" ]]; then
+  cat <<'JSON'
+{"payloads":[{"text":"working on it"},{"text":"TASK_DONE PR_URL=https://github.com/demo/repo/pull/315\nextra summary"}]}
+JSON
+  exit 0
+fi
+
+echo "unsupported mock openclaw args: $*" >&2
+exit 1
+EOF
+chmod +x "$RUNNER_MOCKDIR/openclaw"
+
+TASKFILE15="$WORKDIR/docs/roadmaps/s5-case15-tasklist.md"
+mkdir -p "$(dirname "$TASKFILE15")"
+cat > "$TASKFILE15" <<'EOF'
+- [ ] S5X-15: chatter before contract line
+EOF
+
+OUT15="$(PATH="$RUNNER_MOCKDIR:$PATH" CLAW_TASK_ID="S5X-15" CLAW_TASK_TEXT="chatter before contract line" CLAW_TASK_FILE="$TASKFILE15" CLAW_RUN_ID="run15" bash ./scripts/rl-task-agent.sh)"
+FIRST15="$(printf '%s\n' "$OUT15" | awk 'NF { print; exit }')"
+if [[ "$FIRST15" != "working on it" ]]; then
+  echo "[e2e-smoke] unexpected case15 transcript"
+  printf '%s\n' "$OUT15"
+  exit 1
+fi
+if [[ "$OUT15" != *"TASK_DONE PR_URL=https://github.com/demo/repo/pull/315"* ]]; then
+  echo "[e2e-smoke] expected case15 TASK_DONE line in transcript"
+  printf '%s\n' "$OUT15"
+  exit 1
+fi
+
 echo "[e2e-smoke] ok"

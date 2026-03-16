@@ -36,7 +36,23 @@ PY
 }
 
 get_first_line() {
-  printf '%s\n' "$1" | awk '{ sub(/\r$/, ""); if ($0 ~ /[^[:space:]]/) { print; exit } }'
+  printf '%s\n' "$1" | awk '
+    {
+      sub(/\r$/, "")
+      if (first_nonempty == "" && $0 ~ /[^[:space:]]/) {
+        first_nonempty = $0
+      }
+      if ($0 ~ /^TASK_[A-Z_]+([[:space:]]|$)/) {
+        print
+        exit
+      }
+    }
+    END {
+      if (first_nonempty != "") {
+        print first_nonempty
+      }
+    }
+  '
 }
 
 parse_pr_url() {
