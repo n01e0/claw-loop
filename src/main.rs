@@ -1439,6 +1439,98 @@ fn format_auto_recover_decision_notification(blocked: &BlockedContext) -> Option
     ))
 }
 
+fn recovery_parent_task_id(task_id: &str) -> Option<&str> {
+    let (parent, _) = task_id.split_once("-RECOVER")?;
+    let parent = parent.trim();
+    if parent.is_empty() {
+        None
+    } else {
+        Some(parent)
+    }
+}
+
+fn format_auto_recover_halt_notification(blocked: &BlockedContext) -> Option<String> {
+    let decision = blocked.auto_recover.as_ref()?;
+    if decision.state != AutoRecoverDecisionState::Halted {
+        return None;
+    }
+
+    let compact_reason = compact_blocked_reason(&blocked.reason_summary);
+    let reason_summary = clip_text(&compact_reason, 240);
+    let detail_source = blocked
+        .reason_detail
+        .as_deref()
+        .unwrap_or(blocked.reason_summary.as_str());
+    let compact_detail = compact_blocked_reason(detail_source);
+    let detail_line = if compact_detail != compact_reason {
+        format!("\n- 詳細: {}", clip_text(&compact_detail, 600))
+    } else if compact_reason.chars().count() > 240 {
+        format!("\n- 詳細: {}", clip_text(&compact_reason, 600))
+    } else {
+        String::new()
+    };
+
+    let guard = decision
+        .guard_reason
+        .as_deref()
+        .map(|reason| clip_text(&compact_blocked_reason(reason), 240))
+        .unwrap_or_else(|| "guard reason unavailable".to_string());
+    let recovery = blocked
+        .recovery_hint
+        .as_deref()
+        .unwrap_or_else(|| blocked_recovery_hint(&compact_reason));
+    let task_text = blocked
+        .task_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| clip_text(text, 180))
+        .unwrap_or_else(|| "recovery task detail unavailable".to_string());
+    let parent_line = recovery_parent_task_id(&blocked.task_id)
+        .map(|parent| format!("\n  - 元タスク: {parent}"))
+        .unwrap_or_default();
+    let stderr_line = blocked
+        .runner_stderr_excerpt
+        .as_deref()
+        .map(|stderr| {
+            format!(
+                "\n  - stderr: {}",
+                clip_text(&compact_blocked_reason(stderr), 240)
+            )
+        })
+        .unwrap_or_default();
+    let stdout_line = blocked
+        .runner_stdout_excerpt
+        .as_deref()
+        .map(|stdout| {
+            format!(
+                "\n  - stdout: {}",
+                clip_text(&compact_blocked_reason(stdout), 240)
+            )
+        })
+        .unwrap_or_default();
+    let pr_line = blocked
+        .pr_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| format!("\n  - PR: {v}"))
+        .unwrap_or_default();
+
+    Some(format!(
+        "auto-recovery halted: {}\n- 停止理由: {}\n- 原因: {reason_summary}{detail_line}\n- 次に見るポイント:\n  - 失敗した recovery task: {}: {}{}{}{}{}\n  - 手動での解決方針: {}",
+        blocked.task_id,
+        guard,
+        blocked.task_id,
+        task_text,
+        parent_line,
+        stderr_line,
+        stdout_line,
+        pr_line,
+        recovery,
+    ))
+}
+
 fn format_orphan_blocked_notification(manifest: &Manifest, daemon_pid: u32) -> String {
     let mention = completion_mention_prefix(manifest);
     format!(
@@ -1689,6 +1781,10 @@ fn maybe_auto_recover_blocked_task(
                 "blocked_context": blocked_snapshot,
             }),
         )?;
+
+        if let Some(message) = format_auto_recover_halt_notification(&blocked_snapshot) {
+            queue_notification(run_dir, manifest, "task_recovery_halted", message)?;
+        }
 
         write_json(&run_dir.join("state.json"), state)?;
         let _ = flush_notifications(run_dir, manifest)?;
@@ -4978,13 +5074,14 @@ mod tests {
         dead_letter_path, delivery_ack_path, delivery_attempts_path, delivery_retry_backoff_sec,
         emit_all_tasks_completed_notifications, ensure_task_agent_exists_with,
         ensure_waiting_merge_progress_with, extract_pr_url, flush_notifications,
-        format_auto_recover_decision_notification, format_orphan_blocked_notification,
-        format_task_blocked_notification, lease_window_sec, maybe_auto_recover_blocked_task,
-        normalize_blocked_reason_for_recovery, normalize_error_reason, notification_delivery_mode,
-        openclaw_notify_timeout_sec_from, parse_openclaw_message_id, parse_task_checklist_entry,
-        queue_main_feedback_summary, queue_notification, read_jsonl, retryable_waiting_merge_error,
-        select_next_task_entry, should_force_status_establish_retry, should_suppress_waiting_stuck,
-        task_contract_line, update_waiting_stuck_tracker, validate_task_done_contract_with,
+        format_auto_recover_decision_notification, format_auto_recover_halt_notification,
+        format_orphan_blocked_notification, format_task_blocked_notification, lease_window_sec,
+        maybe_auto_recover_blocked_task, normalize_blocked_reason_for_recovery,
+        normalize_error_reason, notification_delivery_mode, openclaw_notify_timeout_sec_from,
+        parse_openclaw_message_id, parse_task_checklist_entry, queue_main_feedback_summary,
+        queue_notification, read_jsonl, retryable_waiting_merge_error, select_next_task_entry,
+        should_force_status_establish_retry, should_suppress_waiting_stuck, task_contract_line,
+        update_waiting_stuck_tracker, validate_task_done_contract_with,
         waiting_merge_nonprogress_reason, write_json,
     };
     use chrono::{Duration, Utc};
@@ -5643,6 +5740,50 @@ mod tests {
     }
 
     #[test]
+    fn format_auto_recover_halt_notification_points_humans_to_failed_recovery_task() {
+        let mut blocked = test_blocked_context(
+            "A2-RECOVER",
+            "repair merge blockers on generated branch",
+            4,
+            Some("https://example.test/pull/1"),
+            "runner exit=Some(2): generated recovery task failed again",
+            Some(
+                "runner exit=Some(2): generated recovery task failed again\nstderr mentions missing fixture",
+            ),
+            Utc::now(),
+        );
+        blocked.runner_stderr_excerpt = Some("missing fixture in recovery workspace".to_string());
+        blocked.runner_stdout_excerpt = Some("partial recovery output".to_string());
+        blocked.auto_recover = Some(AutoRecoverDecisionSnapshot {
+            state: AutoRecoverDecisionState::Halted,
+            decided_at: Utc::now(),
+            reason_key: "generated recovery task failed".to_string(),
+            attempts: 1,
+            same_reason_count: 1,
+            max_attempts: 3,
+            guard_reason: Some(
+                "auto-recover halted: generated recovery task failed (A2-RECOVER)".to_string(),
+            ),
+            recovery_task: None,
+        });
+
+        let msg =
+            format_auto_recover_halt_notification(&blocked).expect("recovery halt notification");
+        assert!(msg.starts_with("auto-recovery halted: A2-RECOVER"));
+        assert!(msg.contains("- 停止理由:"));
+        assert!(msg.contains("- 原因:"));
+        assert!(msg.contains("- 次に見るポイント:"));
+        assert!(msg.contains(
+            "- 失敗した recovery task: A2-RECOVER: repair merge blockers on generated branch"
+        ));
+        assert!(msg.contains("- 元タスク: A2"));
+        assert!(msg.contains("- stderr: missing fixture in recovery workspace"));
+        assert!(msg.contains("- stdout: partial recovery output"));
+        assert!(msg.contains("- PR: https://example.test/pull/1"));
+        assert!(msg.contains("- 手動での解決方針:"));
+    }
+
+    #[test]
     fn format_orphan_blocked_notification_mentions_requester() {
         let run = TestRunDir::new("orphan-notify");
         let run_id = Uuid::new_v4();
@@ -5861,6 +6002,104 @@ mod tests {
         let content = fs::read_to_string(&task_file).expect("read task file");
         assert!(content.contains("- [x] A2: original task"));
         assert!(content.contains("- [ ] A2-RECOVER"));
+    }
+
+    #[test]
+    fn maybe_auto_recover_blocked_task_dispatches_halt_notification_for_failed_recovery_task() {
+        let run = TestRunDir::new("recovery-halt-notify");
+        let run_id = Uuid::new_v4();
+        let task_file = run.path.join("tasklist.md");
+        fs::write(
+            &task_file,
+            "- [ ] A2: original task\n- [ ] A2-RECOVER: generated follow-up\n",
+        )
+        .expect("write task file");
+
+        let manifest_path = run.path.join("manifest.json");
+        let mut manifest = test_manifest(&run.path, run_id, false);
+        manifest.auto_recover_blocked = true;
+        manifest.task_file = task_file.clone();
+        write_json(&manifest_path, &manifest).expect("write manifest");
+
+        let now = Utc::now();
+        let mut blocked = test_blocked_context(
+            "A2-RECOVER",
+            "generated follow-up",
+            2,
+            Some("https://example.test/pull/1"),
+            "runner exit=Some(2): generated recovery task failed again",
+            Some(
+                "runner exit=Some(2): generated recovery task failed again\nmissing fixture in recovery workspace",
+            ),
+            now,
+        );
+        blocked.runner_stderr_excerpt = Some("missing fixture in recovery workspace".to_string());
+        blocked.runner_stdout_excerpt = Some("partial recovery output".to_string());
+
+        let mut runner_state = RunnerState {
+            current_task_id: Some("A2-RECOVER".into()),
+            current_task_text: Some("generated follow-up".into()),
+            current_task_line: Some(2),
+            current_task_started_at: Some(now),
+            current_task_state: Some(RunnerTaskState::Blocked),
+            current_task_blocked_reason: Some(blocked.reason_summary.clone()),
+            current_blocked_context: Some(blocked.clone()),
+            last_task_id: Some("A2-RECOVER".into()),
+            last_task_state: Some(RunnerTaskState::Blocked),
+            last_task_at: Some(now),
+            last_task_reason: Some(blocked.reason_summary.clone()),
+            last_blocked_context: Some(blocked.clone()),
+            ..RunnerState::default()
+        };
+        let mut state = State {
+            version: 1,
+            status: LoopStatus::Blocked,
+            summary: "task blocked: A2-RECOVER".into(),
+            waiting_reason: blocked.reason_summary.clone(),
+            lease_expires_at: now,
+            updated_at: now,
+            ticks: 0,
+        };
+        let mut task_done_now = 1;
+        let mut task_loops_completed = 1;
+
+        let outcome = maybe_auto_recover_blocked_task(
+            &run.path,
+            &manifest_path,
+            &mut manifest,
+            &task_file,
+            &mut runner_state,
+            &mut state,
+            &blocked,
+            now,
+            &mut task_done_now,
+            &mut task_loops_completed,
+        )
+        .expect("halt auto recover for failed recovery task");
+
+        assert_eq!(outcome, AutoRecoverBlockedOutcome::Halted);
+        assert_eq!(state.status, LoopStatus::Stopped);
+        assert_eq!(state.summary, "auto-recovery halted");
+        assert!(
+            state
+                .waiting_reason
+                .contains("generated recovery task failed")
+        );
+
+        let dispatched =
+            read_jsonl::<DispatchedNotification>(&run.path.join("notify-dispatched.jsonl"))
+                .expect("read dispatched notifications");
+        let halt_note = dispatched
+            .iter()
+            .find(|item| item.kind == "task_recovery_halted")
+            .expect("halt notification");
+        assert!(halt_note.message.contains("- 次に見るポイント:"));
+        assert!(halt_note.message.contains("- 元タスク: A2"));
+        assert!(
+            halt_note
+                .message
+                .contains("missing fixture in recovery workspace")
+        );
     }
 
     #[test]
