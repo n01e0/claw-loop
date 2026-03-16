@@ -2,6 +2,7 @@
 set -euo pipefail
 
 BIN="${1:-./target/debug/claw-loopd}"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [[ ! -x "$BIN" ]]; then
   echo "[e2e-smoke] binary not found or not executable: $BIN" >&2
@@ -1367,7 +1368,7 @@ cat > "$WORKDIR/.ralph/runner-agent-state/run16/S5X-16.env" <<'EOF'
 PR_URL='https://github.com/demo/repo/pull/316'
 EOF
 set +e
-OUT16="$(cd "$WORKDIR" && PATH="$RULESET_MOCKDIR:$PATH" CLAW_GH_REPO="demo/repo" CLAW_TASK_ID="S5X-16" CLAW_TASK_TEXT="ruleset detail required checks" CLAW_RUN_ID="run16" bash /home/shioriko/src/github.com/n01e0/claw-loop/scripts/rl-task-agent.sh)"
+OUT16="$(cd "$WORKDIR" && PATH="$RULESET_MOCKDIR:$PATH" CLAW_GH_REPO="demo/repo" CLAW_TASK_ID="S5X-16" CLAW_TASK_TEXT="ruleset detail required checks" CLAW_RUN_ID="run16" bash "$REPO/scripts/rl-task-agent.sh")"
 RC16=$?
 set -e
 if [[ "$RC16" -ne 10 ]]; then
