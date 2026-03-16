@@ -1130,4 +1130,49 @@ PY
 $BIN stop --repo "$WORKDIR" --run-id "$RUN13" --immediate >/dev/null || true
 sleep 1
 
+echo "[e2e-smoke] case14 rl-task-agent ignores leading empty payload before TASK_DONE"
+RUNNER_MOCKDIR="$WORKDIR/mockbin-runner"
+mkdir -p "$RUNNER_MOCKDIR"
+cat > "$RUNNER_MOCKDIR/openclaw" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "agent" ]]; then
+  cat <<'JSON'
+{"payloads":[{"text":""},{"text":"TASK_DONE PR_URL=https://github.com/demo/repo/pull/314\nrecovery summary"}]}
+JSON
+  exit 0
+fi
+
+echo "unsupported mock openclaw args: $*" >&2
+exit 1
+EOF
+chmod +x "$RUNNER_MOCKDIR/openclaw"
+
+cat > "$RUNNER_MOCKDIR/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "pr" && "${2:-}" == "view" ]]; then
+  echo 'MERGED|2026-03-16T00:00:00Z'
+  exit 0
+fi
+
+echo "unsupported mock gh args: $*" >&2
+exit 1
+EOF
+chmod +x "$RUNNER_MOCKDIR/gh"
+
+TASKFILE14="$WORKDIR/docs/roadmaps/s5-case14-tasklist.md"
+mkdir -p "$(dirname "$TASKFILE14")"
+cat > "$TASKFILE14" <<'EOF'
+- [ ] S5X-14: leading empty payload
+EOF
+
+OUT14="$(PATH="$RUNNER_MOCKDIR:$PATH" CLAW_TASK_ID="S5X-14" CLAW_TASK_TEXT="leading empty payload" CLAW_TASK_FILE="$TASKFILE14" CLAW_RUN_ID="run14" bash ./scripts/rl-task-agent.sh)"
+FIRST14="$(printf '%s\n' "$OUT14" | awk 'NF { print; exit }')"
+if [[ "$FIRST14" != "TASK_DONE PR_URL=https://github.com/demo/repo/pull/314" ]]; then
+  echo "[e2e-smoke] unexpected case14 output"
+  printf '%s\n' "$OUT14"
+  exit 1
+fi
+
 echo "[e2e-smoke] ok"
