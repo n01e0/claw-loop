@@ -5674,6 +5674,32 @@ mod tests {
     }
 
     #[test]
+    fn format_task_blocked_notification_shows_detail_for_blocked_regression() {
+        let run = TestRunDir::new("blocked-notify-detail");
+        let run_id = Uuid::new_v4();
+        let mut manifest = test_manifest(&run.path, run_id, false);
+        manifest.auto_recover_blocked = true;
+
+        let blocked = test_blocked_context(
+            "A1",
+            "blocked task",
+            1,
+            Some("https://example.test/pull/1"),
+            "runner exit=Some(2): initial blocked",
+            Some(
+                "runner exit=Some(2): initial blocked\nstderr: missing fixture in generated workspace",
+            ),
+            Utc::now(),
+        );
+        let msg = format_task_blocked_notification(&manifest, &blocked);
+
+        assert!(msg.contains("- 原因: runner exit=Some(2): initial blocked"));
+        assert!(msg.contains("- 詳細: runner exit=Some(2): initial blocked stderr: missing fixture in generated workspace"));
+        assert!(msg.contains("- 解決方法:"));
+        assert!(msg.contains("次の動作: auto-recover が有効"));
+    }
+
+    #[test]
     fn format_task_blocked_notification_shows_detail_and_recovery_halt_for_recover_task() {
         let run = TestRunDir::new("blocked-notify-recover");
         let run_id = Uuid::new_v4();
