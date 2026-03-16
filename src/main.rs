@@ -1377,6 +1377,68 @@ fn format_task_blocked_notification(manifest: &Manifest, blocked: &BlockedContex
     )
 }
 
+fn format_auto_recover_decision_notification(blocked: &BlockedContext) -> Option<String> {
+    let decision = blocked.auto_recover.as_ref()?;
+    let compact_reason = compact_blocked_reason(&blocked.reason_summary);
+    let reason_summary = clip_text(&compact_reason, 240);
+    let detail_source = blocked
+        .reason_detail
+        .as_deref()
+        .unwrap_or(blocked.reason_summary.as_str());
+    let compact_detail = compact_blocked_reason(detail_source);
+    let detail_line = if compact_detail != compact_reason {
+        format!("\n- 詳細: {}", clip_text(&compact_detail, 600))
+    } else if compact_reason.chars().count() > 240 {
+        format!("\n- 詳細: {}", clip_text(&compact_reason, 600))
+    } else {
+        String::new()
+    };
+    let recovery = blocked
+        .recovery_hint
+        .as_deref()
+        .unwrap_or_else(|| blocked_recovery_hint(&compact_reason));
+    let task_line = decision
+        .recovery_task
+        .as_ref()
+        .map(|task| {
+            format!(
+                "\n- 実際に積んだ recovery task: {}: {}",
+                task.id,
+                clip_text(&task.text, 240)
+            )
+        })
+        .unwrap_or_default();
+    let status_line = match decision.state {
+        AutoRecoverDecisionState::Queued => format!(
+            "auto-recover 継続（attempt {}/{}, same_reason={}）",
+            decision.attempts, decision.max_attempts, decision.same_reason_count
+        ),
+        AutoRecoverDecisionState::Halted => {
+            let guard = decision
+                .guard_reason
+                .as_deref()
+                .map(|reason| clip_text(&compact_blocked_reason(reason), 240))
+                .unwrap_or_else(|| "guard reason unavailable".to_string());
+            format!(
+                "auto-recover 停止（attempt {}/{}, same_reason={}）: {}",
+                decision.attempts, decision.max_attempts, decision.same_reason_count, guard
+            )
+        }
+    };
+    let pr_suffix = blocked
+        .pr_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| format!(" PR_URL={v}"))
+        .unwrap_or_default();
+
+    Some(format!(
+        "auto-recovery decision: {}{pr_suffix}\n- 原因: {reason_summary}{detail_line}\n- 解決方針: {recovery}{task_line}\n- 状態: {status_line}",
+        blocked.task_id
+    ))
+}
+
 fn format_orphan_blocked_notification(manifest: &Manifest, daemon_pid: u32) -> String {
     let mention = completion_mention_prefix(manifest);
     format!(
@@ -1708,15 +1770,9 @@ fn maybe_auto_recover_blocked_task(
         }),
     )?;
 
-    queue_notification(
-        run_dir,
-        manifest,
-        "task_progress",
-        format!(
-            "auto-recovery task queued: {} (from blocked task {})",
-            recovery_task.id, blocked_task_id
-        ),
-    )?;
+    if let Some(message) = format_auto_recover_decision_notification(&blocked_snapshot) {
+        queue_notification(run_dir, manifest, "task_recovery_decision", message)?;
+    }
 
     Ok(AutoRecoverBlockedOutcome::Recovered)
 }
@@ -4910,24 +4966,25 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoRecoverBlockedOutcome, AutoRecoverDecisionState, BlockedContext, BlockedContextSource,
-        DeadLetterEntry, DeliveryAck, DeliveryAttempt, DispatchedNotification, GhPrView,
-        GhStatusCheck, LoopStatus, Manifest, Notification, NotificationDeliveryMode, RunnerState,
-        RunnerTaskState, State, TaskChecklistEntry, WaitingMergeProgress, ack_retry_policy,
-        append_jsonl, apply_status_establish_retry_override, auto_merge_unavailable_error,
+        AutoRecoverBlockedOutcome, AutoRecoverDecisionSnapshot, AutoRecoverDecisionState,
+        BlockedContext, BlockedContextSource, DeadLetterEntry, DeliveryAck, DeliveryAttempt,
+        DispatchedNotification, GhPrView, GhStatusCheck, LoopStatus, Manifest, Notification,
+        NotificationDeliveryMode, RecoveryTaskSnapshot, RunnerState, RunnerTaskState, State,
+        TaskChecklistEntry, WaitingMergeProgress, ack_retry_policy, append_jsonl,
+        apply_status_establish_retry_override, auto_merge_unavailable_error,
         auto_recover_guard_reason, blocked_reason_from_runner, blocked_recovery_hint,
         build_recovery_task_text, classify_ack_failure_category,
         completion_guard_waiting_fallback_line, compute_auto_stop_reason, compute_backoff_sec,
         dead_letter_path, delivery_ack_path, delivery_attempts_path, delivery_retry_backoff_sec,
         emit_all_tasks_completed_notifications, ensure_task_agent_exists_with,
         ensure_waiting_merge_progress_with, extract_pr_url, flush_notifications,
-        format_orphan_blocked_notification, format_task_blocked_notification, lease_window_sec,
-        maybe_auto_recover_blocked_task, normalize_blocked_reason_for_recovery,
-        normalize_error_reason, notification_delivery_mode, openclaw_notify_timeout_sec_from,
-        parse_openclaw_message_id, parse_task_checklist_entry, queue_main_feedback_summary,
-        queue_notification, read_jsonl, retryable_waiting_merge_error, select_next_task_entry,
-        should_force_status_establish_retry, should_suppress_waiting_stuck, task_contract_line,
-        update_waiting_stuck_tracker, validate_task_done_contract_with,
+        format_auto_recover_decision_notification, format_orphan_blocked_notification,
+        format_task_blocked_notification, lease_window_sec, maybe_auto_recover_blocked_task,
+        normalize_blocked_reason_for_recovery, normalize_error_reason, notification_delivery_mode,
+        openclaw_notify_timeout_sec_from, parse_openclaw_message_id, parse_task_checklist_entry,
+        queue_main_feedback_summary, queue_notification, read_jsonl, retryable_waiting_merge_error,
+        select_next_task_entry, should_force_status_establish_retry, should_suppress_waiting_stuck,
+        task_contract_line, update_waiting_stuck_tracker, validate_task_done_contract_with,
         waiting_merge_nonprogress_reason, write_json,
     };
     use chrono::{Duration, Utc};
@@ -5548,6 +5605,44 @@ mod tests {
     }
 
     #[test]
+    fn format_auto_recover_decision_notification_shows_cause_plan_task_and_continue_state() {
+        let mut blocked = test_blocked_context(
+            "A2",
+            "stabilize waiting-merge retry path",
+            3,
+            Some("https://example.test/pull/1"),
+            "merge state is dirty for PR_URL=https://example.test/pull/1",
+            Some(
+                "merge state is dirty for PR_URL=https://example.test/pull/1\nconflicts detected in generated branch",
+            ),
+            Utc::now(),
+        );
+        blocked.auto_recover = Some(AutoRecoverDecisionSnapshot {
+            state: AutoRecoverDecisionState::Queued,
+            decided_at: Utc::now(),
+            reason_key: "merge state is dirty".to_string(),
+            attempts: 1,
+            same_reason_count: 1,
+            max_attempts: 3,
+            guard_reason: None,
+            recovery_task: Some(RecoveryTaskSnapshot {
+                id: "A2-RECOVER".to_string(),
+                line: 4,
+                text: "resolve waiting_merge block for task A2 (stabilize waiting-merge retry path): PR branch を clean にして merge 不能 を解消する".to_string(),
+            }),
+        });
+
+        let msg = format_auto_recover_decision_notification(&blocked)
+            .expect("recovery decision notification");
+        assert!(msg.starts_with("auto-recovery decision: A2 PR_URL=https://example.test/pull/1"));
+        assert!(msg.contains("- 原因:"));
+        assert!(msg.contains("conflicts detected in generated branch"));
+        assert!(msg.contains("- 解決方針:"));
+        assert!(msg.contains("- 実際に積んだ recovery task: A2-RECOVER:"));
+        assert!(msg.contains("- 状態: auto-recover 継続"));
+    }
+
+    #[test]
     fn format_orphan_blocked_notification_mentions_requester() {
         let run = TestRunDir::new("orphan-notify");
         let run_id = Uuid::new_v4();
@@ -5746,6 +5841,22 @@ mod tests {
             recovery_text.starts_with("resolve waiting_merge block for task A2 (original task):")
         );
         assert!(recovery_text.contains("job rust failed in merge recheck"));
+
+        let dispatched =
+            read_jsonl::<DispatchedNotification>(&run.path.join("notify-dispatched.jsonl"))
+                .expect("read dispatched notifications");
+        let decision_note = dispatched
+            .iter()
+            .find(|item| item.kind == "task_recovery_decision")
+            .expect("recovery decision notification");
+        assert!(decision_note.message.contains("- 原因:"));
+        assert!(decision_note.message.contains("- 解決方針:"));
+        assert!(
+            decision_note
+                .message
+                .contains("- 実際に積んだ recovery task:")
+        );
+        assert!(decision_note.message.contains("- 状態: auto-recover 継続"));
 
         let content = fs::read_to_string(&task_file).expect("read task file");
         assert!(content.contains("- [x] A2: original task"));

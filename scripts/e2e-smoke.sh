@@ -1103,11 +1103,12 @@ PY
   sleep 1
 done
 
-python3 - <<'PY' "$STATUS13" "$TASKFILE13" "$WORKDIR/.ralph/runs/$RUN13/events.jsonl"
+python3 - <<'PY' "$STATUS13" "$TASKFILE13" "$WORKDIR/.ralph/runs/$RUN13/events.jsonl" "$WORKDIR/.ralph/runs/$RUN13/notify-dispatched.jsonl"
 import json, pathlib, sys
 status = json.loads(sys.argv[1])
 taskfile = pathlib.Path(sys.argv[2])
 events_path = pathlib.Path(sys.argv[3])
+dispatched_path = pathlib.Path(sys.argv[4])
 
 content = taskfile.read_text()
 if "- [x] S5X-1: blocked sample task" not in content:
@@ -1122,6 +1123,15 @@ if "resolve runner block for task S5X-1 (blocked sample task):" not in content:
 events = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
 if not any(e.get("kind") == "task_blocked_auto_recovered" for e in events):
     raise SystemExit("expected task_blocked_auto_recovered event")
+
+dispatched = [json.loads(line) for line in dispatched_path.read_text().splitlines() if line.strip()]
+recovery_notes = [d for d in dispatched if d.get("kind") == "task_recovery_decision"]
+if not recovery_notes:
+    raise SystemExit(f"expected task_recovery_decision notification, got {dispatched}")
+msg = recovery_notes[-1].get("message") or ""
+for needle in ["- 原因:", "- 解決方針:", "- 実際に積んだ recovery task:", "- 状態: auto-recover 継続"]:
+    if needle not in msg:
+        raise SystemExit(f"expected {needle!r} in recovery decision notification, got: {msg!r}")
 
 runner = status.get("runner") or {}
 last_id = runner.get("last_task_id")

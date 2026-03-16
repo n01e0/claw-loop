@@ -20,6 +20,7 @@ pub(crate) fn notification_delivery_mode(kind: &str) -> NotificationDeliveryMode
             | "all_tasks_completed"
             | "pr_closed"
             | "task_blocked"
+            | "task_recovery_decision"
             | "task_done"
     );
 
@@ -288,6 +289,10 @@ mod tests {
         );
         assert_eq!(
             notification_delivery_mode("task_blocked"),
+            NotificationDeliveryMode::Send
+        );
+        assert_eq!(
+            notification_delivery_mode("task_recovery_decision"),
             NotificationDeliveryMode::Send
         );
         assert_eq!(
