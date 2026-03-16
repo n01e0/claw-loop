@@ -36,7 +36,7 @@ PY
 }
 
 get_first_line() {
-  printf '%s' "$1" | head -n1 | tr -d '\r'
+  printf '%s\n' "$1" | awk '{ sub(/\r$/, ""); if ($0 ~ /[^[:space:]]/) { print; exit } }'
 }
 
 parse_pr_url() {
