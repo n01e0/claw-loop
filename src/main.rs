@@ -1492,6 +1492,38 @@ fn blocked_reason_seed_for_auto_recovery(blocked: &BlockedContext) -> &str {
         .unwrap_or(blocked.reason_summary.as_str())
 }
 
+fn recovery_task_subject(blocked: &BlockedContext) -> String {
+    let label = blocked.task_id.trim();
+    match blocked.task_text.as_deref().map(str::trim) {
+        Some(text) if !text.is_empty() => {
+            format!("task {} ({})", label, clip_text(text, 72))
+        }
+        _ => format!("task {label}"),
+    }
+}
+
+fn build_recovery_task_text(blocked: &BlockedContext) -> String {
+    let subject = recovery_task_subject(blocked);
+    let scope = match blocked.source {
+        BlockedContextSource::RunnerExit => "resolve runner block for",
+        BlockedContextSource::WaitingMerge => "resolve waiting_merge block for",
+    };
+    let action = blocked
+        .recovery_hint
+        .as_deref()
+        .unwrap_or_else(|| blocked_recovery_hint(&blocked.reason_summary))
+        .trim();
+    let blocked_reason = clip_text(
+        &compact_blocked_reason(blocked_reason_seed_for_auto_recovery(blocked)),
+        120,
+    );
+    let mut text = format!("{scope} {subject}: {action}");
+    if !blocked_reason.is_empty() {
+        text.push_str(&format!(" (blocked: {blocked_reason})"));
+    }
+    clip_text(&text, 240)
+}
+
 fn auto_recover_guard_reason(
     blocked_task_id: &str,
     reason_key: &str,
@@ -1601,8 +1633,9 @@ fn maybe_auto_recover_blocked_task(
         return Ok(AutoRecoverBlockedOutcome::Halted);
     }
 
+    let recovery_task_text = build_recovery_task_text(blocked);
     let recovery_task =
-        append_recovery_task_for_blocked(task_file_abs, blocked_task_id, &blocked.reason_summary)?;
+        append_recovery_task_for_blocked(task_file_abs, blocked_task_id, &recovery_task_text)?;
     sync_manifest_tasklist_hash(manifest_path, manifest, task_file_abs)?;
     let _ = update_task_check(task_file_abs, blocked_task_id, true)?;
     *task_done_now = task_checklist_done_count(task_file_abs)?;
@@ -4883,12 +4916,13 @@ mod tests {
         RunnerTaskState, State, TaskChecklistEntry, WaitingMergeProgress, ack_retry_policy,
         append_jsonl, apply_status_establish_retry_override, auto_merge_unavailable_error,
         auto_recover_guard_reason, blocked_reason_from_runner, blocked_recovery_hint,
-        classify_ack_failure_category, completion_guard_waiting_fallback_line,
-        compute_auto_stop_reason, compute_backoff_sec, dead_letter_path, delivery_ack_path,
-        delivery_attempts_path, delivery_retry_backoff_sec, emit_all_tasks_completed_notifications,
-        ensure_task_agent_exists_with, ensure_waiting_merge_progress_with, extract_pr_url,
-        flush_notifications, format_orphan_blocked_notification, format_task_blocked_notification,
-        lease_window_sec, maybe_auto_recover_blocked_task, normalize_blocked_reason_for_recovery,
+        build_recovery_task_text, classify_ack_failure_category,
+        completion_guard_waiting_fallback_line, compute_auto_stop_reason, compute_backoff_sec,
+        dead_letter_path, delivery_ack_path, delivery_attempts_path, delivery_retry_backoff_sec,
+        emit_all_tasks_completed_notifications, ensure_task_agent_exists_with,
+        ensure_waiting_merge_progress_with, extract_pr_url, flush_notifications,
+        format_orphan_blocked_notification, format_task_blocked_notification, lease_window_sec,
+        maybe_auto_recover_blocked_task, normalize_blocked_reason_for_recovery,
         normalize_error_reason, notification_delivery_mode, openclaw_notify_timeout_sec_from,
         parse_openclaw_message_id, parse_task_checklist_entry, queue_main_feedback_summary,
         queue_notification, read_jsonl, retryable_waiting_merge_error, select_next_task_entry,
@@ -5535,6 +5569,27 @@ mod tests {
     }
 
     #[test]
+    fn build_recovery_task_text_uses_hint_and_task_context() {
+        let blocked = test_blocked_context(
+            "A2",
+            "stabilize waiting-merge retry path",
+            3,
+            Some("https://example.test/pull/1"),
+            "merge state is dirty for PR_URL=https://example.test/pull/1",
+            Some("merge state is dirty for PR_URL=https://example.test/pull/1\nconflicts detected"),
+            Utc::now(),
+        );
+
+        let text = build_recovery_task_text(&blocked);
+        assert!(text.starts_with(
+            "resolve waiting_merge block for task A2 (stabilize waiting-merge retry path):"
+        ));
+        assert!(text.contains("merge 不能"));
+        assert!(text.contains("blocked: merge state is dirty"));
+        assert!(text.chars().count() <= 241);
+    }
+
+    #[test]
     fn build_runner_blocked_context_keeps_detail_and_output_excerpts() {
         let task = TaskChecklistEntry {
             line_no: 7,
@@ -5686,14 +5741,11 @@ mod tests {
             decision.reason_key,
             "ci failed for pr_url=https://example.test/pull/1 checks=rust:failure job rust failed in merge recheck"
         );
+        let recovery_text = &decision.recovery_task.as_ref().expect("recovery task").text;
         assert!(
-            decision
-                .recovery_task
-                .as_ref()
-                .expect("recovery task")
-                .text
-                .starts_with("auto-recover from A2:")
+            recovery_text.starts_with("resolve waiting_merge block for task A2 (original task):")
         );
+        assert!(recovery_text.contains("job rust failed in merge recheck"));
 
         let content = fs::read_to_string(&task_file).expect("read task file");
         assert!(content.contains("- [x] A2: original task"));
