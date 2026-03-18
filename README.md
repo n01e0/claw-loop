@@ -51,12 +51,15 @@ cargo run -- start \
   --deliver-openclaw \
   --max-task-loops 10 \
   --task-runner-cmd './scripts/rl-task-agent.sh' \
+  --require-task-approval \
   --approved-tasklist-hash <approved_tasklist_hash> \
   --auto-recover-blocked \
   --auto-recover-blocked-max-attempts 3
 ```
 
-Start will fail if:
+By default, `start` no longer requires task approval markers.
+
+If you pass `--require-task-approval`, start will fail if:
 
 - approval markers are missing
 - `--approved-tasklist-hash` is missing
@@ -88,21 +91,21 @@ cargo run -- stop --repo . --run-id <run_id> --immediate
 - One task at a time from a markdown checklist (`--task-file`)
 - Runner command (`--task-runner-cmd`) receives task context env vars
 - Daemon ticks periodically (`--tick-sec`) and records every transition
-- Start is gated by explicit tasklist approval (`Approved-By`, `Approved-At`, and `--approved-tasklist-hash`)
+- Start is not gated by tasklist approval unless you explicitly pass `--require-task-approval` together with `--approved-tasklist-hash`
 
 ### Planning gate / approval contract
 
-`claw-loopd` now enforces approval at the runtime layer, not just operator convention.
+Task approval is now **optional / opt-in**.
 
-- `task-approve` stamps the tasklist with:
+- `task-approve` still stamps the tasklist with:
   - `Approved-By: <name>`
   - `Approved-At: <RFC3339 timestamp>`
 - It also prints a canonical `approved_tasklist_hash`
-- `start` refuses to run unless the provided hash matches the current approved task plan
-- During a run, daemon re-checks the approved plan hash each tick
+- `start` only enforces approval when you pass `--require-task-approval` together with `--approved-tasklist-hash`
+- While approval is enabled for a run, daemon re-checks the approved plan hash each tick
 - If the plan changes outside daemon-owned mutations, run is blocked with `tasklist approval invalidated`
 
-The approved hash is based on task IDs/text in checklist order, so checkbox flips (`[ ]` → `[x]`) do not invalidate the run.
+The approved hash is based on task IDs/text in checklist order, so checkbox flips (`[ ]` → `[x]`) do not invalidate the run. Approval metadata drift alone no longer invalidates an active run.
 
 ### Strict done contract
 
