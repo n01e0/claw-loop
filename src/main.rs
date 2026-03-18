@@ -1462,6 +1462,22 @@ fn blocked_next_step(manifest: &Manifest, task_label: &str) -> &'static str {
     }
 }
 
+fn blocked_intervention_line(
+    manifest: &Manifest,
+    task_label: &str,
+    phase_or_stacked: bool,
+) -> &'static str {
+    if phase_or_stacked {
+        "人手介入: 必要。依存先 task / PR の特定、task 分割の見直し、または phase / stacked 順序の調整を行う"
+    } else if !manifest.auto_recover_blocked {
+        "人手介入: いま必要。daemon は自動修復しないので、原因を直してから再実行する"
+    } else if task_label.contains("-RECOVER") {
+        "人手介入: いま必要。auto-recover は停止済みで、同じ経路では自然回復しない"
+    } else {
+        "人手介入: まずは不要。daemon が auto-recover を試すが、同じ理由が続く・recovery task が失敗する・依存先が不明なままなら介入する"
+    }
+}
+
 fn format_task_blocked_notification(manifest: &Manifest, blocked: &BlockedContext) -> String {
     let mention = completion_mention_prefix(manifest);
     let compact_reason = compact_blocked_reason(&blocked.reason_summary);
@@ -1478,13 +1494,19 @@ fn format_task_blocked_notification(manifest: &Manifest, blocked: &BlockedContex
     } else {
         String::new()
     };
-    let classification_line = if is_phase_or_stacked_dependency_reason(&compact_reason)
-        || is_phase_or_stacked_dependency_reason(&compact_detail)
-    {
+    let phase_or_stacked = is_phase_or_stacked_dependency_reason(&compact_reason)
+        || is_phase_or_stacked_dependency_reason(&compact_detail);
+    let classification_line = if phase_or_stacked {
         "\n- 分類: phase/stacked dependency が必要。1 task 1 PR ではなく前段 task / PR の完了待ちとして扱うべき状態"
     } else {
-        ""
+        "\n- 分類: generic blocked。依存待ちではなく、現在の task / PR / runner 側で原因修正が必要"
     };
+    let waiting_line = if phase_or_stacked {
+        "\n- 今待っているもの: 前段 task / PR の特定または順序調整。依存先が判明したら `TASK_WAITING_DEPENDENCY` として待機へ切り替える"
+    } else {
+        "\n- 今待っているもの: 自然解消待ちはない。原因修正または auto-recover の結果待ち"
+    };
+    let intervention_line = blocked_intervention_line(manifest, &blocked.task_id, phase_or_stacked);
     let recovery = blocked
         .recovery_hint
         .as_deref()
@@ -1499,8 +1521,26 @@ fn format_task_blocked_notification(manifest: &Manifest, blocked: &BlockedContex
         .unwrap_or_default();
 
     format!(
-        "{mention}タスクが block された: {}{pr_suffix}\n- 原因: {reason_summary}{detail_line}{classification_line}\n- 解決方法: {recovery}\n- {next}",
+        "{mention}タスクが block された: {}{pr_suffix}\n- 原因: {reason_summary}{detail_line}{classification_line}{waiting_line}\n- 解決方法: {recovery}\n- {intervention_line}\n- {next}",
         blocked.task_id
+    )
+}
+
+fn format_waiting_merge_notification(
+    task_label: &str,
+    pr_url: Option<&str>,
+    required_checks_missing: bool,
+) -> String {
+    let wait_target = pr_url
+        .map(|url| format!("PR {url} の CI / merge 完了"))
+        .unwrap_or_else(|| "current task PR の CI / merge 完了".to_string());
+    let checks_line = if required_checks_missing {
+        "\n- 注意: required status checks が branch 保護で強制されていない可能性がある。CI が green でも merge 条件を人間が確認する"
+    } else {
+        ""
+    };
+    format!(
+        "task waiting merge: {task_label}\n- 分類: waiting_merge（generic blocked ではない）\n- 今待っているもの: {wait_target}\n- 次に進む条件: PR が merged したら daemon が task 完了へ進める{checks_line}\n- 人手介入: 通常は不要。CI fail / DIRTY / merge conflict / warning が出た時だけ確認する"
     )
 }
 
@@ -2176,7 +2216,7 @@ fn format_waiting_dependency_notification(
         waits_on.join(" and ")
     };
     format!(
-        "task waiting dependency: {task_label}; waiting on {waits_on}; this task is intentionally not being forced into a standalone PR because it depends on a prior phase/stacked change; auto-recover stays idle until the dependency clears"
+        "task waiting dependency: {task_label}\n- 分類: dependency wait（generic blocked ではない）\n- 今待っているもの: {waits_on}; standalone PR に押し込まず、前段 phase/stacked change の完了を待つ\n- 次に進む条件: 依存 task / PR が片付いたら daemon が自動で再開する\n- 人手介入: 原則不要。依存先が長時間進まない・依存先指定が誤っている・依存先を特定できない場合のみ必要\n- Auto-recover: idle（dependency が解消するまで recovery task は積まない）"
     )
 }
 
@@ -4160,18 +4200,12 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                         pr_url.as_deref(),
                                     );
 
-                                    let pr_suffix =
-                                        pr_url.map(|u| format!(" PR_URL={u}")).unwrap_or_default();
-                                    let checks_warn_suffix = if first_stdout_line
-                                        .contains("WARN_REQUIRED_CHECKS_MISSING=1")
-                                    {
-                                        " [warning: required status checks may be missing on target branch]"
-                                    } else {
-                                        ""
-                                    };
-                                    notification_message = format!(
-                                        "task waiting merge: {}{}{}",
-                                        task_label, pr_suffix, checks_warn_suffix
+                                    let required_checks_missing = first_stdout_line
+                                        .contains("WARN_REQUIRED_CHECKS_MISSING=1");
+                                    notification_message = format_waiting_merge_notification(
+                                        &task_label,
+                                        pr_url.as_deref(),
+                                        required_checks_missing,
                                     );
                                 }
                                 WaitingContract::Other { contract_line } => {
@@ -4187,7 +4221,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                     runner_state.current_task_pr_url = None;
 
                                     notification_message =
-                                        format!("task waiting merge: {}", task_label);
+                                        format_waiting_merge_notification(&task_label, None, false);
                                 }
                                 WaitingContract::WaitingDependency(context) => {
                                     let context =
@@ -5551,11 +5585,12 @@ mod tests {
         extract_pr_url, flush_notifications, format_auto_recover_decision_notification,
         format_auto_recover_halt_notification, format_orphan_blocked_notification,
         format_task_blocked_notification, format_waiting_dependency_notification,
-        is_phase_or_stacked_dependency_reason, lease_window_sec, maybe_auto_recover_blocked_task,
-        normalize_blocked_reason_for_recovery, normalize_error_reason, notification_delivery_mode,
-        openclaw_notify_timeout_sec_from, parse_openclaw_message_id, parse_task_checklist_entry,
-        parse_waiting_contract, parse_waiting_dependency_contract, queue_main_feedback_summary,
-        queue_notification, read_jsonl, retryable_waiting_merge_error, select_next_task_entry,
+        format_waiting_merge_notification, is_phase_or_stacked_dependency_reason, lease_window_sec,
+        maybe_auto_recover_blocked_task, normalize_blocked_reason_for_recovery,
+        normalize_error_reason, notification_delivery_mode, openclaw_notify_timeout_sec_from,
+        parse_openclaw_message_id, parse_task_checklist_entry, parse_waiting_contract,
+        parse_waiting_dependency_contract, queue_main_feedback_summary, queue_notification,
+        read_jsonl, retryable_waiting_merge_error, select_next_task_entry,
         should_force_status_establish_retry, should_suppress_waiting_stuck, task_contract_line,
         tasklist_approval_violation_reason, update_waiting_stuck_tracker,
         validate_task_done_contract_with, waiting_merge_nonprogress_reason, write_json,
@@ -6162,9 +6197,32 @@ mod tests {
 
         assert!(msg.starts_with("<@test-user-id> タスクが block された: S5-2"));
         assert!(msg.contains("- 原因:"));
+        assert!(msg.contains("- 分類: generic blocked。依存待ちではなく、現在の task / PR / runner 側で原因修正が必要"));
+        assert!(msg.contains(
+            "- 今待っているもの: 自然解消待ちはない。原因修正または auto-recover の結果待ち"
+        ));
+        assert!(msg.contains("- 人手介入: まずは不要。daemon が auto-recover を試す"));
         assert!(msg.contains("- 解決方法:"));
         assert!(msg.contains("次の動作: auto-recover が有効"));
         assert!(msg.contains("PR_URL=https://github.com/n01e0/claw-loop/pull/999"));
+    }
+
+    #[test]
+    fn format_waiting_merge_notification_names_wait_target_and_intervention() {
+        let msg = format_waiting_merge_notification(
+            "D6",
+            Some("https://github.com/n01e0/claw-loop/pull/126"),
+            true,
+        );
+
+        assert!(msg.contains("task waiting merge: D6"));
+        assert!(msg.contains("- 分類: waiting_merge（generic blocked ではない）"));
+        assert!(msg.contains(
+            "- 今待っているもの: PR https://github.com/n01e0/claw-loop/pull/126 の CI / merge 完了"
+        ));
+        assert!(msg.contains("- 次に進む条件: PR が merged したら daemon が task 完了へ進める"));
+        assert!(msg.contains("required status checks"));
+        assert!(msg.contains("- 人手介入: 通常は不要。CI fail / DIRTY / merge conflict / warning が出た時だけ確認する"));
     }
 
     #[test]
@@ -6216,8 +6274,10 @@ mod tests {
         assert!(msg.contains("- 詳細:"));
         assert!(msg.contains("green PR"));
         assert!(msg.contains("- 分類: phase/stacked dependency が必要。1 task 1 PR ではなく前段 task / PR の完了待ちとして扱うべき状態"));
+        assert!(msg.contains("- 今待っているもの: 前段 task / PR の特定または順序調整。依存先が判明したら `TASK_WAITING_DEPENDENCY` として待機へ切り替える"));
         assert!(msg.contains("phase/stacked sequencing が必要"));
         assert!(msg.contains("`TASK_WAITING_DEPENDENCY`"));
+        assert!(msg.contains("- 人手介入: 必要。依存先 task / PR の特定、task 分割の見直し、または phase / stacked 順序の調整を行う"));
         assert!(msg.contains(
             "生成された recovery task 自体が失敗したので、auto-recover はここで停止する"
         ));
@@ -6822,13 +6882,18 @@ mod tests {
 
         let message = format_waiting_dependency_notification("D3", &context);
         assert!(message.contains("task waiting dependency: D3"));
+        assert!(message.contains("- 分類: dependency wait（generic blocked ではない）"));
         assert!(
             message
-                .contains("waiting on task D2 and PR https://github.com/n01e0/claw-loop/pull/121")
+                .contains("- 今待っているもの: task D2 and PR https://github.com/n01e0/claw-loop/pull/121; standalone PR に押し込まず、前段 phase/stacked change の完了を待つ")
         );
-        assert!(message.contains("not being forced into a standalone PR"));
-        assert!(message.contains("prior phase/stacked change"));
-        assert!(message.contains("auto-recover stays idle"));
+        assert!(
+            message.contains("- 次に進む条件: 依存 task / PR が片付いたら daemon が自動で再開する")
+        );
+        assert!(message.contains("- 人手介入: 原則不要。依存先が長時間進まない・依存先指定が誤っている・依存先を特定できない場合のみ必要"));
+        assert!(message.contains(
+            "- Auto-recover: idle（dependency が解消するまで recovery task は積まない）"
+        ));
     }
 
     #[test]
