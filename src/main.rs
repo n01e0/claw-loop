@@ -262,8 +262,19 @@ enum RunnerTaskState {
     Queued,
     Running,
     WaitingMerge,
+    WaitingDependency,
     Blocked,
     Done,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+struct WaitingDependencyContext {
+    task_id: String,
+    #[serde(default)]
+    depends_on_task: Option<String>,
+    #[serde(default)]
+    depends_on_pr_url: Option<String>,
+    contract_line: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -340,6 +351,8 @@ struct RunnerState {
     #[serde(default)]
     current_task_state: Option<RunnerTaskState>,
     #[serde(default)]
+    current_waiting_dependency: Option<WaitingDependencyContext>,
+    #[serde(default)]
     current_task_blocked_reason: Option<String>,
     #[serde(default)]
     current_blocked_context: Option<BlockedContext>,
@@ -357,6 +370,8 @@ struct RunnerState {
     last_blocked_context: Option<BlockedContext>,
     #[serde(default)]
     last_task_pr_url: Option<String>,
+    #[serde(default)]
+    last_waiting_dependency: Option<WaitingDependencyContext>,
     #[serde(default)]
     task_loops_started: u64,
     #[serde(default)]
@@ -1213,6 +1228,7 @@ fn apply_blocked_context(
     now: DateTime<Utc>,
 ) {
     runner_state.current_task_state = Some(RunnerTaskState::Blocked);
+    runner_state.current_waiting_dependency = None;
     runner_state.current_task_blocked_reason = Some(context.reason_summary.clone());
     runner_state.current_blocked_context = Some(context.clone());
     runner_state.current_task_pr_url = context.pr_url.clone();
@@ -1233,6 +1249,10 @@ fn apply_blocked_context(
 fn clear_current_blocked_context(runner_state: &mut RunnerState) {
     runner_state.current_task_blocked_reason = None;
     runner_state.current_blocked_context = None;
+}
+
+fn clear_current_waiting_dependency(runner_state: &mut RunnerState) {
+    runner_state.current_waiting_dependency = None;
 }
 
 fn format_local_as_of(ts: DateTime<Utc>) -> String {
@@ -1824,6 +1844,7 @@ fn maybe_auto_recover_blocked_task(
     runner_state.current_task_started_at = None;
     runner_state.current_task_state = None;
     clear_current_blocked_context(runner_state);
+    clear_current_waiting_dependency(runner_state);
     runner_state.current_task_pr_url = None;
     runner_state.paused = false;
     runner_state.pause_reason = None;
@@ -1915,9 +1936,10 @@ fn update_waiting_stuck_tracker(
     Some(runner_state.waiting_unchanged_ticks)
 }
 
-fn extract_pr_url(line: &str) -> Option<String> {
+fn extract_contract_value(line: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
     line.split_whitespace().find_map(|token| {
-        let raw = token.strip_prefix("PR_URL=")?;
+        let raw = token.strip_prefix(&prefix)?;
         let trimmed = raw.trim_matches(|c: char| {
             c.is_whitespace()
                 || matches!(
@@ -1925,12 +1947,112 @@ fn extract_pr_url(line: &str) -> Option<String> {
                     ',' | ';' | '(' | ')' | '[' | ']' | '<' | '>' | '"' | '\''
                 )
         });
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
     })
+}
+
+fn extract_pr_url(line: &str) -> Option<String> {
+    extract_contract_value(line, "PR_URL")
+}
+
+fn is_absolute_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
+fn parse_waiting_dependency_contract(
+    line: &str,
+    fallback_task_id: Option<&str>,
+) -> Result<WaitingDependencyContext> {
+    let contract_line = line.trim();
+    if !contract_line.starts_with("TASK_WAITING_DEPENDENCY") {
+        bail!("first line must start with TASK_WAITING_DEPENDENCY");
+    }
+
+    let task_id = extract_contract_value(contract_line, "TASK_ID")
+        .or_else(|| {
+            fallback_task_id
+                .map(str::trim)
+                .filter(|task_id| !task_id.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .ok_or_else(|| anyhow::anyhow!("TASK_WAITING_DEPENDENCY requires TASK_ID=<id>"))?;
+    let depends_on_task = extract_contract_value(contract_line, "DEPENDS_ON_TASK");
+    let depends_on_pr_url = extract_contract_value(contract_line, "DEPENDS_ON_PR_URL");
+
+    if depends_on_task.is_none() && depends_on_pr_url.is_none() {
+        bail!(
+            "TASK_WAITING_DEPENDENCY requires DEPENDS_ON_TASK=<id> or DEPENDS_ON_PR_URL=<absolute-url>"
+        );
+    }
+
+    if let Some(depends_on_pr_url) = depends_on_pr_url.as_deref()
+        && !is_absolute_url(depends_on_pr_url)
+    {
+        bail!("DEPENDS_ON_PR_URL must be absolute URL: {depends_on_pr_url}");
+    }
+
+    Ok(WaitingDependencyContext {
+        task_id,
+        depends_on_task,
+        depends_on_pr_url,
+        contract_line: contract_line.to_string(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WaitingContract {
+    WaitingMerge {
+        contract_line: Option<String>,
+        pr_url: Option<String>,
+    },
+    WaitingDependency(WaitingDependencyContext),
+    Other {
+        contract_line: Option<String>,
+    },
+}
+
+fn parse_waiting_contract(
+    first_stdout_line: &str,
+    exit_code: Option<i32>,
+    fallback_task_id: Option<&str>,
+) -> Result<Option<WaitingContract>> {
+    let trimmed = first_stdout_line.trim();
+    if trimmed.starts_with("TASK_WAITING_DEPENDENCY") {
+        return Ok(Some(WaitingContract::WaitingDependency(
+            parse_waiting_dependency_contract(trimmed, fallback_task_id)?,
+        )));
+    }
+    if trimmed.starts_with("TASK_WAITING_MERGE") {
+        return Ok(Some(WaitingContract::WaitingMerge {
+            contract_line: Some(trimmed.to_string()),
+            pr_url: extract_pr_url(trimmed),
+        }));
+    }
+    if trimmed.starts_with("TASK_WAITING") {
+        return Ok(Some(WaitingContract::Other {
+            contract_line: Some(trimmed.to_string()),
+        }));
+    }
+    if exit_code == Some(10) {
+        return Ok(Some(WaitingContract::Other {
+            contract_line: (!trimmed.is_empty()).then(|| trimmed.to_string()),
+        }));
+    }
+    Ok(None)
+}
+
+fn format_waiting_dependency_notification(
+    task_label: &str,
+    context: &WaitingDependencyContext,
+) -> String {
+    let mut message = format!("task waiting dependency: {task_label}");
+    if let Some(depends_on_task) = context.depends_on_task.as_deref() {
+        message.push_str(&format!(" depends_on_task={depends_on_task}"));
+    }
+    if let Some(depends_on_pr_url) = context.depends_on_pr_url.as_deref() {
+        message.push_str(&format!(" depends_on_pr_url={depends_on_pr_url}"));
+    }
+    message
 }
 
 fn parse_github_pr_url(pr_url: &str) -> Result<(String, u64)> {
@@ -2195,7 +2317,7 @@ fn validate_task_done_contract_with(
     let pr_url = extract_pr_url(first_stdout_line)
         .ok_or_else(|| anyhow::anyhow!("TASK_DONE line must include PR_URL=<url>"))?;
 
-    if !pr_url.starts_with("http://") && !pr_url.starts_with("https://") {
+    if !is_absolute_url(&pr_url) {
         bail!("PR_URL must be absolute URL: {pr_url}");
     }
 
@@ -3323,6 +3445,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             runner_state.current_task_started_at = None;
                             runner_state.current_task_state = None;
                             clear_current_blocked_context(&mut runner_state);
+                            clear_current_waiting_dependency(&mut runner_state);
                             runner_state.current_task_pr_url = None;
                             write_runner_state(&dir, &runner_state)?;
                             task_done_now = task_checklist_done_count(&task_file_abs)?;
@@ -3379,6 +3502,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                                 runner_state.current_task_started_at = None;
                                                 runner_state.current_task_state = None;
                                                 clear_current_blocked_context(&mut runner_state);
+                                                clear_current_waiting_dependency(&mut runner_state);
                                                 runner_state.current_task_pr_url = None;
 
                                                 append_event(
@@ -3485,6 +3609,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                                 runner_state.current_task_state =
                                                     Some(RunnerTaskState::WaitingMerge);
                                                 clear_current_blocked_context(&mut runner_state);
+                                                clear_current_waiting_dependency(&mut runner_state);
                                                 state.summary =
                                                     format!("task waiting_merge: {}", entry.id);
                                                 state.waiting_reason = reason.clone();
@@ -3553,6 +3678,28 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                             format!("TASK_WAITING_MERGE ({})", entry.id);
                                     }
                                 }
+                                Some(RunnerTaskState::WaitingDependency) => {
+                                    let waiting_dependency = runner_state
+                                        .current_waiting_dependency
+                                        .as_ref()
+                                        .or_else(|| {
+                                            runner_state
+                                                .last_waiting_dependency
+                                                .as_ref()
+                                                .filter(|context| context.task_id == entry.id)
+                                        });
+                                    state.summary = format!(
+                                        "task waiting_dependency: {}",
+                                        waiting_dependency
+                                            .map(|context| context.task_id.as_str())
+                                            .unwrap_or(entry.id.as_str())
+                                    );
+                                    state.waiting_reason = waiting_dependency
+                                        .map(|context| clip_text(&context.contract_line, 200))
+                                        .unwrap_or_else(|| {
+                                            format!("TASK_WAITING_DEPENDENCY TASK_ID={}", entry.id)
+                                        });
+                                }
                                 Some(RunnerTaskState::Blocked) => {
                                     state.summary = format!("task blocked: {}", entry.id);
                                     state.waiting_reason = runner_state
@@ -3578,6 +3725,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             state.version += 1;
                             runner_state.current_task_state = Some(RunnerTaskState::Blocked);
                             clear_current_blocked_context(&mut runner_state);
+                            clear_current_waiting_dependency(&mut runner_state);
                             runner_state.current_task_blocked_reason =
                                 Some("task missing from checklist".into());
                             runner_state.last_task_id = Some(active_id.clone());
@@ -3606,6 +3754,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                         runner_state.paused = true;
                         runner_state.current_task_state = None;
                         clear_current_blocked_context(&mut runner_state);
+                        clear_current_waiting_dependency(&mut runner_state);
                         runner_state.current_task_pr_url = None;
                         runner_state.pause_reason = Some(format!(
                             "max_task_loops reached ({}/{})",
@@ -3628,6 +3777,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                         runner_state.paused = true;
                         runner_state.current_task_state = None;
                         clear_current_blocked_context(&mut runner_state);
+                        clear_current_waiting_dependency(&mut runner_state);
                         runner_state.current_task_pr_url = None;
                         runner_state.pause_reason = Some("all tasklist items completed".into());
                         write_runner_state(&dir, &runner_state)?;
@@ -3670,6 +3820,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                         runner_state.current_task_started_at = Some(now);
                         runner_state.current_task_state = Some(RunnerTaskState::Queued);
                         clear_current_blocked_context(&mut runner_state);
+                        clear_current_waiting_dependency(&mut runner_state);
                         runner_state.current_task_pr_url = None;
                         runner_state.paused = false;
                         runner_state.pause_reason = None;
@@ -3688,7 +3839,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             ),
                         )?;
 
-                        let runner = run_task_once(TaskRunOptions {
+                        let mut runner = run_task_once(TaskRunOptions {
                             task_file: &task_file_abs,
                             selected_task: Some(queued_task.clone()),
                             cmd: &cmd,
@@ -3738,44 +3889,109 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             .map(|t| t.id.clone())
                             .unwrap_or_else(|| "unknown".to_string());
 
-                        if runner.exit_code == Some(10)
-                            || first_stdout_line.starts_with("TASK_WAITING")
-                        {
+                        let waiting_contract = match parse_waiting_contract(
+                            &first_stdout_line,
+                            runner.exit_code,
+                            runner.task.as_ref().map(|task| task.id.as_str()),
+                        ) {
+                            Ok(contract) => contract,
+                            Err(err) => {
+                                runner.success = false;
+                                if runner.exit_code.is_none() || runner.exit_code == Some(0) {
+                                    runner.exit_code = Some(65);
+                                }
+                                if !runner.stderr.trim().is_empty() {
+                                    runner.stderr.push('\n');
+                                }
+                                runner.stderr.push_str(&format!(
+                                    "waiting contract failed: {}",
+                                    err.to_string().replace('\n', " ")
+                                ));
+                                None
+                            }
+                        };
+
+                        if let Some(waiting_contract) = waiting_contract {
                             state.version += 1;
                             state.status = LoopStatus::Waiting;
-                            state.summary = format!("task waiting_merge: {task_label}");
-                            state.waiting_reason = if first_stdout_line.is_empty() {
-                                format!("task waiting_merge: {task_label}")
-                            } else {
-                                clip_text(&first_stdout_line, 200)
-                            };
                             state.updated_at = now;
 
-                            runner_state.current_task_state = Some(RunnerTaskState::WaitingMerge);
-                            clear_current_blocked_context(&mut runner_state);
-                            runner_state.current_task_pr_url = first_line_pr_url.clone();
+                            let mut notification_kind = "task_waiting_merge";
+                            let notification_message;
+
+                            match waiting_contract {
+                                WaitingContract::WaitingMerge {
+                                    contract_line,
+                                    pr_url,
+                                } => {
+                                    state.summary = format!("task waiting_merge: {task_label}");
+                                    state.waiting_reason = contract_line.unwrap_or_else(|| {
+                                        format!("task waiting_merge: {task_label}")
+                                    });
+
+                                    runner_state.current_task_state =
+                                        Some(RunnerTaskState::WaitingMerge);
+                                    clear_current_blocked_context(&mut runner_state);
+                                    clear_current_waiting_dependency(&mut runner_state);
+                                    runner_state.current_task_pr_url = pr_url.clone();
+
+                                    let pr_suffix =
+                                        pr_url.map(|u| format!(" PR_URL={u}")).unwrap_or_default();
+                                    let checks_warn_suffix = if first_stdout_line
+                                        .contains("WARN_REQUIRED_CHECKS_MISSING=1")
+                                    {
+                                        " [warning: required status checks may be missing on target branch]"
+                                    } else {
+                                        ""
+                                    };
+                                    notification_message = format!(
+                                        "task waiting merge: {}{}{}",
+                                        task_label, pr_suffix, checks_warn_suffix
+                                    );
+                                }
+                                WaitingContract::Other { contract_line } => {
+                                    state.summary = format!("task waiting_merge: {task_label}");
+                                    state.waiting_reason = contract_line.unwrap_or_else(|| {
+                                        format!("task waiting_merge: {task_label}")
+                                    });
+
+                                    runner_state.current_task_state =
+                                        Some(RunnerTaskState::WaitingMerge);
+                                    clear_current_blocked_context(&mut runner_state);
+                                    clear_current_waiting_dependency(&mut runner_state);
+                                    runner_state.current_task_pr_url = None;
+
+                                    notification_message =
+                                        format!("task waiting merge: {}", task_label);
+                                }
+                                WaitingContract::WaitingDependency(context) => {
+                                    state.summary =
+                                        format!("task waiting_dependency: {}", context.task_id);
+                                    state.waiting_reason = clip_text(&context.contract_line, 200);
+
+                                    runner_state.current_task_state =
+                                        Some(RunnerTaskState::WaitingDependency);
+                                    clear_current_blocked_context(&mut runner_state);
+                                    runner_state.current_task_pr_url = None;
+                                    runner_state.current_waiting_dependency = Some(context.clone());
+                                    runner_state.last_waiting_dependency = Some(context.clone());
+
+                                    notification_kind = "task_waiting_dependency";
+                                    notification_message = format_waiting_dependency_notification(
+                                        &task_label,
+                                        &context,
+                                    );
+                                }
+                            }
+
                             write_runner_state(&dir, &runner_state)?;
                             write_json(&dir.join("state.json"), &state)?;
 
-                            let pr_suffix = first_line_pr_url
-                                .clone()
-                                .map(|u| format!(" PR_URL={u}"))
-                                .unwrap_or_default();
-                            let checks_warn_suffix = if first_stdout_line
-                                .contains("WARN_REQUIRED_CHECKS_MISSING=1")
-                            {
-                                " [warning: required status checks may be missing on target branch]"
-                            } else {
-                                ""
-                            };
                             queue_notification(
                                 &dir,
                                 &manifest,
-                                "task_waiting_merge",
-                                format!(
-                                    "task waiting merge: {}{}{}",
-                                    task_label, pr_suffix, checks_warn_suffix
-                                ),
+                                notification_kind,
+                                notification_message,
                             )?;
                         } else if !runner.success {
                             let blocked_context = build_runner_blocked_context(
@@ -3870,6 +4086,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                 runner_state.current_task_started_at = None;
                                 runner_state.current_task_state = None;
                                 clear_current_blocked_context(&mut runner_state);
+                                clear_current_waiting_dependency(&mut runner_state);
                                 runner_state.current_task_pr_url = None;
 
                                 task_done_now = task_checklist_done_count(&task_file_abs)?;
@@ -3896,6 +4113,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                 runner_state.current_task_started_at = Some(now);
                                 runner_state.current_task_state = Some(RunnerTaskState::Running);
                                 clear_current_blocked_context(&mut runner_state);
+                                clear_current_waiting_dependency(&mut runner_state);
                                 runner_state.current_task_pr_url = first_line_pr_url.clone();
                                 state.status = LoopStatus::Waiting;
                                 state.summary = format!("task running: {}", task.id);
@@ -4191,6 +4409,7 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
         "line": runner_state.current_task_line,
         "started_at": runner_state.current_task_started_at,
         "state": runner_state.current_task_state.clone(),
+        "waiting_dependency": runner_state.current_waiting_dependency.clone(),
         "blocked_reason": runner_state.current_task_blocked_reason.clone(),
         "blocked_context": runner_state.current_blocked_context.clone(),
         "pr_url": runner_state.current_task_pr_url.clone(),
@@ -4225,6 +4444,7 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
         "current_task_line": runner_state.current_task_line,
         "current_task_started_at": runner_state.current_task_started_at,
         "current_task_state": runner_state.current_task_state.clone(),
+        "current_waiting_dependency": runner_state.current_waiting_dependency.clone(),
         "current_task_blocked_reason": runner_state.current_task_blocked_reason.clone(),
         "current_blocked_context": runner_state.current_blocked_context.clone(),
         "current_task_pr_url": runner_state.current_task_pr_url.clone(),
@@ -4234,6 +4454,7 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
         "last_task_reason": runner_state.last_task_reason.clone(),
         "last_blocked_context": runner_state.last_blocked_context.clone(),
         "last_task_pr_url": last_task_pr_url.clone(),
+        "last_waiting_dependency": runner_state.last_waiting_dependency.clone(),
         "current": runner_current_view,
         "last": runner_last_view,
         "paused": runner_state.paused,
@@ -5067,7 +5288,7 @@ mod tests {
         BlockedContext, BlockedContextSource, DeadLetterEntry, DeliveryAck, DeliveryAttempt,
         DispatchedNotification, GhPrView, GhStatusCheck, LoopStatus, Manifest, Notification,
         NotificationDeliveryMode, RecoveryTaskSnapshot, RunnerState, RunnerTaskState, State,
-        TaskChecklistEntry, WaitingMergeProgress, ack_retry_policy, append_jsonl,
+        TaskChecklistEntry, WaitingContract, WaitingMergeProgress, ack_retry_policy, append_jsonl,
         apply_status_establish_retry_override, auto_merge_unavailable_error,
         auto_recover_guard_reason, blocked_reason_from_runner, blocked_recovery_hint,
         build_recovery_task_text, classify_ack_failure_category,
@@ -5079,8 +5300,9 @@ mod tests {
         format_orphan_blocked_notification, format_task_blocked_notification, lease_window_sec,
         maybe_auto_recover_blocked_task, normalize_blocked_reason_for_recovery,
         normalize_error_reason, notification_delivery_mode, openclaw_notify_timeout_sec_from,
-        parse_openclaw_message_id, parse_task_checklist_entry, queue_main_feedback_summary,
-        queue_notification, read_jsonl, retryable_waiting_merge_error, select_next_task_entry,
+        parse_openclaw_message_id, parse_task_checklist_entry, parse_waiting_contract,
+        parse_waiting_dependency_contract, queue_main_feedback_summary, queue_notification,
+        read_jsonl, retryable_waiting_merge_error, select_next_task_entry,
         should_force_status_establish_retry, should_suppress_waiting_stuck, task_contract_line,
         tasklist_approval_violation_reason, update_waiting_stuck_tracker,
         validate_task_done_contract_with, waiting_merge_nonprogress_reason, write_json,
@@ -6273,6 +6495,71 @@ mod tests {
     }
 
     #[test]
+    fn parse_waiting_dependency_contract_accepts_task_or_pr_dependencies() {
+        let context = parse_waiting_dependency_contract(
+            "TASK_WAITING_DEPENDENCY TASK_ID=D2 DEPENDS_ON_TASK=D1 DEPENDS_ON_PR_URL=https://github.com/n01e0/claw-loop/pull/42",
+            None,
+        )
+        .expect("dependency wait should parse");
+
+        assert_eq!(context.task_id, "D2");
+        assert_eq!(context.depends_on_task.as_deref(), Some("D1"));
+        assert_eq!(
+            context.depends_on_pr_url.as_deref(),
+            Some("https://github.com/n01e0/claw-loop/pull/42")
+        );
+    }
+
+    #[test]
+    fn parse_waiting_dependency_contract_accepts_fallback_task_id() {
+        let context = parse_waiting_dependency_contract(
+            "TASK_WAITING_DEPENDENCY DEPENDS_ON_TASK=D1",
+            Some("D2"),
+        )
+        .expect("fallback task id should be accepted");
+
+        assert_eq!(context.task_id, "D2");
+        assert_eq!(context.depends_on_task.as_deref(), Some("D1"));
+    }
+
+    #[test]
+    fn parse_waiting_dependency_contract_requires_dependency_target() {
+        assert!(
+            parse_waiting_dependency_contract("TASK_WAITING_DEPENDENCY TASK_ID=D2", None).is_err()
+        );
+    }
+
+    #[test]
+    fn parse_waiting_dependency_contract_requires_absolute_pr_url() {
+        assert!(
+            parse_waiting_dependency_contract(
+                "TASK_WAITING_DEPENDENCY TASK_ID=D2 DEPENDS_ON_PR_URL=/pull/42",
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_waiting_contract_recognizes_dependency_wait_as_waiting() {
+        let waiting = parse_waiting_contract(
+            "TASK_WAITING_DEPENDENCY TASK_ID=D2 DEPENDS_ON_TASK=D1",
+            Some(10),
+            None,
+        )
+        .expect("waiting contract should parse");
+
+        match waiting {
+            Some(WaitingContract::WaitingDependency(context)) => {
+                assert_eq!(context.task_id, "D2");
+                assert_eq!(context.depends_on_task.as_deref(), Some("D1"));
+                assert_eq!(context.depends_on_pr_url, None);
+            }
+            other => panic!("expected dependency waiting contract, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn validate_task_done_contract_requires_task_done_prefix_and_pr_url() {
         assert!(validate_task_done_contract_with("TASK_BLOCKED: reason", |_| Ok(true)).is_err());
         assert!(validate_task_done_contract_with("TASK_DONE", |_| Ok(true)).is_err());
@@ -6332,6 +6619,10 @@ mod tests {
         );
         assert_eq!(
             notification_delivery_mode("task_waiting_merge"),
+            NotificationDeliveryMode::EditStatus
+        );
+        assert_eq!(
+            notification_delivery_mode("task_waiting_dependency"),
             NotificationDeliveryMode::EditStatus
         );
         assert_eq!(
