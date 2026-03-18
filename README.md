@@ -230,7 +230,7 @@ Runner must emit first-line protocol responses:
 - `TASK_WAITING_DEPENDENCY [TASK_ID=<id>] [DEPENDS_ON_TASK=<id>] [DEPENDS_ON_PR_URL=<absolute-url>]`
   - at least one of `DEPENDS_ON_TASK` / `DEPENDS_ON_PR_URL` is required
   - daemon preserves this as dependency waiting state (not `waiting_merge` and not `blocked`)
-  - daemon does **not** auto-resume from dependency waits yet; it only records/displays them accurately
+  - daemon does **not** auto-recover or auto-resume from dependency waits yet; it only records/displays them accurately and reports what is being waited on
 - `TASK_BLOCKED: <reason>`
 - `TASK_WAITING_AGENT_LOCK` (treated as waiting, not hard failure)
 

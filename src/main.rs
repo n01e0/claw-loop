@@ -2045,14 +2045,21 @@ fn format_waiting_dependency_notification(
     task_label: &str,
     context: &WaitingDependencyContext,
 ) -> String {
-    let mut message = format!("task waiting dependency: {task_label}");
+    let mut waits_on: Vec<String> = Vec::new();
     if let Some(depends_on_task) = context.depends_on_task.as_deref() {
-        message.push_str(&format!(" depends_on_task={depends_on_task}"));
+        waits_on.push(format!("task {depends_on_task}"));
     }
     if let Some(depends_on_pr_url) = context.depends_on_pr_url.as_deref() {
-        message.push_str(&format!(" depends_on_pr_url={depends_on_pr_url}"));
+        waits_on.push(format!("PR {depends_on_pr_url}"));
     }
-    message
+    let waits_on = if waits_on.is_empty() {
+        "an upstream dependency".to_string()
+    } else {
+        waits_on.join(" and ")
+    };
+    format!(
+        "task waiting dependency: {task_label}; waiting on {waits_on}; auto-recover stays idle until the dependency clears"
+    )
 }
 
 fn parse_github_pr_url(pr_url: &str) -> Result<(String, u64)> {
@@ -3976,6 +3983,18 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                     runner_state.current_waiting_dependency = Some(context.clone());
                                     runner_state.last_waiting_dependency = Some(context.clone());
 
+                                    append_event(
+                                        &dir,
+                                        "task_waiting_dependency",
+                                        serde_json::json!({
+                                            "task_id": context.task_id.clone(),
+                                            "depends_on_task": context.depends_on_task.clone(),
+                                            "depends_on_pr_url": context.depends_on_pr_url.clone(),
+                                            "contract_line": context.contract_line.clone(),
+                                            "auto_recover": false,
+                                        }),
+                                    )?;
+
                                     notification_kind = "task_waiting_dependency";
                                     notification_message = format_waiting_dependency_notification(
                                         &task_label,
@@ -5288,21 +5307,21 @@ mod tests {
         BlockedContext, BlockedContextSource, DeadLetterEntry, DeliveryAck, DeliveryAttempt,
         DispatchedNotification, GhPrView, GhStatusCheck, LoopStatus, Manifest, Notification,
         NotificationDeliveryMode, RecoveryTaskSnapshot, RunnerState, RunnerTaskState, State,
-        TaskChecklistEntry, WaitingContract, WaitingMergeProgress, ack_retry_policy, append_jsonl,
-        apply_status_establish_retry_override, auto_merge_unavailable_error,
-        auto_recover_guard_reason, blocked_reason_from_runner, blocked_recovery_hint,
-        build_recovery_task_text, classify_ack_failure_category,
+        TaskChecklistEntry, WaitingContract, WaitingDependencyContext, WaitingMergeProgress,
+        ack_retry_policy, append_jsonl, apply_status_establish_retry_override,
+        auto_merge_unavailable_error, auto_recover_guard_reason, blocked_reason_from_runner,
+        blocked_recovery_hint, build_recovery_task_text, classify_ack_failure_category,
         completion_guard_waiting_fallback_line, compute_auto_stop_reason, compute_backoff_sec,
         dead_letter_path, delivery_ack_path, delivery_attempts_path, delivery_retry_backoff_sec,
         emit_all_tasks_completed_notifications, ensure_task_agent_exists_with,
         ensure_waiting_merge_progress_with, extract_pr_url, flush_notifications,
         format_auto_recover_decision_notification, format_auto_recover_halt_notification,
-        format_orphan_blocked_notification, format_task_blocked_notification, lease_window_sec,
-        maybe_auto_recover_blocked_task, normalize_blocked_reason_for_recovery,
-        normalize_error_reason, notification_delivery_mode, openclaw_notify_timeout_sec_from,
-        parse_openclaw_message_id, parse_task_checklist_entry, parse_waiting_contract,
-        parse_waiting_dependency_contract, queue_main_feedback_summary, queue_notification,
-        read_jsonl, retryable_waiting_merge_error, select_next_task_entry,
+        format_orphan_blocked_notification, format_task_blocked_notification,
+        format_waiting_dependency_notification, lease_window_sec, maybe_auto_recover_blocked_task,
+        normalize_blocked_reason_for_recovery, normalize_error_reason, notification_delivery_mode,
+        openclaw_notify_timeout_sec_from, parse_openclaw_message_id, parse_task_checklist_entry,
+        parse_waiting_contract, parse_waiting_dependency_contract, queue_main_feedback_summary,
+        queue_notification, read_jsonl, retryable_waiting_merge_error, select_next_task_entry,
         should_force_status_establish_retry, should_suppress_waiting_stuck, task_contract_line,
         tasklist_approval_violation_reason, update_waiting_stuck_tracker,
         validate_task_done_contract_with, waiting_merge_nonprogress_reason, write_json,
@@ -6538,6 +6557,24 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn format_waiting_dependency_notification_names_dependency_and_no_auto_recover() {
+        let context = WaitingDependencyContext {
+            task_id: "D3".to_string(),
+            depends_on_task: Some("D2".to_string()),
+            depends_on_pr_url: Some("https://github.com/n01e0/claw-loop/pull/121".to_string()),
+            contract_line: "TASK_WAITING_DEPENDENCY TASK_ID=D3 DEPENDS_ON_TASK=D2 DEPENDS_ON_PR_URL=https://github.com/n01e0/claw-loop/pull/121".to_string(),
+        };
+
+        let message = format_waiting_dependency_notification("D3", &context);
+        assert!(message.contains("task waiting dependency: D3"));
+        assert!(
+            message
+                .contains("waiting on task D2 and PR https://github.com/n01e0/claw-loop/pull/121")
+        );
+        assert!(message.contains("auto-recover stays idle"));
     }
 
     #[test]
