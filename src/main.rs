@@ -6461,6 +6461,100 @@ mod tests {
     }
 
     #[test]
+    fn maybe_auto_recover_blocked_task_queues_recovery_for_generic_runner_block() {
+        let run = TestRunDir::new("generic-block-auto-recover");
+        let run_id = Uuid::new_v4();
+        let task_file = run.path.join("tasklist.md");
+        fs::write(&task_file, "- [ ] G1: generic blocked task\n").expect("write task file");
+
+        let manifest_path = run.path.join("manifest.json");
+        let mut manifest = test_manifest(&run.path, run_id, false);
+        manifest.auto_recover_blocked = true;
+        manifest.task_file = task_file.clone();
+        write_json(&manifest_path, &manifest).expect("write manifest");
+
+        let now = Utc::now();
+        let mut blocked = test_blocked_context(
+            "G1",
+            "generic blocked task",
+            1,
+            None,
+            "runner exit=Some(2): missing fixture in generated workspace",
+            Some(
+                "runner exit=Some(2): missing fixture in generated workspace\nextra stderr detail",
+            ),
+            now,
+        );
+        blocked.source = BlockedContextSource::RunnerExit;
+        blocked.exit_code = Some(2);
+
+        let mut runner_state = RunnerState {
+            current_task_id: Some("G1".into()),
+            current_task_text: Some("generic blocked task".into()),
+            current_task_line: Some(1),
+            current_task_started_at: Some(now),
+            current_task_state: Some(RunnerTaskState::Blocked),
+            current_task_blocked_reason: Some(blocked.reason_summary.clone()),
+            current_blocked_context: Some(blocked.clone()),
+            last_task_id: Some("G1".into()),
+            last_task_state: Some(RunnerTaskState::Blocked),
+            last_task_at: Some(now),
+            last_task_reason: Some(blocked.reason_summary.clone()),
+            last_blocked_context: Some(blocked.clone()),
+            ..RunnerState::default()
+        };
+        let mut state = State {
+            version: 1,
+            status: LoopStatus::Blocked,
+            summary: "task blocked: G1".into(),
+            waiting_reason: blocked.reason_summary.clone(),
+            lease_expires_at: now,
+            updated_at: now,
+            ticks: 0,
+        };
+        let mut task_done_now = 0;
+        let mut task_loops_completed = 0;
+
+        let outcome = maybe_auto_recover_blocked_task(
+            &run.path,
+            &manifest_path,
+            &mut manifest,
+            &task_file,
+            &mut runner_state,
+            &mut state,
+            &blocked,
+            now,
+            &mut task_done_now,
+            &mut task_loops_completed,
+        )
+        .expect("auto recover generic blocked task");
+
+        assert_eq!(outcome, AutoRecoverBlockedOutcome::Recovered);
+        assert_eq!(state.status, LoopStatus::Running);
+        let content = fs::read_to_string(&task_file).expect("read task file");
+        assert!(content.contains("- [x] G1: generic blocked task"));
+        assert!(content.contains("- [ ] G1-RECOVER"));
+        let dispatched =
+            read_jsonl::<DispatchedNotification>(&run.path.join("notify-dispatched.jsonl"))
+                .expect("read dispatched notifications");
+        let decision_note = dispatched
+            .iter()
+            .find(|item| item.kind == "task_recovery_decision")
+            .expect("recovery decision notification");
+        assert!(decision_note.message.contains("- 状態: auto-recover 継続"));
+        let recovery_text = runner_state
+            .last_blocked_context
+            .as_ref()
+            .and_then(|ctx| ctx.auto_recover.as_ref())
+            .and_then(|decision| decision.recovery_task.as_ref())
+            .map(|task| task.text.clone())
+            .expect("recovery task text");
+        assert!(
+            recovery_text.starts_with("resolve runner block for task G1 (generic blocked task):")
+        );
+    }
+
+    #[test]
     fn maybe_auto_recover_blocked_task_queues_recovery_for_waiting_merge_ci_failures() {
         let run = TestRunDir::new("waiting-merge-auto-recover");
         let run_id = Uuid::new_v4();
@@ -6894,6 +6988,40 @@ mod tests {
         assert!(message.contains(
             "- Auto-recover: idle（dependency が解消するまで recovery task は積まない）"
         ));
+    }
+
+    #[test]
+    fn ensure_waiting_dependency_progress_resolves_when_dependency_task_is_done() {
+        let context = WaitingDependencyContext {
+            task_id: "D4".to_string(),
+            depends_on_task: Some("D3".to_string()),
+            depends_on_pr_url: None,
+            contract_line: "TASK_WAITING_DEPENDENCY TASK_ID=D4 DEPENDS_ON_TASK=D3".to_string(),
+        };
+        let entries = vec![TaskChecklistEntry {
+            line_no: 1,
+            done: true,
+            id: "D3".to_string(),
+            text: "upstream task".to_string(),
+        }];
+        let runner_state = RunnerState::default();
+
+        let progress =
+            ensure_waiting_dependency_progress_with(&context, &entries, &runner_state, |_| {
+                Ok(false)
+            })
+            .expect("dependency progress should resolve from completed upstream task");
+
+        match progress {
+            WaitingDependencyProgress::Resolved {
+                context,
+                resolution,
+            } => {
+                assert_eq!(context.depends_on_task.as_deref(), Some("D3"));
+                assert!(resolution.contains("dependency task D3 is done"));
+            }
+            other => panic!("expected resolved dependency progress, got {other:?}"),
+        }
     }
 
     #[test]

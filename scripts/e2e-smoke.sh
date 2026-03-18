@@ -1232,6 +1232,143 @@ PY
 $BIN stop --repo "$WORKDIR" --run-id "$RUN13B" --immediate >/dev/null || true
 sleep 1
 
+echo "[e2e-smoke] case13c dependency wait stays out of auto-recover and resumes after merge"
+DEP_MOCKDIR="$WORKDIR/mockbin-dependency"
+mkdir -p "$DEP_MOCKDIR"
+DEP_READY_FILE="$WORKDIR/dependency-merged.flag"
+cat > "$DEP_MOCKDIR/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+READY_FILE="${CLAW_LOOPD_DEP_READY_FILE:?missing CLAW_LOOPD_DEP_READY_FILE}"
+if [[ "${1:-}" == "pr" && "${2:-}" == "view" ]]; then
+  if [[ -f "$READY_FILE" ]]; then
+    cat <<'JSON'
+{"state":"MERGED","mergedAt":"2026-03-16T00:00:00Z","url":"https://github.com/demo/repo/pull/777"}
+JSON
+  else
+    cat <<'JSON'
+{"state":"OPEN","mergedAt":null,"url":"https://github.com/demo/repo/pull/777"}
+JSON
+  fi
+  exit 0
+fi
+echo "unsupported mock gh args: $*" >&2
+exit 1
+EOF
+chmod +x "$DEP_MOCKDIR/gh"
+
+TASKFILE13C="$WORKDIR/docs/roadmaps/s5-case13c-tasklist.md"
+mkdir -p "$(dirname "$TASKFILE13C")"
+cat > "$TASKFILE13C" <<'EOF'
+- [ ] S5X-13C: dependency wait sample task
+EOF
+
+APPROVED13C="$(approve_task_file "$TASKFILE13C")"
+OUT13C="$(CLAW_LOOPD_OPENCLAW_BIN="$MOCKDIR/openclaw-ok" CLAW_LOOPD_GH_BIN="$DEP_MOCKDIR/gh" CLAW_LOOPD_DEP_READY_FILE="$DEP_READY_FILE" $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --deliver-openclaw --task-file "$TASKFILE13C" --task-runner-cmd 'if [[ -f "$CLAW_LOOPD_DEP_READY_FILE" ]]; then echo "TASK_DONE PR_URL=https://github.com/demo/repo/pull/777"; exit 0; fi; echo "TASK_WAITING_DEPENDENCY TASK_ID=$CLAW_TASK_ID DEPENDS_ON_PR_URL=https://github.com/demo/repo/pull/777"; exit 10' --auto-recover-blocked --require-task-approval --approved-tasklist-hash "$APPROVED13C")"
+RUN13C="$(echo "$OUT13C" | awk -F= '/^run_id=/{print $2}')"
+if [[ -z "$RUN13C" ]]; then
+  echo "[e2e-smoke] failed to parse run13c id"
+  echo "$OUT13C"
+  exit 1
+fi
+
+STATUS13C=""
+for _ in {1..20}; do
+  STATUS13C="$($BIN status --repo "$WORKDIR" --run-id "$RUN13C")"
+  if python3 - <<'PY' "$STATUS13C"
+import json, sys
+obj = json.loads(sys.argv[1])
+runner = obj.get("runner") or {}
+ok = (
+    obj.get("status") == "waiting"
+    and runner.get("current_task_state") == "waiting_dependency"
+    and "TASK_WAITING_DEPENDENCY" in (obj.get("waiting_reason") or "")
+)
+raise SystemExit(0 if ok else 1)
+PY
+  then
+    break
+  fi
+  sleep 1
+done
+
+python3 - <<'PY' "$STATUS13C" "$TASKFILE13C" "$WORKDIR/.ralph/runs/$RUN13C/events.jsonl" "$WORKDIR/.ralph/runs/$RUN13C/notify-dispatched.jsonl"
+import json, pathlib, sys
+status = json.loads(sys.argv[1])
+taskfile = pathlib.Path(sys.argv[2])
+events_path = pathlib.Path(sys.argv[3])
+dispatched_path = pathlib.Path(sys.argv[4])
+runner = status.get("runner") or {}
+if status.get("status") != "waiting":
+    raise SystemExit(f"expected waiting, got {status.get('status')!r}")
+if runner.get("current_task_state") != "waiting_dependency":
+    raise SystemExit(f"expected waiting_dependency state, got {runner}")
+if "TASK_WAITING_DEPENDENCY" not in (status.get("waiting_reason") or ""):
+    raise SystemExit(f"expected dependency waiting reason, got {status.get('waiting_reason')!r}")
+content = taskfile.read_text()
+if "RECOVER" in content:
+    raise SystemExit(f"dependency wait should not create recovery tasks, got:\n{content}")
+events = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+if not any(e.get("kind") == "task_waiting_dependency" for e in events):
+    raise SystemExit(f"expected task_waiting_dependency event, got {[e.get('kind') for e in events][-10:]}")
+if any(e.get("kind") == "task_blocked_auto_recovered" for e in events):
+    raise SystemExit("dependency wait should not emit task_blocked_auto_recovered")
+dispatched = [json.loads(line) for line in dispatched_path.read_text().splitlines() if line.strip()]
+if any(d.get("kind") == "task_recovery_decision" for d in dispatched):
+    raise SystemExit(f"dependency wait should not emit task_recovery_decision, got {dispatched}")
+waiting_notes = [d for d in dispatched if d.get("kind") == "task_waiting_dependency"]
+if not waiting_notes:
+    raise SystemExit(f"expected task_waiting_dependency notification, got {dispatched}")
+msg = waiting_notes[-1].get("message") or ""
+for needle in ["- 分類: dependency wait", "- 次に進む条件:", "- Auto-recover: idle"]:
+    if needle not in msg:
+        raise SystemExit(f"expected {needle!r} in waiting notification, got: {msg!r}")
+PY
+
+touch "$DEP_READY_FILE"
+STATUS13C_DONE=""
+for _ in {1..25}; do
+  STATUS13C_DONE="$($BIN status --repo "$WORKDIR" --run-id "$RUN13C")"
+  if python3 - <<'PY' "$STATUS13C_DONE"
+import json, sys
+obj = json.loads(sys.argv[1])
+runner = obj.get("runner") or {}
+ok = (
+    obj.get("status") == "stopped"
+    and runner.get("pause_reason") == "all tasklist items completed"
+)
+raise SystemExit(0 if ok else 1)
+PY
+  then
+    break
+  fi
+  sleep 1
+done
+
+python3 - <<'PY' "$STATUS13C_DONE" "$TASKFILE13C" "$WORKDIR/.ralph/runs/$RUN13C/events.jsonl"
+import json, pathlib, sys
+status = json.loads(sys.argv[1])
+taskfile = pathlib.Path(sys.argv[2])
+events_path = pathlib.Path(sys.argv[3])
+runner = status.get("runner") or {}
+if status.get("status") != "stopped":
+    raise SystemExit(f"expected stopped after dependency merge, got {status.get('status')!r}")
+if runner.get("pause_reason") != "all tasklist items completed":
+    raise SystemExit(f"expected all tasklist items completed, got {runner}")
+content = taskfile.read_text()
+if "- [x] S5X-13C: dependency wait sample task" not in content:
+    raise SystemExit(f"expected dependency wait task to complete after merge, got:\n{content}")
+events = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+if not any(e.get("kind") == "task_waiting_dependency_resolved" for e in events):
+    raise SystemExit(f"expected task_waiting_dependency_resolved event, got {[e.get('kind') for e in events][-10:]}")
+if any(e.get("kind") == "task_blocked_auto_recovered" for e in events):
+    raise SystemExit("dependency wait resolve path should not emit task_blocked_auto_recovered")
+PY
+
+$BIN stop --repo "$WORKDIR" --run-id "$RUN13C" --immediate >/dev/null || true
+sleep 1
+
+
 echo "[e2e-smoke] case14 rl-task-agent ignores leading empty payload before TASK_DONE"
 RUNNER_MOCKDIR="$WORKDIR/mockbin-runner"
 mkdir -p "$RUNNER_MOCKDIR"
