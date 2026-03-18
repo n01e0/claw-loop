@@ -72,6 +72,8 @@ enum Commands {
         task_runner_cmd: Option<String>,
         #[arg(long)]
         approved_tasklist_hash: Option<String>,
+        #[arg(long, default_value_t = false)]
+        require_task_approval: bool,
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         auto_check_on_success: bool,
         #[arg(long, default_value_t = false)]
@@ -220,6 +222,8 @@ struct Manifest {
     approved_tasklist_hash: String,
     approved_by: String,
     approved_at: DateTime<Utc>,
+    #[serde(default)]
+    require_task_approval: bool,
     #[serde(default = "default_auto_check_on_success")]
     auto_check_on_success: bool,
     #[serde(default)]
@@ -525,6 +529,7 @@ struct StartOptions {
     task_file: PathBuf,
     task_runner_cmd: Option<String>,
     approved_tasklist_hash: Option<String>,
+    require_task_approval: bool,
     auto_check_on_success: bool,
     auto_recover_blocked: bool,
     auto_recover_blocked_max_attempts: u64,
@@ -608,6 +613,9 @@ fn sync_manifest_tasklist_hash(
 }
 
 fn tasklist_approval_violation_reason(task_file: &Path, manifest: &Manifest) -> String {
+    if !manifest.require_task_approval {
+        return String::new();
+    }
     match task_plan_hash(task_file) {
         Ok(actual_hash) => {
             if actual_hash != manifest.approved_tasklist_hash {
@@ -3082,8 +3090,18 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
 
     let task_file = opts.task_file.clone();
     let task_file_abs = resolve_task_file_path(&opts.repo, &task_file);
-    let (approval, approved_tasklist_hash) =
-        require_tasklist_approval(&task_file_abs, opts.approved_tasklist_hash.as_deref())?;
+    let now = Utc::now();
+    let (approval, approved_tasklist_hash) = if opts.require_task_approval {
+        require_tasklist_approval(&task_file_abs, opts.approved_tasklist_hash.as_deref())?
+    } else {
+        (
+            TaskApprovalMetadata {
+                approved_by: "<disabled>".to_string(),
+                approved_at: now,
+            },
+            task_plan_hash(&task_file_abs)?,
+        )
+    };
     let task_done_baseline = task_checklist_done_count(&task_file_abs)?;
 
     let run_id = Uuid::new_v4();
@@ -3105,7 +3123,6 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
         .spawn()
         .context("spawn daemon")?;
 
-    let now = Utc::now();
     let manifest = Manifest {
         run_id,
         repo_path: opts.repo.clone(),
@@ -3129,6 +3146,7 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
         approved_tasklist_hash,
         approved_by: approval.approved_by,
         approved_at: approval.approved_at,
+        require_task_approval: opts.require_task_approval,
         auto_check_on_success: opts.auto_check_on_success,
         auto_recover_blocked: opts.auto_recover_blocked,
         auto_recover_blocked_max_attempts: opts.auto_recover_blocked_max_attempts,
@@ -4959,6 +4977,7 @@ fn main() -> Result<()> {
             task_file,
             task_runner_cmd,
             approved_tasklist_hash,
+            require_task_approval,
             auto_check_on_success,
             auto_recover_blocked,
             auto_recover_blocked_max_attempts,
@@ -4980,6 +4999,7 @@ fn main() -> Result<()> {
             task_file,
             task_runner_cmd,
             approved_tasklist_hash,
+            require_task_approval,
             auto_check_on_success,
             auto_recover_blocked,
             auto_recover_blocked_max_attempts,
@@ -5140,6 +5160,7 @@ mod tests {
             approved_tasklist_hash: "test-approved-hash".to_string(),
             approved_by: "test-approver".to_string(),
             approved_at: Utc::now(),
+            require_task_approval: false,
             auto_check_on_success: true,
             auto_recover_blocked: false,
             auto_recover_blocked_max_attempts: 3,
@@ -6678,6 +6699,7 @@ mod tests {
         let status = write_task_approval(&task_file, "n01e0").expect("approve task file");
         let mut manifest = test_manifest(&run.path, Uuid::new_v4(), false);
         manifest.task_file = task_file.clone();
+        manifest.require_task_approval = true;
         manifest.approved_tasklist_hash = status.approved_tasklist_hash.clone();
         manifest.approved_by = status.approved_by.clone().expect("approved by");
         manifest.approved_at = status.approved_at.expect("approved at");
@@ -6695,6 +6717,28 @@ mod tests {
     }
 
     #[test]
+    fn tasklist_approval_violation_reason_skips_checks_when_approval_is_disabled() {
+        let run = TestRunDir::new("approval-disabled");
+        let task_file = run.path.join("tasklist.md");
+        fs::write(
+            &task_file,
+            "# Title
+
+- [ ] A1: alpha
+",
+        )
+        .expect("write task file");
+
+        let mut manifest = test_manifest(&run.path, Uuid::new_v4(), false);
+        manifest.task_file = task_file.clone();
+        manifest.require_task_approval = false;
+        manifest.approved_tasklist_hash = "mismatch".into();
+
+        let reason = tasklist_approval_violation_reason(&task_file, &manifest);
+        assert!(reason.is_empty(), "unexpected reason: {reason}");
+    }
+
+    #[test]
     fn tasklist_approval_violation_reason_still_blocks_plan_hash_drift() {
         let run = TestRunDir::new("approval-plan-drift");
         let task_file = run.path.join("tasklist.md");
@@ -6703,6 +6747,7 @@ mod tests {
         let status = write_task_approval(&task_file, "n01e0").expect("approve task file");
         let mut manifest = test_manifest(&run.path, Uuid::new_v4(), false);
         manifest.task_file = task_file.clone();
+        manifest.require_task_approval = true;
         manifest.approved_tasklist_hash = status.approved_tasklist_hash.clone();
         manifest.approved_by = status.approved_by.clone().expect("approved by");
         manifest.approved_at = status.approved_at.expect("approved at");

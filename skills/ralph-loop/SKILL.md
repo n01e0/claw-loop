@@ -49,7 +49,8 @@ Never start without `thread_id` + `session_key`.
    - `claw-loopd task-approve --file <task_file> --approved-by <name>`
    - capture `approved_tasklist_hash` from JSON output
 6. Start daemon:
-   - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --requester-user-id <discord_user_id> --task-agent-id <agent_id> --feedback-thread-id <feedback_thread_id> --feedback-channel discord --tick-sec 60 --deliver-openclaw --max-task-loops 10 --task-runner-cmd './scripts/rl-task-agent.sh' --approved-tasklist-hash <hash> --auto-recover-blocked --auto-recover-blocked-max-attempts 3`
+   - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --requester-user-id <discord_user_id> --task-agent-id <agent_id> --feedback-thread-id <feedback_thread_id> --feedback-channel discord --tick-sec 60 --deliver-openclaw --max-task-loops 10 --task-runner-cmd './scripts/rl-task-agent.sh' --auto-recover-blocked --auto-recover-blocked-max-attempts 3
+   - add `--require-task-approval --approved-tasklist-hash <hash>` only when you explicitly want the stricter approval gate`
    - default: auto-check and continue on runner success (`--auto-check-on-success=true`)
    - with `--auto-check-on-success=false`, run in completion-gated mode (do not start the next task until the active task is checked complete)
    - daemon blocks the run if the approved plan markers/hash drift after start
