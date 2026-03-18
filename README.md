@@ -140,6 +140,11 @@ While in waiting-merge state, runner inspects branch policy:
 
 If required checks are not enforced on target branch, waiting output is tagged with warning marker and daemon surfaces a warning in `task_waiting_merge` notification.
 
+Notification wording is now explicit about operator action:
+- `task_waiting_merge`: waiting on PR CI / merge; usually no human action unless CI fails, merge goes dirty, or warnings need review
+- `task_waiting_dependency`: waiting on an upstream task / PR; auto-recover stays idle and humans only need to step in when the dependency target is wrong, unknown, or stalled
+- `task_blocked`: not a natural wait; message says whether this is a generic blocked case or a phase/stacked dependency problem, what is being waited on (if anything), and whether human intervention is needed now
+
 ---
 
 ## OpenClaw/Discord integration
