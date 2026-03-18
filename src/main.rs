@@ -1391,16 +1391,29 @@ fn completion_mention_prefix(manifest: &Manifest) -> String {
     String::new()
 }
 
+fn is_phase_or_stacked_dependency_reason(reason: &str) -> bool {
+    let normalized = reason.to_ascii_lowercase();
+    [
+        "cannot be shipped as an isolated green pr",
+        "still cannot be shipped as an isolated green pr",
+        "isolated green pr without also doing",
+        "phase/stacked dependency",
+        "stacked change",
+        "stacked pr",
+        "prior phase",
+        "earlier phase",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
 fn blocked_recovery_hint(reason: &str) -> &'static str {
     let normalized = reason.to_ascii_lowercase();
     if normalized.contains("session file locked") || normalized.contains("task_waiting_agent_lock")
     {
         "別の agent session がロックを保持しているので、ロック解放を待つか `--task-agent-id` を分離して再実行する"
-    } else if normalized.contains("cannot be shipped as an isolated green pr")
-        || normalized.contains("still cannot be shipped as an isolated green pr")
-        || normalized.contains("isolated green pr without also doing")
-    {
-        "この task 単体では green PR にできない。依存タスクを同時に進めるか、tasklist の切り方を見直して分離不能な変更をまとめる"
+    } else if is_phase_or_stacked_dependency_reason(&normalized) {
+        "phase/stacked sequencing が必要。この task を standalone な green PR に押し込まず、前段 task / PR を特定できるなら `TASK_WAITING_DEPENDENCY` を返し、依存先が未特定ならその旨を `TASK_BLOCKED` で明示する"
     } else if normalized.contains("merge state is dirty")
         || normalized.contains("unmergeable branch")
     {
@@ -1465,6 +1478,13 @@ fn format_task_blocked_notification(manifest: &Manifest, blocked: &BlockedContex
     } else {
         String::new()
     };
+    let classification_line = if is_phase_or_stacked_dependency_reason(&compact_reason)
+        || is_phase_or_stacked_dependency_reason(&compact_detail)
+    {
+        "\n- 分類: phase/stacked dependency が必要。1 task 1 PR ではなく前段 task / PR の完了待ちとして扱うべき状態"
+    } else {
+        ""
+    };
     let recovery = blocked
         .recovery_hint
         .as_deref()
@@ -1479,7 +1499,7 @@ fn format_task_blocked_notification(manifest: &Manifest, blocked: &BlockedContex
         .unwrap_or_default();
 
     format!(
-        "{mention}タスクが block された: {}{pr_suffix}\n- 原因: {reason_summary}{detail_line}\n- 解決方法: {recovery}\n- {next}",
+        "{mention}タスクが block された: {}{pr_suffix}\n- 原因: {reason_summary}{detail_line}{classification_line}\n- 解決方法: {recovery}\n- {next}",
         blocked.task_id
     )
 }
@@ -2156,7 +2176,7 @@ fn format_waiting_dependency_notification(
         waits_on.join(" and ")
     };
     format!(
-        "task waiting dependency: {task_label}; waiting on {waits_on}; auto-recover stays idle until the dependency clears"
+        "task waiting dependency: {task_label}; waiting on {waits_on}; this task is intentionally not being forced into a standalone PR because it depends on a prior phase/stacked change; auto-recover stays idle until the dependency clears"
     )
 }
 
@@ -5530,12 +5550,12 @@ mod tests {
         ensure_waiting_dependency_progress_with, ensure_waiting_merge_progress_with,
         extract_pr_url, flush_notifications, format_auto_recover_decision_notification,
         format_auto_recover_halt_notification, format_orphan_blocked_notification,
-        format_task_blocked_notification, format_waiting_dependency_notification, lease_window_sec,
-        maybe_auto_recover_blocked_task, normalize_blocked_reason_for_recovery,
-        normalize_error_reason, notification_delivery_mode, openclaw_notify_timeout_sec_from,
-        parse_openclaw_message_id, parse_task_checklist_entry, parse_waiting_contract,
-        parse_waiting_dependency_contract, queue_main_feedback_summary, queue_notification,
-        read_jsonl, retryable_waiting_merge_error, select_next_task_entry,
+        format_task_blocked_notification, format_waiting_dependency_notification,
+        is_phase_or_stacked_dependency_reason, lease_window_sec, maybe_auto_recover_blocked_task,
+        normalize_blocked_reason_for_recovery, normalize_error_reason, notification_delivery_mode,
+        openclaw_notify_timeout_sec_from, parse_openclaw_message_id, parse_task_checklist_entry,
+        parse_waiting_contract, parse_waiting_dependency_contract, queue_main_feedback_summary,
+        queue_notification, read_jsonl, retryable_waiting_merge_error, select_next_task_entry,
         should_force_status_establish_retry, should_suppress_waiting_stuck, task_contract_line,
         tasklist_approval_violation_reason, update_waiting_stuck_tracker,
         validate_task_done_contract_with, waiting_merge_nonprogress_reason, write_json,
@@ -6106,6 +6126,22 @@ mod tests {
     }
 
     #[test]
+    fn is_phase_or_stacked_dependency_reason_matches_common_phrases() {
+        assert!(is_phase_or_stacked_dependency_reason(
+            "still cannot be shipped as an isolated green PR without also doing D4"
+        ));
+        assert!(is_phase_or_stacked_dependency_reason(
+            "phase/stacked dependency is required before this lands"
+        ));
+        assert!(is_phase_or_stacked_dependency_reason(
+            "this needs a prior phase before it can merge"
+        ));
+        assert!(!is_phase_or_stacked_dependency_reason(
+            "merge state is dirty for PR_URL=https://example.test/pull/1"
+        ));
+    }
+
+    #[test]
     fn format_task_blocked_notification_includes_mention_reason_and_next_step() {
         let run = TestRunDir::new("blocked-notify");
         let run_id = Uuid::new_v4();
@@ -6179,7 +6215,9 @@ mod tests {
 
         assert!(msg.contains("- 詳細:"));
         assert!(msg.contains("green PR"));
-        assert!(msg.contains("依存タスクを同時に進めるか"));
+        assert!(msg.contains("- 分類: phase/stacked dependency が必要。1 task 1 PR ではなく前段 task / PR の完了待ちとして扱うべき状態"));
+        assert!(msg.contains("phase/stacked sequencing が必要"));
+        assert!(msg.contains("`TASK_WAITING_DEPENDENCY`"));
         assert!(msg.contains(
             "生成された recovery task 自体が失敗したので、auto-recover はここで停止する"
         ));
@@ -6788,6 +6826,8 @@ mod tests {
             message
                 .contains("waiting on task D2 and PR https://github.com/n01e0/claw-loop/pull/121")
         );
+        assert!(message.contains("not being forced into a standalone PR"));
+        assert!(message.contains("prior phase/stacked change"));
         assert!(message.contains("auto-recover stays idle"));
     }
 

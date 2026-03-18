@@ -114,7 +114,9 @@ A task is considered complete only when runner output contract is satisfied:
 - `TASK_DONE PR_URL=<url>` and PR is **actually merged**
 - If merge is pending: `TASK_WAITING_MERGE PR_URL=<url>`
 - If work is waiting on an upstream dependency: `TASK_WAITING_DEPENDENCY [TASK_ID=<id>] [DEPENDS_ON_TASK=<id>] [DEPENDS_ON_PR_URL=<absolute-url>]` (`DEPENDS_ON_TASK` or `DEPENDS_ON_PR_URL` required)
+  - use this when the task should not be forced into an isolated green PR because it depends on a prior phase / stacked task or PR
 - If blocked: `TASK_BLOCKED: <reason>`
+  - if phase / stacked sequencing is required but the dependency target is still unknown, block explicitly and say that the phase/stacked dependency is not yet identifiable
 
 The `TASK_*` contract line must be the first emitted line. Task agents must not send progress narration, delegation chatter, `NO_REPLY`, or `HEARTBEAT_OK` instead of the contract.
 
@@ -229,9 +231,11 @@ Runner must emit first-line protocol responses:
 - `TASK_WAITING_MERGE PR_URL=<url>`
 - `TASK_WAITING_DEPENDENCY [TASK_ID=<id>] [DEPENDS_ON_TASK=<id>] [DEPENDS_ON_PR_URL=<absolute-url>]`
   - at least one of `DEPENDS_ON_TASK` / `DEPENDS_ON_PR_URL` is required
+  - use this when the task cannot land as an isolated green PR and must wait for a prior phase / stacked task or PR
   - daemon preserves this as dependency waiting state (not `waiting_merge` and not `blocked`)
   - daemon tracks same-run dependency task/PR metadata, keeps dependency waits out of auto-recover, and re-runs the waiting task once the upstream task/PR is cleared
 - `TASK_BLOCKED: <reason>`
+  - if phase / stacked sequencing is required but no dependency target can be named yet, return `TASK_BLOCKED` and explain that the upstream phase/stacked dependency is still unidentified
 - `TASK_WAITING_AGENT_LOCK` (treated as waiting, not hard failure)
 
 No preamble is allowed before the `TASK_*` line: do not narrate progress, tool use, or sub-agent handoffs, and do not return `NO_REPLY` / `HEARTBEAT_OK` from the task runner agent.

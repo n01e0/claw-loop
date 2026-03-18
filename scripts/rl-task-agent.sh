@@ -483,6 +483,8 @@ Hard requirements:
   or
   TASK_WAITING_DEPENDENCY [TASK_ID=<id>] DEPENDS_ON_PR_URL=<absolute-url>
   (at least one of DEPENDS_ON_TASK / DEPENDS_ON_PR_URL is required; include TASK_ID when available)
+- If the task cannot be shipped as an isolated green PR because it must land after an upstream phase/stacked task or PR, emit TASK_WAITING_DEPENDENCY with DEPENDS_ON_TASK and/or DEPENDS_ON_PR_URL when known.
+- If you know phase/stacked sequencing is required but do not know the dependency target, emit TASK_BLOCKED explaining that a phase/stacked dependency is required.
 - If not complete / blocked, first line MUST be:
   TASK_BLOCKED: <reason>
 - Do not emit any preamble before the required `TASK_*` line.
