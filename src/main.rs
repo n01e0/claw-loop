@@ -608,31 +608,12 @@ fn sync_manifest_tasklist_hash(
 }
 
 fn tasklist_approval_violation_reason(task_file: &Path, manifest: &Manifest) -> String {
-    match task_approval_status(task_file) {
-        Ok(status) => {
-            if status.approved_by.as_deref() != Some(manifest.approved_by.as_str()) {
-                return format!(
-                    "tasklist approval invalidated: Approved-By changed (expected={} actual={})",
-                    manifest.approved_by,
-                    status
-                        .approved_by
-                        .unwrap_or_else(|| "<missing>".to_string())
-                );
-            }
-            if status.approved_at != Some(manifest.approved_at) {
-                return format!(
-                    "tasklist approval invalidated: Approved-At changed (expected={} actual={})",
-                    manifest.approved_at.to_rfc3339(),
-                    status
-                        .approved_at
-                        .map(|ts| ts.to_rfc3339())
-                        .unwrap_or_else(|| "<missing>".to_string())
-                );
-            }
-            if status.approved_tasklist_hash != manifest.approved_tasklist_hash {
+    match task_plan_hash(task_file) {
+        Ok(actual_hash) => {
+            if actual_hash != manifest.approved_tasklist_hash {
                 return format!(
                     "tasklist approval invalidated: approved task hash changed (expected={} actual={})",
-                    manifest.approved_tasklist_hash, status.approved_tasklist_hash
+                    manifest.approved_tasklist_hash, actual_hash
                 );
             }
             String::new()
@@ -5081,9 +5062,10 @@ mod tests {
         parse_openclaw_message_id, parse_task_checklist_entry, queue_main_feedback_summary,
         queue_notification, read_jsonl, retryable_waiting_merge_error, select_next_task_entry,
         should_force_status_establish_retry, should_suppress_waiting_stuck, task_contract_line,
-        update_waiting_stuck_tracker, validate_task_done_contract_with,
-        waiting_merge_nonprogress_reason, write_json,
+        tasklist_approval_violation_reason, update_waiting_stuck_tracker,
+        validate_task_done_contract_with, waiting_merge_nonprogress_reason, write_json,
     };
+    use crate::tasklist::write_task_approval;
     use chrono::{Duration, Utc};
     use std::{
         fs,
@@ -6684,6 +6666,55 @@ mod tests {
             WaitingMergeProgress::Blocked(
                 "PR_URL=https://github.com/demo/repo/pull/253 merge state is DIRTY (merge conflict or unmergeable branch)".into()
             )
+        );
+    }
+
+    #[test]
+    fn tasklist_approval_violation_reason_ignores_approval_marker_drift() {
+        let run = TestRunDir::new("approval-marker-drift");
+        let task_file = run.path.join("tasklist.md");
+        fs::write(&task_file, "# Title\n\n- [ ] A1: alpha\n").expect("write task file");
+
+        let status = write_task_approval(&task_file, "n01e0").expect("approve task file");
+        let mut manifest = test_manifest(&run.path, Uuid::new_v4(), false);
+        manifest.task_file = task_file.clone();
+        manifest.approved_tasklist_hash = status.approved_tasklist_hash.clone();
+        manifest.approved_by = status.approved_by.clone().expect("approved by");
+        manifest.approved_at = status.approved_at.expect("approved at");
+
+        let content = fs::read_to_string(&task_file).expect("read task file");
+        let updated = content.replacen(
+            &format!("Approved-At: {}", manifest.approved_at.to_rfc3339()),
+            "Approved-At: 2026-03-18T11:38:57.199213524+00:00",
+            1,
+        );
+        fs::write(&task_file, updated).expect("rewrite approval marker only");
+
+        let reason = tasklist_approval_violation_reason(&task_file, &manifest);
+        assert!(reason.is_empty(), "unexpected reason: {reason}");
+    }
+
+    #[test]
+    fn tasklist_approval_violation_reason_still_blocks_plan_hash_drift() {
+        let run = TestRunDir::new("approval-plan-drift");
+        let task_file = run.path.join("tasklist.md");
+        fs::write(&task_file, "# Title\n\n- [ ] A1: alpha\n").expect("write task file");
+
+        let status = write_task_approval(&task_file, "n01e0").expect("approve task file");
+        let mut manifest = test_manifest(&run.path, Uuid::new_v4(), false);
+        manifest.task_file = task_file.clone();
+        manifest.approved_tasklist_hash = status.approved_tasklist_hash.clone();
+        manifest.approved_by = status.approved_by.clone().expect("approved by");
+        manifest.approved_at = status.approved_at.expect("approved at");
+
+        let content = fs::read_to_string(&task_file).expect("read task file");
+        let updated = content.replace("- [ ] A1: alpha", "- [ ] A1: beta");
+        fs::write(&task_file, updated).expect("rewrite task entry");
+
+        let reason = tasklist_approval_violation_reason(&task_file, &manifest);
+        assert!(
+            reason.contains("approved task hash changed"),
+            "unexpected reason: {reason}"
         );
     }
 
