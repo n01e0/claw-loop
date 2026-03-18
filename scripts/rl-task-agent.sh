@@ -60,6 +60,33 @@ parse_pr_url() {
   printf '%s\n' "$line" | sed -n 's/.*PR_URL=\([^ ]\+\).*/\1/p' | head -n1
 }
 
+task_plan_hash() {
+  local task_file="$1"
+  python3 - "$task_file" <<'PY'
+import hashlib
+import pathlib
+import re
+import sys
+path = pathlib.Path(sys.argv[1])
+content = path.read_text()
+entries = []
+for raw in content.splitlines():
+    m = re.match(r'^- \[( |x)\] ([^:]+):\s*(.+)$', raw)
+    if not m:
+        continue
+    entries.append((m.group(2), m.group(3)))
+sha = hashlib.sha256()
+for idx, (task_id, text) in enumerate(entries):
+    sha.update(str(idx).encode())
+    sha.update(b'\t')
+    sha.update(task_id.encode())
+    sha.update(b'\t')
+    sha.update(text.encode())
+    sha.update(b'\n')
+print(sha.hexdigest())
+PY
+}
+
 clip_one_line() {
   local input="$1"
   printf '%s' "$input" \
@@ -441,6 +468,7 @@ You are executing one approved dogfood task for claw-loop.
 Hard requirements:
 - Work only in the specified repository path.
 - Complete exactly the specified task.
+- Do not edit the task file; treat it as daemon-owned planning state. Only claw-loopd may mutate task checkboxes / recovery entries.
 - Commit/push your changes.
 - Create PR for this task. Prefer enabling auto-merge when the repository supports it.
 - If CI checks fail on that PR, fix the failure and push follow-up commits until checks pass.
@@ -462,6 +490,11 @@ PROMPT+="Task: ${CLAW_TASK_TEXT}"$'\n'
 PROMPT+="Task file: ${CLAW_TASK_FILE:-}"$'\n'
 PROMPT+="Run ID: ${run_id}"$'\n'
 
+task_file_hash_before=""
+if [[ -n "${CLAW_TASK_FILE:-}" && -f "${CLAW_TASK_FILE}" ]]; then
+  task_file_hash_before="$(task_plan_hash "${CLAW_TASK_FILE}")"
+fi
+
 set +e
 raw_out="$(openclaw agent --local --agent "$agent_id" --session-id "$agent_session_id" --timeout "$agent_timeout_sec" --message "$PROMPT" --json 2>&1)"
 rc=$?
@@ -480,6 +513,14 @@ fi
 json_out="$(extract_json_object "$raw_out")"
 text="$(printf '%s' "$json_out" | jq -r 'if (.payloads | type) == "array" then [(.payloads[]? | .text? // empty)] | join("\n") elif (.text? // null) != null then .text else "" end')"
 printf '%s\n' "$text"
+
+if [[ -n "$task_file_hash_before" && -f "${CLAW_TASK_FILE:-}" ]]; then
+  task_file_hash_after="$(task_plan_hash "${CLAW_TASK_FILE}")"
+  if [[ "$task_file_hash_after" != "$task_file_hash_before" ]]; then
+    echo "TASK_BLOCKED: task file was modified during runner execution (before=${task_file_hash_before} after=${task_file_hash_after}); tasklist edits are not allowed" >&2
+    exit 2
+  fi
+fi
 
 first_line="$(get_first_line "$text")"
 pr_url="$(parse_pr_url "$first_line")"
