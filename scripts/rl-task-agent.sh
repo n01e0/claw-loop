@@ -478,7 +478,7 @@ if [[ "$rc" -ne 0 ]]; then
 fi
 
 json_out="$(extract_json_object "$raw_out")"
-text="$(printf '%s' "$json_out" | jq -r '[.payloads[].text // ""] | join("\n")')"
+text="$(printf '%s' "$json_out" | jq -r 'if (.payloads | type) == "array" then [(.payloads[]? | .text? // empty)] | join("\n") elif (.text? // null) != null then .text else "" end')"
 printf '%s\n' "$text"
 
 first_line="$(get_first_line "$text")"

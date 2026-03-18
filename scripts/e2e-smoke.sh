@@ -1306,6 +1306,36 @@ if [[ "$OUT15" != *"TASK_DONE PR_URL=https://github.com/demo/repo/pull/315"* ]];
   exit 1
 fi
 
+echo "[e2e-smoke] case15b rl-task-agent falls back to top-level text when payloads is null"
+cat > "$RUNNER_MOCKDIR/openclaw" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "agent" ]]; then
+  cat <<'JSON'
+{"payloads":null,"text":"TASK_DONE PR_URL=https://github.com/demo/repo/pull/315b\nsummary from top-level text"}
+JSON
+  exit 0
+fi
+
+echo "unsupported mock openclaw args: $*" >&2
+exit 1
+EOF
+chmod +x "$RUNNER_MOCKDIR/openclaw"
+
+TASKFILE15B="$WORKDIR/docs/roadmaps/s5-case15b-tasklist.md"
+mkdir -p "$(dirname "$TASKFILE15B")"
+cat > "$TASKFILE15B" <<'EOF'
+- [ ] S5X-15B: top-level text fallback
+EOF
+
+OUT15B="$(PATH="$RUNNER_MOCKDIR:$PATH" CLAW_TASK_ID="S5X-15B" CLAW_TASK_TEXT="top-level text fallback" CLAW_TASK_FILE="$TASKFILE15B" CLAW_RUN_ID="run15b" bash ./scripts/rl-task-agent.sh)"
+FIRST15B="$(printf '%s\n' "$OUT15B" | awk 'NF { print; exit }')"
+if [[ "$FIRST15B" != "TASK_DONE PR_URL=https://github.com/demo/repo/pull/315b" ]]; then
+  echo "[e2e-smoke] expected case15b TASK_DONE first line"
+  printf '%s\n' "$OUT15B"
+  exit 1
+fi
+
 echo "[e2e-smoke] case16 rl-task-agent sees required checks from ruleset detail endpoint"
 RULESET_MOCKDIR="$WORKDIR/mockbin-ruleset"
 mkdir -p "$RULESET_MOCKDIR"
