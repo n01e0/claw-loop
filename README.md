@@ -113,6 +113,7 @@ A task is considered complete only when runner output contract is satisfied:
 
 - `TASK_DONE PR_URL=<url>` and PR is **actually merged**
 - If merge is pending: `TASK_WAITING_MERGE PR_URL=<url>`
+- If work is waiting on an upstream dependency: `TASK_WAITING_DEPENDENCY [TASK_ID=<id>] [DEPENDS_ON_TASK=<id>] [DEPENDS_ON_PR_URL=<absolute-url>]` (`DEPENDS_ON_TASK` or `DEPENDS_ON_PR_URL` required)
 - If blocked: `TASK_BLOCKED: <reason>`
 
 ### Auto-merge + CI failure handling
@@ -224,6 +225,10 @@ Runner must emit first-line protocol responses:
 
 - `TASK_DONE PR_URL=<url>`
 - `TASK_WAITING_MERGE PR_URL=<url>`
+- `TASK_WAITING_DEPENDENCY [TASK_ID=<id>] [DEPENDS_ON_TASK=<id>] [DEPENDS_ON_PR_URL=<absolute-url>]`
+  - at least one of `DEPENDS_ON_TASK` / `DEPENDS_ON_PR_URL` is required
+  - daemon preserves this as dependency waiting state (not `waiting_merge` and not `blocked`)
+  - daemon does **not** auto-resume from dependency waits yet; it only records/displays them accurately
 - `TASK_BLOCKED: <reason>`
 - `TASK_WAITING_AGENT_LOCK` (treated as waiting, not hard failure)
 

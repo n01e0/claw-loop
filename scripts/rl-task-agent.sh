@@ -478,6 +478,11 @@ Hard requirements:
   TASK_DONE PR_URL=<url>
 - If PR exists but merge is pending, first line MUST be:
   TASK_WAITING_MERGE PR_URL=<url>
+- If work is waiting on an upstream task or PR dependency, first line MUST be:
+  TASK_WAITING_DEPENDENCY [TASK_ID=<id>] DEPENDS_ON_TASK=<id>
+  or
+  TASK_WAITING_DEPENDENCY [TASK_ID=<id>] DEPENDS_ON_PR_URL=<absolute-url>
+  (at least one of DEPENDS_ON_TASK / DEPENDS_ON_PR_URL is required; include TASK_ID when available)
 - If not complete / blocked, first line MUST be:
   TASK_BLOCKED: <reason>
 - After the first line, include a short summary.
@@ -545,6 +550,11 @@ if [[ "$first_line" == TASK_WAITING_MERGE* ]]; then
     handle_waiting_pr "$pr_url"
     exit $?
   fi
+  exit 10
+fi
+
+if [[ "$first_line" == TASK_WAITING_DEPENDENCY* ]]; then
+  : >"$state_file"
   exit 10
 fi
 
