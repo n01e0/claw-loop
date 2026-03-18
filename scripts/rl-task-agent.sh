@@ -485,6 +485,10 @@ Hard requirements:
   (at least one of DEPENDS_ON_TASK / DEPENDS_ON_PR_URL is required; include TASK_ID when available)
 - If not complete / blocked, first line MUST be:
   TASK_BLOCKED: <reason>
+- Do not emit any preamble before the required `TASK_*` line.
+- Do not narrate progress updates, tool calls, delegation, or sub-agent handoffs (for example: "I'm handing this to a coding agent...").
+- Do not return `NO_REPLY` or `HEARTBEAT_OK` for this task runner contract.
+- If you need background work or a sub-agent, wait until it is finished and then respond once with the final `TASK_*` line.
 - After the first line, include a short summary.
 EOF
 

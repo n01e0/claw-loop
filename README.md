@@ -116,6 +116,8 @@ A task is considered complete only when runner output contract is satisfied:
 - If work is waiting on an upstream dependency: `TASK_WAITING_DEPENDENCY [TASK_ID=<id>] [DEPENDS_ON_TASK=<id>] [DEPENDS_ON_PR_URL=<absolute-url>]` (`DEPENDS_ON_TASK` or `DEPENDS_ON_PR_URL` required)
 - If blocked: `TASK_BLOCKED: <reason>`
 
+The `TASK_*` contract line must be the first emitted line. Task agents must not send progress narration, delegation chatter, `NO_REPLY`, or `HEARTBEAT_OK` instead of the contract.
+
 ### Auto-merge + CI failure handling
 
 The default runner (`scripts/rl-task-agent.sh`) does all of the following:
@@ -231,6 +233,8 @@ Runner must emit first-line protocol responses:
   - daemon does **not** auto-resume from dependency waits yet; it only records/displays them accurately
 - `TASK_BLOCKED: <reason>`
 - `TASK_WAITING_AGENT_LOCK` (treated as waiting, not hard failure)
+
+No preamble is allowed before the `TASK_*` line: do not narrate progress, tool use, or sub-agent handoffs, and do not return `NO_REPLY` / `HEARTBEAT_OK` from the task runner agent.
 
 Any non-conforming output is treated as failure and surfaced in state/logs.
 
