@@ -1593,4 +1593,107 @@ if [[ "$OUT16" == *"WARN_REQUIRED_CHECKS_MISSING=1"* ]]; then
   exit 1
 fi
 
+echo "[e2e-smoke] case17 rl-task-agent falls back to manual merge when --auto fails but PR still exists"
+AUTOMERGE_FALLBACK_MOCKDIR="$WORKDIR/mockbin-automerge-fallback"
+mkdir -p "$AUTOMERGE_FALLBACK_MOCKDIR"
+cat > "$AUTOMERGE_FALLBACK_MOCKDIR/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+state_file="${MOCK_GH_STATE_FILE:?}"
+if [[ "${1:-}" == "pr" && "${2:-}" == "view" ]]; then
+  joined="$*"
+  if [[ "$joined" == *"state,mergedAt"* ]]; then
+    if [[ -f "$state_file" ]]; then
+      echo 'MERGED|2026-04-06T01:00:00Z'
+    else
+      echo 'OPEN|'
+    fi
+    exit 0
+  fi
+  if [[ "$joined" == *"state,autoMergeRequest"* ]]; then
+    echo '0'
+    exit 0
+  fi
+  if [[ "$joined" == *"statusCheckRollup"* && "$joined" == *"| length"* ]]; then
+    echo '1'
+    exit 0
+  fi
+  if [[ "$joined" == *"statusCheckRollup"* ]]; then
+    echo ''
+    exit 0
+  fi
+fi
+if [[ "${1:-}" == "pr" && "${2:-}" == "merge" ]]; then
+  if [[ "$*" == *"--auto"* ]]; then
+    echo 'GraphQL: Could not resolve to a PullRequest with the number of 68. (repository.pullRequest)' >&2
+    exit 1
+  fi
+  : > "$state_file"
+  exit 0
+fi
+
+echo "unsupported mock gh args: $*" >&2
+exit 1
+EOF
+chmod +x "$AUTOMERGE_FALLBACK_MOCKDIR/gh"
+MOCK_GH_STATE_FILE="$WORKDIR/mock-gh-merge-state-17"
+rm -f "$MOCK_GH_STATE_FILE"
+mkdir -p "$WORKDIR/.ralph/runner-agent-state/run17"
+cat > "$WORKDIR/.ralph/runner-agent-state/run17/S5X-17.env" <<'EOF'
+PR_URL='https://github.com/demo/repo/pull/68'
+EOF
+set +e
+OUT17="$(cd "$WORKDIR" && PATH="$AUTOMERGE_FALLBACK_MOCKDIR:$PATH" MOCK_GH_STATE_FILE="$MOCK_GH_STATE_FILE" CLAW_GH_REPO="demo/repo" CLAW_TASK_ID="S5X-17" CLAW_TASK_TEXT="automerge fallback" CLAW_RUN_ID="run17" bash "$REPO/scripts/rl-task-agent.sh")"
+RC17=$?
+set -e
+if [[ "$RC17" -ne 0 ]]; then
+  echo "[e2e-smoke] expected case17 rc=0, got $RC17"
+  printf '%s\n' "$OUT17"
+  exit 1
+fi
+FIRST17="$(printf '%s\n' "$OUT17" | awk 'NF { print; exit }')"
+if [[ "$FIRST17" != "TASK_DONE PR_URL=https://github.com/demo/repo/pull/68" ]]; then
+  echo "[e2e-smoke] unexpected case17 first line"
+  printf '%s\n' "$OUT17"
+  exit 1
+fi
+
+echo "[e2e-smoke] case18 rl-task-agent blocks when --auto fails and PR no longer exists"
+AUTOMERGE_MISSING_MOCKDIR="$WORKDIR/mockbin-automerge-missing"
+mkdir -p "$AUTOMERGE_MISSING_MOCKDIR"
+cat > "$AUTOMERGE_MISSING_MOCKDIR/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "pr" && "${2:-}" == "view" ]]; then
+  echo 'GraphQL: Could not resolve to a PullRequest with the number of 69. (repository.pullRequest)' >&2
+  exit 1
+fi
+if [[ "${1:-}" == "pr" && "${2:-}" == "merge" ]]; then
+  echo 'GraphQL: Could not resolve to a PullRequest with the number of 69. (repository.pullRequest)' >&2
+  exit 1
+fi
+
+echo "unsupported mock gh args: $*" >&2
+exit 1
+EOF
+chmod +x "$AUTOMERGE_MISSING_MOCKDIR/gh"
+mkdir -p "$WORKDIR/.ralph/runner-agent-state/run18"
+cat > "$WORKDIR/.ralph/runner-agent-state/run18/S5X-18.env" <<'EOF'
+PR_URL='https://github.com/demo/repo/pull/69'
+EOF
+set +e
+OUT18="$(cd "$WORKDIR" && PATH="$AUTOMERGE_MISSING_MOCKDIR:$PATH" CLAW_GH_REPO="demo/repo" CLAW_TASK_ID="S5X-18" CLAW_TASK_TEXT="automerge missing pr" CLAW_RUN_ID="run18" bash "$REPO/scripts/rl-task-agent.sh" 2>&1)"
+RC18=$?
+set -e
+if [[ "$RC18" -ne 2 ]]; then
+  echo "[e2e-smoke] expected case18 rc=2, got $RC18"
+  printf '%s\n' "$OUT18"
+  exit 1
+fi
+if [[ "$OUT18" != *"TASK_BLOCKED: auto-merge enable failed for PR_URL=https://github.com/demo/repo/pull/69"* ]]; then
+  echo "[e2e-smoke] unexpected case18 blocked message"
+  printf '%s\n' "$OUT18"
+  exit 1
+fi
+
 echo "[e2e-smoke] ok"

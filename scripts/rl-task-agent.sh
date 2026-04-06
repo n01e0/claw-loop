@@ -120,7 +120,7 @@ resolve_gh_repo() {
   return 1
 }
 
-is_pr_merged() {
+pr_state_summary() {
   local pr_url="$1"
   if [[ -z "$pr_url" ]]; then
     return 1
@@ -130,11 +130,25 @@ is_pr_merged() {
   if [[ -z "$gh_repo" ]]; then
     return 1
   fi
+  gh pr view "$pr_url" --repo "$gh_repo" --json state,mergedAt --jq '.state + "|" + (.mergedAt // "")' 2>/dev/null
+}
+
+is_pr_merged() {
+  local pr_url="$1"
   local out
-  if ! out="$(gh pr view "$pr_url" --repo "$gh_repo" --json state,mergedAt --jq '.state + "|" + (.mergedAt // "")' 2>/dev/null)"; then
+  if ! out="$(pr_state_summary "$pr_url")"; then
     return 1
   fi
   [[ "$out" == MERGED* ]]
+}
+
+pr_exists() {
+  local pr_url="$1"
+  local out
+  if ! out="$(pr_state_summary "$pr_url")"; then
+    return 1
+  fi
+  [[ -n "$out" ]]
 }
 
 AUTO_MERGE_LAST_ERROR=""
@@ -191,6 +205,15 @@ enable_pr_auto_merge() {
   if [[ "$merge_rc" -ne 0 ]]; then
     AUTO_MERGE_LAST_ERROR="$(clip_one_line "$merge_out")"
     if is_auto_merge_unavailable_error "$AUTO_MERGE_LAST_ERROR"; then
+      AUTO_MERGE_MODE="manual"
+      AUTO_MERGE_LAST_ERROR=""
+      return 0
+    fi
+    if is_pr_merged "$pr_url"; then
+      AUTO_MERGE_LAST_ERROR=""
+      return 0
+    fi
+    if pr_exists "$pr_url"; then
       AUTO_MERGE_MODE="manual"
       AUTO_MERGE_LAST_ERROR=""
       return 0
