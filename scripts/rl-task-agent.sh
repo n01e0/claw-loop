@@ -140,23 +140,101 @@ PY
 }
 
 get_first_line() {
-  printf '%s\n' "$1" | awk '
+  printf '%s
+' "$1" | awk '
     {
       sub(/\r$/, "")
       if (first_nonempty == "" && $0 ~ /[^[:space:]]/) {
         first_nonempty = $0
       }
-      if ($0 ~ /^TASK_[A-Z_]+([[:space:]]|$)/) {
-        print
-        exit
-      }
     }
     END {
-      if (first_nonempty != "") {
-        print first_nonempty
-      }
+      print first_nonempty
     }
   '
+}
+
+resolve_session_jsonl() {
+  local session_id="$1"
+  local agent_id="$2"
+  local base="${OPENCLAW_HOME:-$HOME/.openclaw}/agents/${agent_id}/sessions"
+  if [[ -f "$base/${session_id}.jsonl" ]]; then
+    printf '%s\n' "$base/${session_id}.jsonl"
+    return 0
+  fi
+  local candidate
+  candidate="$(find "$base" -maxdepth 1 -type f -name "${session_id}*.jsonl" 2>/dev/null | head -n1 || true)"
+  if [[ -n "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  return 1
+}
+
+extract_session_signal() {
+  local session_jsonl="$1"
+  python3 - "$session_jsonl" <<'PY2' 2>/dev/null
+import json, sys
+path = sys.argv[1]
+with open(path, 'r') as fh:
+    rows = [json.loads(line) for line in fh if line.strip()]
+
+def assistant_text(row):
+    msg = row.get('message') or {}
+    if msg.get('role') != 'assistant':
+        return None
+    content = msg.get('content') or []
+    parts = []
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get('text'), str):
+                parts.append(item['text'])
+            elif isinstance(item, str):
+                parts.append(item)
+    elif isinstance(content, str):
+        parts.append(content)
+    text = '\n'.join(p for p in parts if p).strip()
+    return text or None
+
+for row in reversed(rows):
+    text = assistant_text(row)
+    if not text:
+        continue
+    first = text.splitlines()[0].strip()
+    if first.startswith(('TASK_DONE', 'TASK_WAITING_MERGE', 'TASK_WAITING_DEPENDENCY', 'TASK_WAITING_AGENT_LOCK', 'TASK_BLOCKED')):
+        print(first)
+        raise SystemExit(0)
+
+for row in reversed(rows):
+    if row.get('customType') == 'openclaw:prompt-error':
+        err = ((row.get('data') or {}).get('error') or '').strip()
+        if err:
+            print(f'PROMPT_ERROR: {err}')
+            raise SystemExit(0)
+
+for row in reversed(rows):
+    msg = row.get('message') or {}
+    err = (msg.get('errorMessage') or '').strip()
+    if err:
+        print(f'ABORTED: {err}')
+        raise SystemExit(0)
+PY2
+}
+
+session_signal_for_failure() {
+  local session_id="$1"
+  local agent_id="$2"
+  local jsonl
+  jsonl="$(resolve_session_jsonl "$session_id" "$agent_id" || true)"
+  if [[ -z "$jsonl" ]]; then
+    return 0
+  fi
+  extract_session_signal "$jsonl"
+}
+
+is_retryable_session_signal() {
+  local signal="$1"
+  [[ "$signal" == PROMPT_ERROR:*request\ timed\ out* ||      "$signal" == PROMPT_ERROR:*timed\ out* ||      "$signal" == ABORTED:*operation\ was\ aborted* ]]
 }
 
 parse_pr_url() {
@@ -643,14 +721,39 @@ if [[ "$rc" -ne 0 ]]; then
     echo "TASK_WAITING_AGENT_LOCK"
     exit 10
   fi
-  echo "TASK_BLOCKED: openclaw agent command failed (rc=$rc)" >&2
-  printf '%s\n' "$raw_out" >&2
-  exit 2
+  session_signal="$(session_signal_for_failure "$agent_session_id" "$agent_id" || true)"
+  if [[ "$session_signal" == TASK_DONE* || "$session_signal" == TASK_WAITING_MERGE* || "$session_signal" == TASK_WAITING_DEPENDENCY* || "$session_signal" == TASK_WAITING_AGENT_LOCK* || "$session_signal" == TASK_BLOCKED* ]]; then
+    raw_out="$session_signal"
+  elif is_retryable_session_signal "$session_signal"; then
+    echo "TASK_WAITING_DEPENDENCY: subagent request timed out for ${agent_session_id}; retry task"
+    exit 10
+  else
+    echo "TASK_BLOCKED: openclaw agent command failed (rc=$rc)" >&2
+    printf '%s\n' "$raw_out" >&2
+    if [[ -n "$session_signal" ]]; then
+      printf '%s\n' "$session_signal" >&2
+    fi
+    exit 2
+  fi
 fi
 
-json_out="$(extract_json_object "$raw_out")"
-text="$(extract_agent_text "$json_out")"
-printf '%s\n' "$text"
+if [[ "$raw_out" == TASK_DONE* || "$raw_out" == TASK_WAITING_MERGE* || "$raw_out" == TASK_WAITING_DEPENDENCY* || "$raw_out" == TASK_WAITING_AGENT_LOCK* || "$raw_out" == TASK_BLOCKED* ]]; then
+  text="$raw_out"
+else
+  json_out="$(extract_json_object "$raw_out")"
+  text="$(extract_agent_text "$json_out")"
+fi
+if [[ -z "$text" ]]; then
+  session_signal="$(session_signal_for_failure "$agent_session_id" "$agent_id" || true)"
+  if [[ "$session_signal" == TASK_DONE* || "$session_signal" == TASK_WAITING_MERGE* || "$session_signal" == TASK_WAITING_DEPENDENCY* || "$session_signal" == TASK_WAITING_AGENT_LOCK* || "$session_signal" == TASK_BLOCKED* ]]; then
+    text="$session_signal"
+  elif is_retryable_session_signal "$session_signal"; then
+    echo "TASK_WAITING_DEPENDENCY: subagent request timed out for ${agent_session_id}; retry task"
+    exit 10
+  fi
+fi
+printf '%s
+' "$text"
 
 if [[ -n "$task_file_hash_before" && -f "${CLAW_TASK_FILE:-}" ]]; then
   task_file_hash_after="$(task_plan_hash "${CLAW_TASK_FILE}")"
