@@ -275,6 +275,19 @@ enum RunnerTaskState {
     Done,
 }
 
+impl RunnerTaskState {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::WaitingMerge => "waiting_merge",
+            Self::WaitingDependency => "waiting_dependency",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 struct WaitingDependencyContext {
     task_id: String,
@@ -1332,6 +1345,25 @@ fn clear_current_blocked_context(runner_state: &mut RunnerState) {
 
 fn clear_current_waiting_dependency(runner_state: &mut RunnerState) {
     runner_state.current_waiting_dependency = None;
+}
+
+fn missing_current_task_id_guard_reason(
+    current_task_state: Option<&RunnerTaskState>,
+) -> Option<String> {
+    let state = current_task_state?;
+    let detail = match state {
+        RunnerTaskState::WaitingMerge => {
+            "task was waiting_merge; refusing to misclassify it as blocked or completed"
+        }
+        RunnerTaskState::WaitingDependency => {
+            "task was waiting_dependency (external dependency); refusing to misclassify it as generic blocked or completed"
+        }
+        RunnerTaskState::Blocked => {
+            "task was already blocked; refusing to misclassify it as waiting_merge, dependency wait, or completed"
+        }
+        _ => return None,
+    };
+    Some(format!("runner state lost current_task_id while {detail}"))
 }
 
 fn track_task_pr_url(runner_state: &mut RunnerState, task_id: Option<&str>, pr_url: Option<&str>) {
@@ -4328,6 +4360,45 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                 }
 
                 if runner_state.current_task_id.is_none() {
+                    if let Some(reason) = missing_current_task_id_guard_reason(
+                        runner_state.current_task_state.as_ref(),
+                    ) {
+                        runner_state.paused = false;
+                        runner_state.pause_reason = None;
+                        state.status = LoopStatus::Blocked;
+                        state.summary = "runner state guardrail blocked".into();
+                        state.waiting_reason = reason.clone();
+                        state.updated_at = now;
+                        state.version += 1;
+                        write_runner_state(&dir, &runner_state)?;
+                        write_json(&dir.join("state.json"), &state)?;
+                        append_event(
+                            &dir,
+                            "runner_state_guardrail_blocked",
+                            serde_json::json!({
+                                "reason": reason,
+                                "current_task_state": runner_state
+                                    .current_task_state
+                                    .as_ref()
+                                    .map(RunnerTaskState::as_str),
+                                "current_task_text": runner_state.current_task_text.clone(),
+                                "current_waiting_dependency": runner_state.current_waiting_dependency.clone(),
+                                "current_blocked_context": runner_state.current_blocked_context.clone(),
+                            }),
+                        )?;
+                        queue_notification(
+                            &dir,
+                            &manifest,
+                            "blocked",
+                            format!(
+                                "run blocked: runner state guardrail triggered\n- reason: {}\n- recovery: inspect runner-state.json and rerun the task so waiting_merge / dependency_wait / blocked state keeps its task id",
+                                state.waiting_reason
+                            ),
+                        )?;
+                        let _ = flush_notifications(&dir, &manifest)?;
+                        break;
+                    }
+
                     let (_, _, entries) = load_task_checklist(&task_file_abs)?;
                     let preferred_next_task_id = runner_state
                         .preferred_next_task_id
@@ -6070,11 +6141,12 @@ mod tests {
         format_orphan_blocked_notification, format_task_blocked_notification,
         format_waiting_dependency_notification, format_waiting_merge_notification,
         is_phase_or_stacked_dependency_reason, lease_window_sec, maybe_auto_recover_blocked_task,
-        normalize_blocked_reason_for_recovery, normalize_error_reason, notification_delivery_mode,
-        openclaw_notify_timeout_sec_from, parse_openclaw_message_id, parse_task_checklist_entry,
-        parse_waiting_contract, parse_waiting_dependency_contract, queue_main_feedback_summary,
-        queue_notification, read_backlog_snapshot, read_jsonl, retryable_waiting_merge_error,
-        select_next_task_entry, select_next_task_with_backlog, should_force_status_establish_retry,
+        missing_current_task_id_guard_reason, normalize_blocked_reason_for_recovery,
+        normalize_error_reason, notification_delivery_mode, openclaw_notify_timeout_sec_from,
+        parse_openclaw_message_id, parse_task_checklist_entry, parse_waiting_contract,
+        parse_waiting_dependency_contract, queue_main_feedback_summary, queue_notification,
+        read_backlog_snapshot, read_jsonl, retryable_waiting_merge_error, select_next_task_entry,
+        select_next_task_with_backlog, should_force_status_establish_retry,
         should_suppress_waiting_stuck, task_contract_line, tasklist_approval_violation_reason,
         update_waiting_stuck_tracker, validate_task_done_contract_with,
         waiting_merge_nonprogress_reason, write_json,
@@ -6664,6 +6736,30 @@ mod tests {
         assert!(!is_phase_or_stacked_dependency_reason(
             "merge state is dirty for PR_URL=https://example.test/pull/1"
         ));
+    }
+
+    #[test]
+    fn missing_current_task_id_guard_reason_distinguishes_waiting_merge_blocked_and_dependency() {
+        let waiting_merge =
+            missing_current_task_id_guard_reason(Some(&RunnerTaskState::WaitingMerge))
+                .expect("waiting_merge guard reason");
+        assert!(waiting_merge.contains("waiting_merge"));
+        assert!(waiting_merge.contains("blocked or completed"));
+
+        let waiting_dependency =
+            missing_current_task_id_guard_reason(Some(&RunnerTaskState::WaitingDependency))
+                .expect("waiting_dependency guard reason");
+        assert!(waiting_dependency.contains("waiting_dependency"));
+        assert!(waiting_dependency.contains("external dependency"));
+        assert!(waiting_dependency.contains("generic blocked or completed"));
+
+        let blocked = missing_current_task_id_guard_reason(Some(&RunnerTaskState::Blocked))
+            .expect("blocked guard reason");
+        assert!(blocked.contains("already blocked"));
+        assert!(blocked.contains("waiting_merge, dependency wait, or completed"));
+
+        assert!(missing_current_task_id_guard_reason(Some(&RunnerTaskState::Running)).is_none());
+        assert!(missing_current_task_id_guard_reason(None).is_none());
     }
 
     #[test]

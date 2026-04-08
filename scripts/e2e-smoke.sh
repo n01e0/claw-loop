@@ -1439,6 +1439,100 @@ $BIN stop --repo "$WORKDIR" --run-id "$RUN13D" --immediate >/dev/null || true
 sleep 1
 
 
+echo "[e2e-smoke] case13e guardrail blocks inconsistent waiting_dependency state instead of stopping"
+TASKFILE13E="$WORKDIR/docs/roadmaps/s5-case13e-tasklist.md"
+mkdir -p "$(dirname "$TASKFILE13E")"
+cat > "$TASKFILE13E" <<'EOF'
+- [ ] S5X-13E: repair external dependency sequencing
+EOF
+
+APPROVED13E="$(approve_task_file "$TASKFILE13E")"
+OUT13E="$($BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --task-file "$TASKFILE13E" --task-runner-cmd 'echo should-not-run > "$WORKDIR/.ralph/should-not-run-case13e"; exit 0' --auto-check-on-success false --require-task-approval --approved-tasklist-hash "$APPROVED13E")"
+RUN13E="$(echo "$OUT13E" | awk -F= '/^run_id=/{print $2}')"
+if [[ -z "$RUN13E" ]]; then
+  echo "[e2e-smoke] failed to parse run13e id"
+  echo "$OUT13E"
+  exit 1
+fi
+
+$BIN stop --repo "$WORKDIR" --run-id "$RUN13E" --immediate >/dev/null || true
+sleep 1
+rm -f "$WORKDIR/.ralph/runs/$RUN13E/control.stop"
+
+SHOULD_NOT_RUN13E="$WORKDIR/.ralph/should-not-run-case13e"
+rm -f "$SHOULD_NOT_RUN13E"
+python3 - <<'PY' "$WORKDIR" "$RUN13E"
+import json, pathlib, sys
+workdir = pathlib.Path(sys.argv[1])
+run_id = sys.argv[2]
+run_dir = workdir / '.ralph' / 'runs' / run_id
+runner_state_path = run_dir / 'runner-state.json'
+state_path = run_dir / 'state.json'
+runner = json.loads(runner_state_path.read_text())
+runner.update({
+    'current_task_id': None,
+    'current_task_text': 'repair external dependency sequencing',
+    'current_task_line': 1,
+    'current_task_started_at': None,
+    'current_task_state': 'waiting_dependency',
+    'current_task_pr_url': None,
+    'current_task_blocked_reason': None,
+    'current_blocked_context': None,
+    'paused': False,
+    'pause_reason': None,
+    'task_loops_started': 0,
+    'current_waiting_dependency': {
+        'task_id': 'S5X-13E',
+        'depends_on_task': None,
+        'depends_on_pr_url': 'https://github.com/demo/repo/pull/888',
+        'contract_line': 'TASK_WAITING_DEPENDENCY TASK_ID=S5X-13E DEPENDS_ON_PR_URL=https://github.com/demo/repo/pull/888'
+    }
+})
+runner_state_path.write_text(json.dumps(runner))
+state = json.loads(state_path.read_text())
+state.update({'status': 'running', 'summary': 'daemon started', 'waiting_reason': ''})
+state_path.write_text(json.dumps(state))
+PY
+
+"$BIN" daemon --repo "$WORKDIR" --run-id "$RUN13E" --tick-sec 1 >/tmp/case13e-daemon.log 2>&1 &
+DAEMON13E=$!
+STATUS13E=""
+for _ in {1..20}; do
+  STATUS13E="$($BIN status --repo "$WORKDIR" --run-id "$RUN13E")"
+  if python3 - <<'PY' "$STATUS13E"
+import json, sys
+obj = json.loads(sys.argv[1])
+ok = obj.get('status') == 'blocked' and 'waiting_dependency' in (obj.get('waiting_reason') or '') and 'lost current_task_id' in (obj.get('waiting_reason') or '')
+raise SystemExit(0 if ok else 1)
+PY
+  then
+    break
+  fi
+  sleep 1
+done
+kill "$DAEMON13E" >/dev/null 2>&1 || true
+wait "$DAEMON13E" >/dev/null 2>&1 || true
+
+python3 - <<'PY' "$STATUS13E" "$WORKDIR/.ralph/runs/$RUN13E/events.jsonl" "$SHOULD_NOT_RUN13E"
+import json, pathlib, sys
+status = json.loads(sys.argv[1])
+events_path = pathlib.Path(sys.argv[2])
+should_not_run = pathlib.Path(sys.argv[3])
+if status.get('status') != 'blocked':
+    raise SystemExit(f"expected blocked, got {status.get('status')!r}")
+reason = status.get('waiting_reason') or ''
+if 'waiting_dependency' not in reason or 'lost current_task_id' not in reason:
+    raise SystemExit(f"expected waiting_dependency guardrail reason, got {reason!r}")
+if should_not_run.exists():
+    raise SystemExit('guardrail should block before task runner executes')
+events = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+if not any(e.get('kind') == 'runner_state_guardrail_blocked' for e in events):
+    raise SystemExit(f"expected runner_state_guardrail_blocked event, got {[e.get('kind') for e in events][-10:]}")
+if any(e.get('kind') == 'daemon_stopped_all_tasks_completed' for e in events):
+    raise SystemExit('guardrail regression: daemon should not stop as all tasks completed')
+PY
+
+
 echo "[e2e-smoke] case14 rl-task-agent ignores leading empty payload before TASK_DONE"
 RUNNER_MOCKDIR="$WORKDIR/mockbin-runner"
 mkdir -p "$RUNNER_MOCKDIR"
