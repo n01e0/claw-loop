@@ -589,6 +589,16 @@ if [[ -f "$state_file" ]]; then
   fi
 fi
 
+if [[ "${CLAW_BACKLOG_STATUS:-}" == "backlog" ]]; then
+  task_kind="${CLAW_TASK_KIND:-unknown}"
+  if [[ "$task_kind" != "repair" ]]; then
+    backlog_count="${CLAW_BACKLOG_COUNT:-unknown}"
+    backlog_summary="$(clip_one_line "${CLAW_BACKLOG_SUMMARY:-backlog active}")"
+    echo "TASK_BLOCKED: failure-first backlog gate active for task ${CLAW_TASK_ID}; backlog_count=${backlog_count}; task_kind=${task_kind}; repair tasks only; detector=${backlog_summary}" >&2
+    exit 2
+  fi
+fi
+
 read -r -d '' PROMPT <<'EOF' || true
 You are executing one approved dogfood task for claw-loop.
 
@@ -627,6 +637,18 @@ PROMPT+="Task ID: ${CLAW_TASK_ID}"$'\n'
 PROMPT+="Task: ${CLAW_TASK_TEXT}"$'\n'
 PROMPT+="Task file: ${CLAW_TASK_FILE:-}"$'\n'
 PROMPT+="Run ID: ${run_id}"$'\n'
+if [[ -n "${CLAW_TASK_KIND:-}" ]]; then
+  PROMPT+="Task kind: ${CLAW_TASK_KIND}"$'\n'
+fi
+if [[ -n "${CLAW_BACKLOG_STATUS:-}" ]]; then
+  PROMPT+="Backlog detector status: ${CLAW_BACKLOG_STATUS}"$'\n'
+  PROMPT+="Backlog count: ${CLAW_BACKLOG_COUNT:-0}"$'\n'
+  PROMPT+="Backlog summary: ${CLAW_BACKLOG_SUMMARY:-}"$'\n'
+  PROMPT+="Backlog updated at: ${CLAW_BACKLOG_UPDATED_AT:-}"$'\n'
+  if [[ "${CLAW_BACKLOG_STATUS}" == "backlog" ]]; then
+    PROMPT+="Failure-first gate: backlog is active. Repair-scoped tasks may proceed; do not ship a standalone feature-style PR while backlog_count>0."$'\n'
+  fi
+fi
 
 task_file_hash_before=""
 if [[ -n "${CLAW_TASK_FILE:-}" && -f "${CLAW_TASK_FILE}" ]]; then

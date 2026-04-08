@@ -80,6 +80,10 @@ enum Commands {
         auto_recover_blocked: bool,
         #[arg(long, default_value_t = 3)]
         auto_recover_blocked_max_attempts: u64,
+        #[arg(long)]
+        backlog_detector_file: Option<PathBuf>,
+        #[arg(long, default_value_t = default_backlog_detector_max_age_sec())]
+        backlog_detector_max_age_sec: u64,
     },
     Daemon {
         #[arg(long)]
@@ -230,6 +234,10 @@ struct Manifest {
     auto_recover_blocked: bool,
     #[serde(default = "default_auto_recover_blocked_max_attempts")]
     auto_recover_blocked_max_attempts: u64,
+    #[serde(default)]
+    backlog_detector_file: Option<PathBuf>,
+    #[serde(default = "default_backlog_detector_max_age_sec")]
+    backlog_detector_max_age_sec: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -275,6 +283,65 @@ struct WaitingDependencyContext {
     #[serde(default)]
     depends_on_pr_url: Option<String>,
     contract_line: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TaskExecutionKind {
+    Repair,
+    Feature,
+    Unknown,
+}
+
+impl TaskExecutionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Repair => "repair",
+            Self::Feature => "feature",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+struct BacklogSnapshot {
+    detector_file: PathBuf,
+    repo_path: PathBuf,
+    status: String,
+    backlog_count: u64,
+    summary: String,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawBacklogSnapshot {
+    #[serde(default)]
+    repo_path: Option<PathBuf>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default, alias = "count")]
+    backlog_count: Option<u64>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum TaskSelectionOutcome {
+    Next(TaskChecklistEntry),
+    None,
+    Waiting {
+        summary: String,
+        reason: String,
+        backlog_snapshot: BacklogSnapshot,
+    },
+    Blocked {
+        summary: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -552,6 +619,8 @@ struct StartOptions {
     auto_check_on_success: bool,
     auto_recover_blocked: bool,
     auto_recover_blocked_max_attempts: u64,
+    backlog_detector_file: Option<PathBuf>,
+    backlog_detector_max_age_sec: u64,
 }
 
 fn default_max_task_loops() -> u64 {
@@ -564,6 +633,10 @@ fn default_auto_check_on_success() -> bool {
 
 fn default_auto_recover_blocked_max_attempts() -> u64 {
     3
+}
+
+fn default_backlog_detector_max_age_sec() -> u64 {
+    900
 }
 
 fn stuck_wait_ticks_threshold() -> u64 {
@@ -1118,6 +1191,8 @@ struct TaskRunOptions<'a> {
     thread_id: Option<&'a str>,
     channel: Option<&'a str>,
     task_agent_id: Option<&'a str>,
+    task_kind: Option<TaskExecutionKind>,
+    backlog_snapshot: Option<&'a BacklogSnapshot>,
 }
 
 fn clip_text(input: &str, max_chars: usize) -> String {
@@ -1351,6 +1426,242 @@ where
     }
 
     Ok(WaitingDependencyProgress::Waiting(enriched))
+}
+
+fn canonicalize_for_repo_match(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn resolve_backlog_repo_path(raw_repo_path: &Path, detector_file: &Path) -> PathBuf {
+    if raw_repo_path.is_absolute() {
+        raw_repo_path.to_path_buf()
+    } else {
+        detector_file
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(raw_repo_path)
+    }
+}
+
+fn read_backlog_snapshot(
+    repo_path: &Path,
+    detector_file: &Path,
+    max_age_sec: u64,
+    now: DateTime<Utc>,
+) -> Result<BacklogSnapshot> {
+    let raw_text = fs::read_to_string(detector_file)
+        .with_context(|| format!("read backlog detector file {}", detector_file.display()))?;
+    let raw: RawBacklogSnapshot = serde_json::from_str(&raw_text)
+        .with_context(|| format!("parse backlog detector file {}", detector_file.display()))?;
+
+    let raw_repo_path = raw.repo_path.ok_or_else(|| {
+        anyhow::anyhow!(
+            "backlog detector file {} is missing repo_path",
+            detector_file.display()
+        )
+    })?;
+    let resolved_repo_path = resolve_backlog_repo_path(&raw_repo_path, detector_file);
+    let expected_repo_path = canonicalize_for_repo_match(repo_path);
+    let snapshot_repo_path = canonicalize_for_repo_match(&resolved_repo_path);
+    if snapshot_repo_path != expected_repo_path {
+        bail!(
+            "backlog detector file {} targets repo {} (current repo: {})",
+            detector_file.display(),
+            snapshot_repo_path.display(),
+            expected_repo_path.display()
+        );
+    }
+
+    let metadata = fs::metadata(detector_file)
+        .with_context(|| format!("stat backlog detector file {}", detector_file.display()))?;
+    let updated_at = raw
+        .updated_at
+        .or_else(|| metadata.modified().ok().map(DateTime::<Utc>::from))
+        .unwrap_or(now);
+
+    if max_age_sec > 0 {
+        let age_sec = now.signed_duration_since(updated_at).num_seconds();
+        if age_sec > max_age_sec as i64 {
+            bail!(
+                "backlog detector file {} is stale: age={}s exceeds {}s",
+                detector_file.display(),
+                age_sec,
+                max_age_sec
+            );
+        }
+    }
+
+    let mut status = raw
+        .status
+        .unwrap_or_else(|| {
+            if raw.backlog_count.unwrap_or(0) > 0 {
+                "backlog".to_string()
+            } else {
+                "clear".to_string()
+            }
+        })
+        .trim()
+        .to_ascii_lowercase();
+    if status.is_empty() {
+        status = "clear".to_string();
+    }
+
+    let backlog_count = match status.as_str() {
+        "clear" => raw.backlog_count.unwrap_or(0),
+        "backlog" => raw.backlog_count.unwrap_or(1),
+        "error" => {
+            bail!(
+                "backlog detector error from {}: {}",
+                detector_file.display(),
+                raw.error
+                    .or(raw.summary)
+                    .unwrap_or_else(|| "unknown detector error".to_string())
+            )
+        }
+        "stale" => {
+            bail!(
+                "backlog detector marked itself stale in {}: {}",
+                detector_file.display(),
+                raw.summary
+                    .unwrap_or_else(|| "detector reported stale status".to_string())
+            )
+        }
+        other => bail!(
+            "unsupported backlog detector status '{}' in {}",
+            other,
+            detector_file.display()
+        ),
+    };
+
+    let summary = raw.summary.unwrap_or_else(|| match status.as_str() {
+        "backlog" => format!("backlog_count={backlog_count}"),
+        _ => format!("status={status}"),
+    });
+
+    Ok(BacklogSnapshot {
+        detector_file: detector_file.to_path_buf(),
+        repo_path: snapshot_repo_path,
+        status,
+        backlog_count,
+        summary,
+        updated_at,
+    })
+}
+
+fn classify_task_execution_kind(entry: &TaskChecklistEntry) -> TaskExecutionKind {
+    let text = entry.text.trim();
+    let lowered = text.to_ascii_lowercase();
+    let lowered_id = entry.id.to_ascii_lowercase();
+
+    let has_tag = |tag: &str| {
+        lowered.starts_with(&format!("[{tag}]")) || lowered.starts_with(&format!("({tag})"))
+    };
+    if has_tag("repair") || has_tag("fix") || lowered_id.contains("-recover") {
+        return TaskExecutionKind::Repair;
+    }
+    if has_tag("feature") {
+        return TaskExecutionKind::Feature;
+    }
+
+    let repair_keywords = [
+        "fix",
+        "bug",
+        "regression",
+        "recover",
+        "repair",
+        "blocked",
+        "failure-first",
+        "backlog",
+        "gating",
+        "guardrail",
+        "guard",
+        "stabilize",
+        "stability",
+        "retry",
+        "ci fail",
+        "ci failure",
+        "waiting_merge",
+        "dependency",
+    ];
+    if repair_keywords.iter().any(|kw| lowered.contains(kw)) {
+        return TaskExecutionKind::Repair;
+    }
+
+    let feature_keywords = [
+        "feature",
+        "add ",
+        "add:",
+        "implement",
+        "introduce",
+        "create",
+        "build",
+        "new ",
+    ];
+    if feature_keywords.iter().any(|kw| lowered.contains(kw)) {
+        return TaskExecutionKind::Feature;
+    }
+
+    TaskExecutionKind::Unknown
+}
+
+fn select_next_task_with_backlog(
+    entries: &[TaskChecklistEntry],
+    preferred_recovery_task_id: Option<&str>,
+    backlog_snapshot: Option<&BacklogSnapshot>,
+) -> TaskSelectionOutcome {
+    let next_open = select_next_task_entry(entries, preferred_recovery_task_id);
+    let Some(backlog_snapshot) = backlog_snapshot else {
+        return next_open
+            .map(TaskSelectionOutcome::Next)
+            .unwrap_or(TaskSelectionOutcome::None);
+    };
+
+    if backlog_snapshot.status != "backlog" || backlog_snapshot.backlog_count == 0 {
+        return next_open
+            .map(TaskSelectionOutcome::Next)
+            .unwrap_or(TaskSelectionOutcome::None);
+    }
+
+    if let Some(preferred_id) = preferred_recovery_task_id
+        && !preferred_id.trim().is_empty()
+        && let Some(preferred_entry) = entries.iter().find(|entry| {
+            !entry.done
+                && entry.id == preferred_id
+                && classify_task_execution_kind(entry) == TaskExecutionKind::Repair
+        })
+    {
+        return TaskSelectionOutcome::Next(preferred_entry.clone());
+    }
+
+    if let Some(repair_entry) = entries.iter().find(|entry| {
+        !entry.done && classify_task_execution_kind(entry) == TaskExecutionKind::Repair
+    }) {
+        return TaskSelectionOutcome::Next(repair_entry.clone());
+    }
+
+    let Some(next_open) = next_open else {
+        return TaskSelectionOutcome::None;
+    };
+    let blocked_kind = classify_task_execution_kind(&next_open);
+    TaskSelectionOutcome::Waiting {
+        summary: "task selection gated by failure-first backlog policy".to_string(),
+        reason: format!(
+            "backlog gate active: backlog_count={}; repair tasks only; next open task {} classified as {}; detector_summary={}; detector_updated_at={}",
+            backlog_snapshot.backlog_count,
+            next_open.id,
+            blocked_kind.as_str(),
+            clip_text(&backlog_snapshot.summary, 120),
+            backlog_snapshot.updated_at.to_rfc3339()
+        ),
+        backlog_snapshot: backlog_snapshot.clone(),
+    }
+}
+
+fn format_backlog_gate_notification(summary: &str, reason: &str) -> String {
+    format!(
+        "task selection gated by failure-first backlog policy\n- summary: {}\n- reason: {}",
+        summary, reason
+    )
 }
 
 fn format_local_as_of(ts: DateTime<Utc>) -> String {
@@ -2608,6 +2919,26 @@ fn run_task_once(opts: TaskRunOptions<'_>) -> Result<TaskRunOutcome> {
     if let Some(task_agent_id) = opts.task_agent_id {
         command.env("CLAW_AGENT_ID", task_agent_id);
     }
+    if let Some(task_kind) = opts.task_kind {
+        command.env("CLAW_TASK_KIND", task_kind.as_str());
+    }
+    if let Some(backlog_snapshot) = opts.backlog_snapshot {
+        command
+            .env("CLAW_BACKLOG_STATUS", backlog_snapshot.status.as_str())
+            .env(
+                "CLAW_BACKLOG_COUNT",
+                backlog_snapshot.backlog_count.to_string(),
+            )
+            .env("CLAW_BACKLOG_SUMMARY", backlog_snapshot.summary.as_str())
+            .env(
+                "CLAW_BACKLOG_UPDATED_AT",
+                backlog_snapshot.updated_at.to_rfc3339(),
+            )
+            .env(
+                "CLAW_BACKLOG_FILE",
+                backlog_snapshot.detector_file.to_string_lossy().to_string(),
+            );
+    }
 
     if let Some(cwd) = opts.cwd {
         command.current_dir(cwd);
@@ -3437,6 +3768,8 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
         auto_check_on_success: opts.auto_check_on_success,
         auto_recover_blocked: opts.auto_recover_blocked,
         auto_recover_blocked_max_attempts: opts.auto_recover_blocked_max_attempts,
+        backlog_detector_file: opts.backlog_detector_file,
+        backlog_detector_max_age_sec: opts.backlog_detector_max_age_sec,
     };
     let state = State {
         version: 1,
@@ -3996,13 +4329,34 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
 
                 if runner_state.current_task_id.is_none() {
                     let (_, _, entries) = load_task_checklist(&task_file_abs)?;
-                    let next = select_next_task_entry(
-                        &entries,
-                        runner_state
-                            .preferred_next_task_id
-                            .as_deref()
-                            .or(runner_state.auto_recover_last_task_id.as_deref()),
-                    );
+                    let preferred_next_task_id = runner_state
+                        .preferred_next_task_id
+                        .as_deref()
+                        .or(runner_state.auto_recover_last_task_id.as_deref());
+                    let selection = match manifest.backlog_detector_file.as_deref() {
+                        Some(detector_file) => match read_backlog_snapshot(
+                            &manifest.repo_path,
+                            detector_file,
+                            manifest.backlog_detector_max_age_sec,
+                            now,
+                        ) {
+                            Ok(backlog_snapshot) => select_next_task_with_backlog(
+                                &entries,
+                                preferred_next_task_id,
+                                Some(&backlog_snapshot),
+                            ),
+                            Err(err) => TaskSelectionOutcome::Blocked {
+                                summary: "backlog detector unavailable".to_string(),
+                                reason: format!(
+                                    "failure-first gate blocked: {}",
+                                    clip_text(&err.to_string(), 200)
+                                ),
+                            },
+                        },
+                        None => {
+                            select_next_task_with_backlog(&entries, preferred_next_task_id, None)
+                        }
+                    };
 
                     if runner_state.task_loops_started >= manifest.max_task_loops {
                         runner_state.paused = true;
@@ -4027,7 +4381,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                             "loop_limit_reached",
                             state.waiting_reason.clone(),
                         )?;
-                    } else if next.is_none() {
+                    } else if matches!(selection, TaskSelectionOutcome::None) {
                         runner_state.paused = true;
                         runner_state.current_task_state = None;
                         clear_current_blocked_context(&mut runner_state);
@@ -4062,358 +4416,481 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                         )?;
                         break;
                     } else {
-                        let queued_task = next.clone().expect("checked next.is_some");
-                        if runner_state.preferred_next_task_id.as_deref()
-                            == Some(queued_task.id.as_str())
-                        {
-                            runner_state.preferred_next_task_id = None;
-                        }
-                        if runner_state.auto_recover_last_task_id.as_deref()
-                            == Some(queued_task.id.as_str())
-                        {
-                            runner_state.auto_recover_last_task_id = None;
-                        }
-                        runner_state.preferred_next_task_id = None;
-                        runner_state.current_task_id = Some(queued_task.id.clone());
-                        runner_state.current_task_text = Some(queued_task.text.clone());
-                        runner_state.current_task_line = Some(queued_task.line_no);
-                        runner_state.current_task_started_at = Some(now);
-                        runner_state.current_task_state = Some(RunnerTaskState::Queued);
-                        clear_current_blocked_context(&mut runner_state);
-                        clear_current_waiting_dependency(&mut runner_state);
-                        runner_state.current_task_pr_url = None;
-                        runner_state.paused = false;
-                        runner_state.pause_reason = None;
-                        write_runner_state(&dir, &runner_state)?;
-
-                        runner_state.current_task_state = Some(RunnerTaskState::Running);
-                        write_runner_state(&dir, &runner_state)?;
-
-                        queue_notification(
-                            &dir,
-                            &manifest,
-                            "task_started",
-                            format!(
-                                "task started: {} (line {})",
-                                queued_task.id, queued_task.line_no
-                            ),
-                        )?;
-
-                        let mut runner = run_task_once(TaskRunOptions {
-                            task_file: &task_file_abs,
-                            selected_task: Some(queued_task.clone()),
-                            cmd: &cmd,
-                            auto_check_on_success: manifest.auto_check_on_success,
-                            dry_run: false,
-                            cwd: Some(&manifest.repo_path),
-                            run_id: Some(run_id),
-                            thread_id: Some(&manifest.thread_id),
-                            channel: Some(&manifest.channel),
-                            task_agent_id: manifest.task_agent_id.as_deref(),
-                        })?;
-
-                        append_event(
-                            &dir,
-                            "task_runner_tick",
-                            serde_json::json!({
-                                "task": runner.task.as_ref().map(|t| serde_json::json!({
-                                    "id": t.id,
-                                    "line": t.line_no,
-                                    "text": t.text,
-                                })),
-                                "command": runner.command,
-                                "executed": runner.executed,
-                                "success": runner.success,
-                                "exit_code": runner.exit_code,
-                                "auto_check_on_success": manifest.auto_check_on_success,
-                                "check_result": runner.check_result,
-                                "stdout": clip_text(&runner.stdout, 1000),
-                                "stderr": clip_text(&runner.stderr, 1000),
-                            }),
-                        )?;
-
-                        let first_stdout_line =
-                            task_contract_line(&runner.stdout).unwrap_or_else(|| {
-                                runner
-                                    .stdout
-                                    .lines()
-                                    .map(str::trim)
-                                    .find(|line| !line.is_empty())
-                                    .unwrap_or("")
-                                    .to_string()
-                            });
-                        let first_line_pr_url = extract_pr_url(&first_stdout_line);
-                        let task_label = runner
-                            .task
-                            .as_ref()
-                            .map(|t| t.id.clone())
-                            .unwrap_or_else(|| "unknown".to_string());
-
-                        let waiting_contract = match parse_waiting_contract(
-                            &first_stdout_line,
-                            runner.exit_code,
-                            runner.task.as_ref().map(|task| task.id.as_str()),
-                        ) {
-                            Ok(contract) => contract,
-                            Err(err) => {
-                                runner.success = false;
-                                if runner.exit_code.is_none() || runner.exit_code == Some(0) {
-                                    runner.exit_code = Some(65);
+                        match selection {
+                            TaskSelectionOutcome::Next(queued_task) => {
+                                if runner_state.preferred_next_task_id.as_deref()
+                                    == Some(queued_task.id.as_str())
+                                {
+                                    runner_state.preferred_next_task_id = None;
                                 }
-                                if !runner.stderr.trim().is_empty() {
-                                    runner.stderr.push('\n');
+                                if runner_state.auto_recover_last_task_id.as_deref()
+                                    == Some(queued_task.id.as_str())
+                                {
+                                    runner_state.auto_recover_last_task_id = None;
                                 }
-                                runner.stderr.push_str(&format!(
-                                    "waiting contract failed: {}",
-                                    err.to_string().replace('\n', " ")
-                                ));
-                                None
-                            }
-                        };
+                                runner_state.preferred_next_task_id = None;
+                                runner_state.current_task_id = Some(queued_task.id.clone());
+                                runner_state.current_task_text = Some(queued_task.text.clone());
+                                runner_state.current_task_line = Some(queued_task.line_no);
+                                runner_state.current_task_started_at = Some(now);
+                                runner_state.current_task_state = Some(RunnerTaskState::Queued);
+                                clear_current_blocked_context(&mut runner_state);
+                                clear_current_waiting_dependency(&mut runner_state);
+                                runner_state.current_task_pr_url = None;
+                                runner_state.paused = false;
+                                runner_state.pause_reason = None;
+                                write_runner_state(&dir, &runner_state)?;
 
-                        if let Some(waiting_contract) = waiting_contract {
-                            state.version += 1;
-                            state.status = LoopStatus::Waiting;
-                            state.updated_at = now;
+                                runner_state.current_task_state = Some(RunnerTaskState::Running);
+                                write_runner_state(&dir, &runner_state)?;
 
-                            let mut notification_kind = "task_waiting_merge";
-                            let notification_message;
+                                queue_notification(
+                                    &dir,
+                                    &manifest,
+                                    "task_started",
+                                    format!(
+                                        "task started: {} (line {})",
+                                        queued_task.id, queued_task.line_no
+                                    ),
+                                )?;
 
-                            match waiting_contract {
-                                WaitingContract::WaitingMerge {
-                                    contract_line,
-                                    pr_url,
-                                } => {
-                                    state.summary = format!("task waiting_merge: {task_label}");
-                                    state.waiting_reason = contract_line.unwrap_or_else(|| {
-                                        format!("task waiting_merge: {task_label}")
+                                let task_kind = classify_task_execution_kind(&queued_task);
+                                let backlog_snapshot = manifest
+                                    .backlog_detector_file
+                                    .as_deref()
+                                    .and_then(|detector_file| {
+                                        read_backlog_snapshot(
+                                            &manifest.repo_path,
+                                            detector_file,
+                                            manifest.backlog_detector_max_age_sec,
+                                            now,
+                                        )
+                                        .ok()
                                     });
 
-                                    runner_state.current_task_state =
-                                        Some(RunnerTaskState::WaitingMerge);
-                                    clear_current_blocked_context(&mut runner_state);
-                                    clear_current_waiting_dependency(&mut runner_state);
-                                    runner_state.current_task_pr_url = pr_url.clone();
-                                    track_task_pr_url(
-                                        &mut runner_state,
-                                        Some(task_label.as_str()),
-                                        pr_url.as_deref(),
-                                    );
+                                let mut runner = run_task_once(TaskRunOptions {
+                                    task_file: &task_file_abs,
+                                    selected_task: Some(queued_task.clone()),
+                                    cmd: &cmd,
+                                    auto_check_on_success: manifest.auto_check_on_success,
+                                    dry_run: false,
+                                    cwd: Some(&manifest.repo_path),
+                                    run_id: Some(run_id),
+                                    thread_id: Some(&manifest.thread_id),
+                                    channel: Some(&manifest.channel),
+                                    task_agent_id: manifest.task_agent_id.as_deref(),
+                                    task_kind: Some(task_kind),
+                                    backlog_snapshot: backlog_snapshot.as_ref(),
+                                })?;
 
-                                    let required_checks_missing = first_stdout_line
-                                        .contains("WARN_REQUIRED_CHECKS_MISSING=1");
-                                    notification_message = format_waiting_merge_notification(
-                                        &task_label,
-                                        pr_url.as_deref(),
-                                        required_checks_missing,
-                                    );
-                                }
-                                WaitingContract::Other { contract_line } => {
-                                    state.summary = format!("task waiting_merge: {task_label}");
-                                    state.waiting_reason = contract_line.unwrap_or_else(|| {
-                                        format!("task waiting_merge: {task_label}")
+                                append_event(
+                                    &dir,
+                                    "task_runner_tick",
+                                    serde_json::json!({
+                                        "task": runner.task.as_ref().map(|t| serde_json::json!({
+                                            "id": t.id,
+                                            "line": t.line_no,
+                                            "text": t.text,
+                                        })),
+                                        "command": runner.command,
+                                        "executed": runner.executed,
+                                        "success": runner.success,
+                                        "exit_code": runner.exit_code,
+                                        "auto_check_on_success": manifest.auto_check_on_success,
+                                        "check_result": runner.check_result,
+                                        "stdout": clip_text(&runner.stdout, 1000),
+                                        "stderr": clip_text(&runner.stderr, 1000),
+                                    }),
+                                )?;
+
+                                let first_stdout_line = task_contract_line(&runner.stdout)
+                                    .unwrap_or_else(|| {
+                                        runner
+                                            .stdout
+                                            .lines()
+                                            .map(str::trim)
+                                            .find(|line| !line.is_empty())
+                                            .unwrap_or("")
+                                            .to_string()
                                     });
+                                let first_line_pr_url = extract_pr_url(&first_stdout_line);
+                                let task_label = runner
+                                    .task
+                                    .as_ref()
+                                    .map(|t| t.id.clone())
+                                    .unwrap_or_else(|| "unknown".to_string());
 
-                                    runner_state.current_task_state =
-                                        Some(RunnerTaskState::WaitingMerge);
-                                    clear_current_blocked_context(&mut runner_state);
-                                    clear_current_waiting_dependency(&mut runner_state);
-                                    runner_state.current_task_pr_url = None;
+                                let waiting_contract = match parse_waiting_contract(
+                                    &first_stdout_line,
+                                    runner.exit_code,
+                                    runner.task.as_ref().map(|task| task.id.as_str()),
+                                ) {
+                                    Ok(contract) => contract,
+                                    Err(err) => {
+                                        runner.success = false;
+                                        if runner.exit_code.is_none() || runner.exit_code == Some(0)
+                                        {
+                                            runner.exit_code = Some(65);
+                                        }
+                                        if !runner.stderr.trim().is_empty() {
+                                            runner.stderr.push('\n');
+                                        }
+                                        runner.stderr.push_str(&format!(
+                                            "waiting contract failed: {}",
+                                            err.to_string().replace('\n', " ")
+                                        ));
+                                        None
+                                    }
+                                };
 
-                                    notification_message =
-                                        format_waiting_merge_notification(&task_label, None, false);
-                                }
-                                WaitingContract::WaitingDependency(context) => {
-                                    let context =
-                                        enrich_waiting_dependency_context(&context, &runner_state);
-                                    state.summary =
-                                        format!("task waiting_dependency: {}", context.task_id);
-                                    state.waiting_reason = clip_text(&context.contract_line, 200);
+                                if let Some(waiting_contract) = waiting_contract {
+                                    state.version += 1;
+                                    state.status = LoopStatus::Waiting;
+                                    state.updated_at = now;
 
-                                    runner_state.current_task_state =
-                                        Some(RunnerTaskState::WaitingDependency);
-                                    clear_current_blocked_context(&mut runner_state);
-                                    runner_state.current_task_pr_url = None;
-                                    runner_state.current_waiting_dependency = Some(context.clone());
-                                    runner_state.last_waiting_dependency = Some(context.clone());
+                                    let mut notification_kind = "task_waiting_merge";
+                                    let notification_message;
 
-                                    append_event(
+                                    match waiting_contract {
+                                        WaitingContract::WaitingMerge {
+                                            contract_line,
+                                            pr_url,
+                                        } => {
+                                            state.summary =
+                                                format!("task waiting_merge: {task_label}");
+                                            state.waiting_reason =
+                                                contract_line.unwrap_or_else(|| {
+                                                    format!("task waiting_merge: {task_label}")
+                                                });
+
+                                            runner_state.current_task_state =
+                                                Some(RunnerTaskState::WaitingMerge);
+                                            clear_current_blocked_context(&mut runner_state);
+                                            clear_current_waiting_dependency(&mut runner_state);
+                                            runner_state.current_task_pr_url = pr_url.clone();
+                                            track_task_pr_url(
+                                                &mut runner_state,
+                                                Some(task_label.as_str()),
+                                                pr_url.as_deref(),
+                                            );
+
+                                            let required_checks_missing = first_stdout_line
+                                                .contains("WARN_REQUIRED_CHECKS_MISSING=1");
+                                            notification_message =
+                                                format_waiting_merge_notification(
+                                                    &task_label,
+                                                    pr_url.as_deref(),
+                                                    required_checks_missing,
+                                                );
+                                        }
+                                        WaitingContract::Other { contract_line } => {
+                                            state.summary =
+                                                format!("task waiting_merge: {task_label}");
+                                            state.waiting_reason =
+                                                contract_line.unwrap_or_else(|| {
+                                                    format!("task waiting_merge: {task_label}")
+                                                });
+
+                                            runner_state.current_task_state =
+                                                Some(RunnerTaskState::WaitingMerge);
+                                            clear_current_blocked_context(&mut runner_state);
+                                            clear_current_waiting_dependency(&mut runner_state);
+                                            runner_state.current_task_pr_url = None;
+
+                                            notification_message =
+                                                format_waiting_merge_notification(
+                                                    &task_label,
+                                                    None,
+                                                    false,
+                                                );
+                                        }
+                                        WaitingContract::WaitingDependency(context) => {
+                                            let context = enrich_waiting_dependency_context(
+                                                &context,
+                                                &runner_state,
+                                            );
+                                            state.summary = format!(
+                                                "task waiting_dependency: {}",
+                                                context.task_id
+                                            );
+                                            state.waiting_reason =
+                                                clip_text(&context.contract_line, 200);
+
+                                            runner_state.current_task_state =
+                                                Some(RunnerTaskState::WaitingDependency);
+                                            clear_current_blocked_context(&mut runner_state);
+                                            runner_state.current_task_pr_url = None;
+                                            runner_state.current_waiting_dependency =
+                                                Some(context.clone());
+                                            runner_state.last_waiting_dependency =
+                                                Some(context.clone());
+
+                                            append_event(
+                                                &dir,
+                                                "task_waiting_dependency",
+                                                serde_json::json!({
+                                                    "task_id": context.task_id.clone(),
+                                                    "depends_on_task": context.depends_on_task.clone(),
+                                                    "depends_on_pr_url": context.depends_on_pr_url.clone(),
+                                                    "contract_line": context.contract_line.clone(),
+                                                    "auto_recover": false,
+                                                }),
+                                            )?;
+
+                                            notification_kind = "task_waiting_dependency";
+                                            notification_message =
+                                                format_waiting_dependency_notification(
+                                                    &task_label,
+                                                    &context,
+                                                );
+                                        }
+                                    }
+
+                                    write_runner_state(&dir, &runner_state)?;
+                                    write_json(&dir.join("state.json"), &state)?;
+
+                                    queue_notification(
                                         &dir,
-                                        "task_waiting_dependency",
-                                        serde_json::json!({
-                                            "task_id": context.task_id.clone(),
-                                            "depends_on_task": context.depends_on_task.clone(),
-                                            "depends_on_pr_url": context.depends_on_pr_url.clone(),
-                                            "contract_line": context.contract_line.clone(),
-                                            "auto_recover": false,
-                                        }),
+                                        &manifest,
+                                        notification_kind,
+                                        notification_message,
                                     )?;
-
-                                    notification_kind = "task_waiting_dependency";
-                                    notification_message = format_waiting_dependency_notification(
-                                        &task_label,
-                                        &context,
+                                } else if !runner.success {
+                                    let blocked_context = build_runner_blocked_context(
+                                        runner.task.as_ref(),
+                                        runner.exit_code,
+                                        &runner.stdout,
+                                        &runner.stderr,
+                                        first_line_pr_url.as_deref(),
+                                        now,
                                     );
-                                }
-                            }
-
-                            write_runner_state(&dir, &runner_state)?;
-                            write_json(&dir.join("state.json"), &state)?;
-
-                            queue_notification(
-                                &dir,
-                                &manifest,
-                                notification_kind,
-                                notification_message,
-                            )?;
-                        } else if !runner.success {
-                            let blocked_context = build_runner_blocked_context(
-                                runner.task.as_ref(),
-                                runner.exit_code,
-                                &runner.stdout,
-                                &runner.stderr,
-                                first_line_pr_url.as_deref(),
-                                now,
-                            );
-                            apply_blocked_context(
-                                &mut runner_state,
-                                &mut state,
-                                &blocked_context,
-                                now,
-                            );
-                            state.summary = format!("task runner failed: {}", task_label);
-                            write_runner_state(&dir, &runner_state)?;
-                            append_event(
-                                &dir,
-                                "task_runner_blocked",
-                                serde_json::json!({
-                                    "task_label": task_label.clone(),
-                                    "blocked_context": runner_state.last_blocked_context.clone(),
-                                }),
-                            )?;
-
-                            let blocked_context = runner_state
-                                .last_blocked_context
-                                .clone()
-                                .expect("blocked context recorded");
-                            let blocked_message =
-                                format_task_blocked_notification(&manifest, &blocked_context);
-                            queue_notification(&dir, &manifest, "task_blocked", blocked_message)?;
-
-                            if manifest.auto_recover_blocked {
-                                if runner.task.is_some() {
-                                    match maybe_auto_recover_blocked_task(
-                                        &dir,
-                                        &manifest_path,
-                                        &mut manifest,
-                                        &task_file_abs,
+                                    apply_blocked_context(
                                         &mut runner_state,
                                         &mut state,
                                         &blocked_context,
                                         now,
-                                        &mut task_done_now,
-                                        &mut task_loops_completed,
-                                    )? {
-                                        AutoRecoverBlockedOutcome::Recovered => continue,
-                                        AutoRecoverBlockedOutcome::Halted => break,
-                                        AutoRecoverBlockedOutcome::NotTriggered => {}
-                                    }
-                                } else {
+                                    );
+                                    state.summary = format!("task runner failed: {}", task_label);
+                                    write_runner_state(&dir, &runner_state)?;
                                     append_event(
                                         &dir,
-                                        "task_blocked_auto_recover_skipped",
+                                        "task_runner_blocked",
                                         serde_json::json!({
-                                            "reason": "runner.task is missing",
-                                            "task_label": task_label,
-                                            "blocked_context": blocked_context,
+                                            "task_label": task_label.clone(),
+                                            "blocked_context": runner_state.last_blocked_context.clone(),
                                         }),
                                     )?;
+
+                                    let blocked_context = runner_state
+                                        .last_blocked_context
+                                        .clone()
+                                        .expect("blocked context recorded");
+                                    let blocked_message = format_task_blocked_notification(
+                                        &manifest,
+                                        &blocked_context,
+                                    );
+                                    queue_notification(
+                                        &dir,
+                                        &manifest,
+                                        "task_blocked",
+                                        blocked_message,
+                                    )?;
+
+                                    if manifest.auto_recover_blocked {
+                                        if runner.task.is_some() {
+                                            match maybe_auto_recover_blocked_task(
+                                                &dir,
+                                                &manifest_path,
+                                                &mut manifest,
+                                                &task_file_abs,
+                                                &mut runner_state,
+                                                &mut state,
+                                                &blocked_context,
+                                                now,
+                                                &mut task_done_now,
+                                                &mut task_loops_completed,
+                                            )? {
+                                                AutoRecoverBlockedOutcome::Recovered => continue,
+                                                AutoRecoverBlockedOutcome::Halted => break,
+                                                AutoRecoverBlockedOutcome::NotTriggered => {}
+                                            }
+                                        } else {
+                                            append_event(
+                                                &dir,
+                                                "task_blocked_auto_recover_skipped",
+                                                serde_json::json!({
+                                                    "reason": "runner.task is missing",
+                                                    "task_label": task_label,
+                                                    "blocked_context": blocked_context,
+                                                }),
+                                            )?;
+                                        }
+                                    }
+
+                                    write_json(&dir.join("state.json"), &state)?;
+                                    let _ = flush_notifications(&dir, &manifest)?;
+                                    break;
+                                }
+
+                                if runner.success
+                                    && let Some(task) = runner.task
+                                {
+                                    runner_state.task_loops_started =
+                                        runner_state.task_loops_started.saturating_add(1);
+
+                                    if manifest.auto_check_on_success {
+                                        let elapsed_suffix = task_elapsed_suffix(
+                                            runner_state.current_task_started_at.as_ref(),
+                                            now,
+                                        );
+                                        runner_state.last_task_id = Some(task.id.clone());
+                                        runner_state.last_task_state = Some(RunnerTaskState::Done);
+                                        runner_state.last_task_at = Some(now);
+                                        runner_state.last_task_reason =
+                                            Some("runner success + auto-check".into());
+                                        runner_state.last_task_pr_url = first_line_pr_url.clone();
+                                        track_task_pr_url(
+                                            &mut runner_state,
+                                            Some(task.id.as_str()),
+                                            first_line_pr_url.as_deref(),
+                                        );
+                                        runner_state.current_task_id = None;
+                                        runner_state.current_task_text = None;
+                                        runner_state.current_task_line = None;
+                                        runner_state.current_task_started_at = None;
+                                        runner_state.current_task_state = None;
+                                        clear_current_blocked_context(&mut runner_state);
+                                        clear_current_waiting_dependency(&mut runner_state);
+                                        runner_state.current_task_pr_url = None;
+
+                                        task_done_now = task_checklist_done_count(&task_file_abs)?;
+                                        task_loops_completed = task_done_now
+                                            .saturating_sub(manifest.task_done_baseline);
+
+                                        let pr_suffix = first_line_pr_url
+                                            .clone()
+                                            .map(|u| format!(" PR_URL={u}"))
+                                            .unwrap_or_default();
+                                        queue_notification(
+                                            &dir,
+                                            &manifest,
+                                            "task_done",
+                                            format!(
+                                                "task done: {} (done={}){}{}",
+                                                task.id, task_done_now, pr_suffix, elapsed_suffix
+                                            ),
+                                        )?;
+                                    } else {
+                                        runner_state.current_task_id = Some(task.id.clone());
+                                        runner_state.current_task_text = Some(task.text.clone());
+                                        runner_state.current_task_line = Some(task.line_no);
+                                        runner_state.current_task_started_at = Some(now);
+                                        runner_state.current_task_state =
+                                            Some(RunnerTaskState::Running);
+                                        clear_current_blocked_context(&mut runner_state);
+                                        clear_current_waiting_dependency(&mut runner_state);
+                                        runner_state.current_task_pr_url =
+                                            first_line_pr_url.clone();
+                                        track_task_pr_url(
+                                            &mut runner_state,
+                                            Some(task.id.as_str()),
+                                            first_line_pr_url.as_deref(),
+                                        );
+                                        state.status = LoopStatus::Waiting;
+                                        state.summary = format!("task running: {}", task.id);
+                                        state.waiting_reason =
+                                            format!("waiting for task completion: {}", task.id);
+
+                                        queue_notification(
+                                            &dir,
+                                            &manifest,
+                                            "task_progress",
+                                            format!(
+                                                "task in progress: {} (waiting for checklist completion)",
+                                                task.id
+                                            ),
+                                        )?;
+                                    }
+                                    write_runner_state(&dir, &runner_state)?;
                                 }
                             }
-
-                            write_json(&dir.join("state.json"), &state)?;
-                            let _ = flush_notifications(&dir, &manifest)?;
-                            break;
-                        }
-
-                        if runner.success
-                            && let Some(task) = runner.task
-                        {
-                            runner_state.task_loops_started =
-                                runner_state.task_loops_started.saturating_add(1);
-
-                            if manifest.auto_check_on_success {
-                                let elapsed_suffix = task_elapsed_suffix(
-                                    runner_state.current_task_started_at.as_ref(),
-                                    now,
-                                );
-                                runner_state.last_task_id = Some(task.id.clone());
-                                runner_state.last_task_state = Some(RunnerTaskState::Done);
-                                runner_state.last_task_at = Some(now);
-                                runner_state.last_task_reason =
-                                    Some("runner success + auto-check".into());
-                                runner_state.last_task_pr_url = first_line_pr_url.clone();
-                                track_task_pr_url(
-                                    &mut runner_state,
-                                    Some(task.id.as_str()),
-                                    first_line_pr_url.as_deref(),
-                                );
-                                runner_state.current_task_id = None;
-                                runner_state.current_task_text = None;
-                                runner_state.current_task_line = None;
-                                runner_state.current_task_started_at = None;
+                            TaskSelectionOutcome::Waiting {
+                                summary,
+                                reason,
+                                backlog_snapshot,
+                            } => {
+                                let should_notify = state.status != LoopStatus::Waiting
+                                    || state.summary != summary
+                                    || state.waiting_reason != reason;
                                 runner_state.current_task_state = None;
                                 clear_current_blocked_context(&mut runner_state);
                                 clear_current_waiting_dependency(&mut runner_state);
                                 runner_state.current_task_pr_url = None;
-
-                                task_done_now = task_checklist_done_count(&task_file_abs)?;
-                                task_loops_completed =
-                                    task_done_now.saturating_sub(manifest.task_done_baseline);
-
-                                let pr_suffix = first_line_pr_url
-                                    .clone()
-                                    .map(|u| format!(" PR_URL={u}"))
-                                    .unwrap_or_default();
-                                queue_notification(
-                                    &dir,
-                                    &manifest,
-                                    "task_done",
-                                    format!(
-                                        "task done: {} (done={}){}{}",
-                                        task.id, task_done_now, pr_suffix, elapsed_suffix
-                                    ),
-                                )?;
-                            } else {
-                                runner_state.current_task_id = Some(task.id.clone());
-                                runner_state.current_task_text = Some(task.text.clone());
-                                runner_state.current_task_line = Some(task.line_no);
-                                runner_state.current_task_started_at = Some(now);
-                                runner_state.current_task_state = Some(RunnerTaskState::Running);
+                                runner_state.paused = false;
+                                runner_state.pause_reason = None;
+                                state.status = LoopStatus::Waiting;
+                                state.summary = summary.clone();
+                                state.waiting_reason = reason.clone();
+                                state.updated_at = now;
+                                if should_notify {
+                                    state.version += 1;
+                                    append_event(
+                                        &dir,
+                                        "task_selection_backlog_waiting",
+                                        serde_json::json!({
+                                            "summary": summary,
+                                            "reason": reason,
+                                            "backlog_snapshot": backlog_snapshot,
+                                        }),
+                                    )?;
+                                    queue_notification(
+                                        &dir,
+                                        &manifest,
+                                        "task_progress",
+                                        format_backlog_gate_notification(
+                                            state.summary.as_str(),
+                                            state.waiting_reason.as_str(),
+                                        ),
+                                    )?;
+                                }
+                            }
+                            TaskSelectionOutcome::Blocked { summary, reason } => {
+                                let should_notify = state.status != LoopStatus::Blocked
+                                    || state.summary != summary
+                                    || state.waiting_reason != reason;
+                                runner_state.current_task_state = None;
                                 clear_current_blocked_context(&mut runner_state);
                                 clear_current_waiting_dependency(&mut runner_state);
-                                runner_state.current_task_pr_url = first_line_pr_url.clone();
-                                track_task_pr_url(
-                                    &mut runner_state,
-                                    Some(task.id.as_str()),
-                                    first_line_pr_url.as_deref(),
-                                );
-                                state.status = LoopStatus::Waiting;
-                                state.summary = format!("task running: {}", task.id);
-                                state.waiting_reason =
-                                    format!("waiting for task completion: {}", task.id);
-
-                                queue_notification(
-                                    &dir,
-                                    &manifest,
-                                    "task_progress",
-                                    format!(
-                                        "task in progress: {} (waiting for checklist completion)",
-                                        task.id
-                                    ),
-                                )?;
+                                runner_state.current_task_pr_url = None;
+                                runner_state.paused = false;
+                                runner_state.pause_reason = None;
+                                state.status = LoopStatus::Blocked;
+                                state.summary = summary.clone();
+                                state.waiting_reason = reason.clone();
+                                state.updated_at = now;
+                                if should_notify {
+                                    state.version += 1;
+                                    append_event(
+                                        &dir,
+                                        "task_selection_backlog_blocked",
+                                        serde_json::json!({
+                                            "summary": summary,
+                                            "reason": reason,
+                                            "detector_file": manifest.backlog_detector_file,
+                                        }),
+                                    )?;
+                                    queue_notification(
+                                        &dir,
+                                        &manifest,
+                                        "blocked",
+                                        format_backlog_gate_notification(
+                                            state.summary.as_str(),
+                                            state.waiting_reason.as_str(),
+                                        ),
+                                    )?;
+                                }
                             }
-                            write_runner_state(&dir, &runner_state)?;
+                            TaskSelectionOutcome::None => unreachable!("handled above"),
                         }
                     }
                 }
@@ -5421,6 +5898,8 @@ fn cmd_task_run_once(
         thread_id: None,
         channel: None,
         task_agent_id: None,
+        task_kind: None,
+        backlog_snapshot: None,
     })?;
 
     println!(
@@ -5487,6 +5966,8 @@ fn main() -> Result<()> {
             auto_check_on_success,
             auto_recover_blocked,
             auto_recover_blocked_max_attempts,
+            backlog_detector_file,
+            backlog_detector_max_age_sec,
         } => cmd_start(StartOptions {
             repo,
             session_key,
@@ -5509,6 +5990,8 @@ fn main() -> Result<()> {
             auto_check_on_success,
             auto_recover_blocked,
             auto_recover_blocked_max_attempts,
+            backlog_detector_file,
+            backlog_detector_max_age_sec,
         }),
         Commands::Daemon {
             repo,
@@ -5570,30 +6053,31 @@ fn main() -> Result<()> {
 mod tests {
     use super::{
         AutoRecoverBlockedOutcome, AutoRecoverDecisionSnapshot, AutoRecoverDecisionState,
-        BlockedContext, BlockedContextSource, DeadLetterEntry, DeliveryAck, DeliveryAttempt,
-        DispatchedNotification, GhPrView, GhStatusCheck, LoopStatus, Manifest, Notification,
-        NotificationDeliveryMode, RecoveryTaskSnapshot, RunnerState, RunnerTaskState, State,
-        TaskChecklistEntry, WaitingContract, WaitingDependencyContext, WaitingDependencyProgress,
-        WaitingMergeProgress, ack_retry_policy, append_jsonl,
-        apply_status_establish_retry_override, auto_merge_unavailable_error,
-        auto_recover_guard_reason, blocked_reason_from_runner, blocked_recovery_hint,
-        build_recovery_task_text, classify_ack_failure_category,
-        completion_guard_waiting_fallback_line, compute_auto_stop_reason, compute_backoff_sec,
-        dead_letter_path, delivery_ack_path, delivery_attempts_path, delivery_retry_backoff_sec,
-        emit_all_tasks_completed_notifications, ensure_task_agent_exists_with,
-        ensure_waiting_dependency_progress_with, ensure_waiting_merge_progress_with,
-        extract_pr_url, flush_notifications, format_auto_recover_decision_notification,
-        format_auto_recover_halt_notification, format_orphan_blocked_notification,
-        format_task_blocked_notification, format_waiting_dependency_notification,
-        format_waiting_merge_notification, is_phase_or_stacked_dependency_reason, lease_window_sec,
-        maybe_auto_recover_blocked_task, normalize_blocked_reason_for_recovery,
-        normalize_error_reason, notification_delivery_mode, openclaw_notify_timeout_sec_from,
-        parse_openclaw_message_id, parse_task_checklist_entry, parse_waiting_contract,
-        parse_waiting_dependency_contract, queue_main_feedback_summary, queue_notification,
-        read_jsonl, retryable_waiting_merge_error, select_next_task_entry,
-        should_force_status_establish_retry, should_suppress_waiting_stuck, task_contract_line,
-        tasklist_approval_violation_reason, update_waiting_stuck_tracker,
-        validate_task_done_contract_with, waiting_merge_nonprogress_reason, write_json,
+        BacklogSnapshot, BlockedContext, BlockedContextSource, DeadLetterEntry, DeliveryAck,
+        DeliveryAttempt, DispatchedNotification, GhPrView, GhStatusCheck, LoopStatus, Manifest,
+        Notification, NotificationDeliveryMode, RecoveryTaskSnapshot, RunnerState, RunnerTaskState,
+        State, TaskChecklistEntry, TaskExecutionKind, TaskSelectionOutcome, WaitingContract,
+        WaitingDependencyContext, WaitingDependencyProgress, WaitingMergeProgress,
+        ack_retry_policy, append_jsonl, apply_status_establish_retry_override,
+        auto_merge_unavailable_error, auto_recover_guard_reason, blocked_reason_from_runner,
+        blocked_recovery_hint, build_recovery_task_text, classify_ack_failure_category,
+        classify_task_execution_kind, completion_guard_waiting_fallback_line,
+        compute_auto_stop_reason, compute_backoff_sec, dead_letter_path, delivery_ack_path,
+        delivery_attempts_path, delivery_retry_backoff_sec, emit_all_tasks_completed_notifications,
+        ensure_task_agent_exists_with, ensure_waiting_dependency_progress_with,
+        ensure_waiting_merge_progress_with, extract_pr_url, flush_notifications,
+        format_auto_recover_decision_notification, format_auto_recover_halt_notification,
+        format_orphan_blocked_notification, format_task_blocked_notification,
+        format_waiting_dependency_notification, format_waiting_merge_notification,
+        is_phase_or_stacked_dependency_reason, lease_window_sec, maybe_auto_recover_blocked_task,
+        normalize_blocked_reason_for_recovery, normalize_error_reason, notification_delivery_mode,
+        openclaw_notify_timeout_sec_from, parse_openclaw_message_id, parse_task_checklist_entry,
+        parse_waiting_contract, parse_waiting_dependency_contract, queue_main_feedback_summary,
+        queue_notification, read_backlog_snapshot, read_jsonl, retryable_waiting_merge_error,
+        select_next_task_entry, select_next_task_with_backlog, should_force_status_establish_retry,
+        should_suppress_waiting_stuck, task_contract_line, tasklist_approval_violation_reason,
+        update_waiting_stuck_tracker, validate_task_done_contract_with,
+        waiting_merge_nonprogress_reason, write_json,
     };
     use crate::tasklist::write_task_approval;
     use chrono::{Duration, Utc};
@@ -5613,6 +6097,10 @@ mod tests {
                 std::env::temp_dir().join(format!("claw-loopd-test-{tag}-{}", Uuid::new_v4()));
             fs::create_dir_all(&path).expect("create temp run dir");
             Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
         }
     }
 
@@ -5674,6 +6162,8 @@ mod tests {
             auto_check_on_success: true,
             auto_recover_blocked: false,
             auto_recover_blocked_max_attempts: 3,
+            backlog_detector_file: None,
+            backlog_detector_max_age_sec: 900,
         }
     }
 
@@ -6857,6 +7347,127 @@ mod tests {
 
         let next = select_next_task_entry(&entries, Some("H1-RECOVER")).expect("next task");
         assert_eq!(next.id, "H2");
+    }
+
+    #[test]
+    fn classify_task_execution_kind_treats_failure_first_gating_work_as_repair() {
+        let entry = TaskChecklistEntry {
+            line_no: 1,
+            done: false,
+            id: "C14-2".to_string(),
+            text: "backlog>0 時の failure-first gating を daemon/task-agent に実装し、state / waiting_reason を明示する".to_string(),
+        };
+
+        assert_eq!(
+            classify_task_execution_kind(&entry),
+            TaskExecutionKind::Repair
+        );
+    }
+
+    #[test]
+    fn select_next_task_with_backlog_prioritizes_repair_task_over_feature_task() {
+        let entries = vec![
+            TaskChecklistEntry {
+                line_no: 3,
+                done: false,
+                id: "F1".to_string(),
+                text: "add shiny feature".to_string(),
+            },
+            TaskChecklistEntry {
+                line_no: 5,
+                done: false,
+                id: "R1".to_string(),
+                text: "fix flaky backlog gate".to_string(),
+            },
+        ];
+        let backlog_snapshot = BacklogSnapshot {
+            detector_file: PathBuf::from("/tmp/backlog.json"),
+            repo_path: PathBuf::from("/tmp/repo"),
+            status: "backlog".to_string(),
+            backlog_count: 2,
+            summary: "2 repairs pending".to_string(),
+            updated_at: Utc::now(),
+        };
+
+        let next = select_next_task_with_backlog(&entries, None, Some(&backlog_snapshot));
+        match next {
+            TaskSelectionOutcome::Next(entry) => assert_eq!(entry.id, "R1"),
+            other => panic!("expected repair task selection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn select_next_task_with_backlog_waits_when_only_feature_tasks_are_open() {
+        let entries = vec![TaskChecklistEntry {
+            line_no: 3,
+            done: false,
+            id: "F1".to_string(),
+            text: "add shiny feature".to_string(),
+        }];
+        let backlog_snapshot = BacklogSnapshot {
+            detector_file: PathBuf::from("/tmp/backlog.json"),
+            repo_path: PathBuf::from("/tmp/repo"),
+            status: "backlog".to_string(),
+            backlog_count: 3,
+            summary: "feature work blocked behind backlog".to_string(),
+            updated_at: Utc::now(),
+        };
+
+        let next = select_next_task_with_backlog(&entries, None, Some(&backlog_snapshot));
+        match next {
+            TaskSelectionOutcome::Waiting { reason, .. } => {
+                assert!(reason.contains("backlog gate active"));
+                assert!(reason.contains("F1"));
+                assert!(reason.contains("feature"));
+            }
+            other => panic!("expected waiting outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_backlog_snapshot_accepts_repo_bound_file() {
+        let dir = TestRunDir::new("backlog-detector-file");
+        let detector_file = dir.path().join("backlog.json");
+        fs::write(
+            &detector_file,
+            serde_json::json!({
+                "repo_path": dir.path(),
+                "status": "backlog",
+                "backlog_count": 2,
+                "summary": "2 repairs pending",
+                "updated_at": Utc::now().to_rfc3339(),
+            })
+            .to_string(),
+        )
+        .expect("write detector file");
+
+        let snapshot = read_backlog_snapshot(dir.path(), &detector_file, 900, Utc::now())
+            .expect("backlog snapshot");
+        assert_eq!(snapshot.status, "backlog");
+        assert_eq!(snapshot.backlog_count, 2);
+    }
+
+    #[test]
+    fn read_backlog_snapshot_rejects_repo_mismatch() {
+        let dir = TestRunDir::new("backlog-detector-mismatch");
+        let other_repo = TestRunDir::new("backlog-detector-other");
+        let detector_file = dir.path().join("backlog.json");
+        fs::write(
+            &detector_file,
+            serde_json::json!({
+                "repo_path": other_repo.path(),
+                "status": "backlog",
+                "backlog_count": 1,
+                "summary": "wrong repo",
+                "updated_at": Utc::now().to_rfc3339(),
+            })
+            .to_string(),
+        )
+        .expect("write detector file");
+
+        let err = read_backlog_snapshot(dir.path(), &detector_file, 900, Utc::now())
+            .expect_err("expected repo mismatch");
+        assert!(err.to_string().contains("targets repo"));
     }
 
     #[test]

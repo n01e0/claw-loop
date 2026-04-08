@@ -1369,6 +1369,76 @@ $BIN stop --repo "$WORKDIR" --run-id "$RUN13C" --immediate >/dev/null || true
 sleep 1
 
 
+echo "[e2e-smoke] case13d failure-first backlog gate waits when only feature tasks are open"
+TASKFILE13D="$WORKDIR/docs/roadmaps/s5-case13d-tasklist.md"
+mkdir -p "$(dirname "$TASKFILE13D")"
+cat > "$TASKFILE13D" <<'EOF'
+- [ ] S5X-13D: add shiny feature
+EOF
+
+BACKLOG13D="$WORKDIR/.ralph/backlog-case13d.json"
+python3 - <<'PY' "$BACKLOG13D" "$WORKDIR"
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+repo = pathlib.Path(sys.argv[2])
+path.write_text(json.dumps({
+    "repo_path": str(repo),
+    "status": "backlog",
+    "backlog_count": 2,
+    "summary": "2 repairs pending",
+    "updated_at": "2026-03-16T00:00:00Z"
+}))
+PY
+
+APPROVED13D="$(approve_task_file "$TASKFILE13D")"
+SHOULD_NOT_RUN13D="$WORKDIR/.ralph/should-not-run-case13d"
+rm -f "$SHOULD_NOT_RUN13D"
+OUT13D="$($BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --task-file "$TASKFILE13D" --task-runner-cmd 'echo ran > "$WORKDIR/.ralph/should-not-run-case13d"; exit 0' --auto-check-on-success false --backlog-detector-file "$BACKLOG13D" --backlog-detector-max-age-sec 31536000 --require-task-approval --approved-tasklist-hash "$APPROVED13D")"
+RUN13D="$(echo "$OUT13D" | awk -F= '/^run_id=/{print $2}')"
+if [[ -z "$RUN13D" ]]; then
+  echo "[e2e-smoke] failed to parse run13d id"
+  echo "$OUT13D"
+  exit 1
+fi
+
+STATUS13D=""
+for _ in {1..20}; do
+  STATUS13D="$($BIN status --repo "$WORKDIR" --run-id "$RUN13D")"
+  if python3 - <<'PY' "$STATUS13D"
+import json, sys
+obj = json.loads(sys.argv[1])
+ok = obj.get("status") == "waiting" and "backlog gate active" in (obj.get("waiting_reason") or "")
+raise SystemExit(0 if ok else 1)
+PY
+  then
+    break
+  fi
+  sleep 1
+done
+
+python3 - <<'PY' "$STATUS13D" "$WORKDIR/.ralph/runs/$RUN13D/events.jsonl" "$SHOULD_NOT_RUN13D"
+import json, pathlib, sys
+status = json.loads(sys.argv[1])
+events_path = pathlib.Path(sys.argv[2])
+should_not_run = pathlib.Path(sys.argv[3])
+if status.get("status") != "waiting":
+    raise SystemExit(f"expected waiting, got {status.get('status')!r}")
+reason = status.get("waiting_reason") or ""
+if "backlog gate active" not in reason:
+    raise SystemExit(f"expected backlog gate waiting reason, got {reason!r}")
+if should_not_run.exists():
+    raise SystemExit("feature task should not have executed while backlog gate is active")
+events = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+if not any(e.get("kind") == "task_selection_backlog_waiting" for e in events):
+    raise SystemExit(f"expected task_selection_backlog_waiting event, got {[e.get('kind') for e in events][-10:]}")
+if any(e.get("kind") == "task_runner_tick" for e in events):
+    raise SystemExit("feature task should not emit task_runner_tick while backlog gate is active")
+PY
+
+$BIN stop --repo "$WORKDIR" --run-id "$RUN13D" --immediate >/dev/null || true
+sleep 1
+
+
 echo "[e2e-smoke] case14 rl-task-agent ignores leading empty payload before TASK_DONE"
 RUNNER_MOCKDIR="$WORKDIR/mockbin-runner"
 mkdir -p "$RUNNER_MOCKDIR"
@@ -1470,6 +1540,50 @@ FIRST15B="$(printf '%s\n' "$OUT15B" | awk 'NF { print; exit }')"
 if [[ "$FIRST15B" != "TASK_DONE PR_URL=https://github.com/demo/repo/pull/315b" ]]; then
   echo "[e2e-smoke] expected case15b TASK_DONE first line"
   printf '%s\n' "$OUT15B"
+  exit 1
+fi
+
+echo "[e2e-smoke] case15bb rl-task-agent blocks feature tasks while backlog gate is active"
+BACKLOG_GUARD_MARKER="$WORKDIR/.ralph/case15bb-openclaw-called"
+rm -f "$BACKLOG_GUARD_MARKER"
+cat > "$RUNNER_MOCKDIR/openclaw" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "agent" ]]; then
+  : > "${BACKLOG_GUARD_MARKER:?}"
+  cat <<'JSON'
+{"payloads":null,"text":"TASK_DONE PR_URL=https://github.com/demo/repo/pull/315bb\nthis should never be reached"}
+JSON
+  exit 0
+fi
+
+echo "unsupported mock openclaw args: $*" >&2
+exit 1
+EOF
+chmod +x "$RUNNER_MOCKDIR/openclaw"
+
+TASKFILE15BB="$WORKDIR/docs/roadmaps/s5-case15bb-tasklist.md"
+mkdir -p "$(dirname "$TASKFILE15BB")"
+cat > "$TASKFILE15BB" <<'EOF'
+- [ ] S5X-15BB: feature task blocked by backlog gate
+EOF
+
+set +e
+OUT15BB="$(PATH="$RUNNER_MOCKDIR:$PATH" BACKLOG_GUARD_MARKER="$BACKLOG_GUARD_MARKER" CLAW_TASK_ID="S5X-15BB" CLAW_TASK_TEXT="feature task blocked by backlog gate" CLAW_TASK_FILE="$TASKFILE15BB" CLAW_RUN_ID="run15bb" CLAW_TASK_KIND="feature" CLAW_BACKLOG_STATUS="backlog" CLAW_BACKLOG_COUNT="2" CLAW_BACKLOG_SUMMARY="2 repairs pending" bash ./scripts/rl-task-agent.sh 2>&1)"
+RC15BB=$?
+set -e
+if [[ "$RC15BB" -eq 0 ]]; then
+  echo "[e2e-smoke] expected case15bb to block feature task under backlog gate"
+  printf '%s\n' "$OUT15BB"
+  exit 1
+fi
+if [[ "$OUT15BB" != *"TASK_BLOCKED: failure-first backlog gate active"* ]]; then
+  echo "[e2e-smoke] expected case15bb backlog gate block message"
+  printf '%s\n' "$OUT15BB"
+  exit 1
+fi
+if [[ -f "$BACKLOG_GUARD_MARKER" ]]; then
+  echo "[e2e-smoke] expected case15bb to fail before openclaw agent was called"
   exit 1
 fi
 
