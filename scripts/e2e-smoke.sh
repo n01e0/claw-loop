@@ -1473,14 +1473,14 @@ if [[ "$FIRST15B" != "TASK_DONE PR_URL=https://github.com/demo/repo/pull/315b" ]
   exit 1
 fi
 
-echo "[e2e-smoke] case15c rl-task-agent blocks task file mutations during runner execution"
+echo "[e2e-smoke] case15c rl-task-agent prefers the last text-bearing JSON object"
 cat > "$RUNNER_MOCKDIR/openclaw" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "${1:-}" == "agent" ]]; then
-  printf '\n- [ ] S5X-15C-EXTRA: illegal tasklist mutation\n' >> "$CLAW_TASK_FILE"
   cat <<'JSON'
-{"payloads":null,"text":"TASK_DONE PR_URL=https://github.com/demo/repo/pull/315c\nthis should be rejected because the task file was modified"}
+{"message":{"role":"assistant","content":[{"type":"toolCall","name":"read"}]}}
+{"message":{"role":"assistant","content":[{"type":"text","text":"TASK_DONE PR_URL=https://github.com/demo/repo/pull/315c\nsummary from final response"}]}}
 JSON
   exit 0
 fi
@@ -1493,21 +1493,52 @@ chmod +x "$RUNNER_MOCKDIR/openclaw"
 TASKFILE15C="$WORKDIR/docs/roadmaps/s5-case15c-tasklist.md"
 mkdir -p "$(dirname "$TASKFILE15C")"
 cat > "$TASKFILE15C" <<'EOF'
-- [ ] S5X-15C: forbid tasklist mutation
+- [ ] S5X-15C: final response in later JSON object
 EOF
 
-set +e
-OUT15C="$(PATH="$RUNNER_MOCKDIR:$PATH" CLAW_TASK_ID="S5X-15C" CLAW_TASK_TEXT="forbid tasklist mutation" CLAW_TASK_FILE="$TASKFILE15C" CLAW_RUN_ID="run15c" bash ./scripts/rl-task-agent.sh 2>&1)"
-RC15C=$?
-set -e
-if [[ "$RC15C" -eq 0 ]]; then
-  echo "[e2e-smoke] expected case15c to fail when task file mutates"
+OUT15C="$(PATH="$RUNNER_MOCKDIR:$PATH" CLAW_TASK_ID="S5X-15C" CLAW_TASK_TEXT="final response in later JSON object" CLAW_TASK_FILE="$TASKFILE15C" CLAW_RUN_ID="run15c" bash ./scripts/rl-task-agent.sh)"
+FIRST15C="$(printf '%s\n' "$OUT15C" | awk 'NF { print; exit }')"
+if [[ "$FIRST15C" != "TASK_DONE PR_URL=https://github.com/demo/repo/pull/315c" ]]; then
+  echo "[e2e-smoke] expected case15c TASK_DONE first line from last JSON object"
   printf '%s\n' "$OUT15C"
   exit 1
 fi
-if [[ "$OUT15C" != *"TASK_BLOCKED: task file was modified during runner execution"* ]]; then
-  echo "[e2e-smoke] expected case15c mutation block message"
-  printf '%s\n' "$OUT15C"
+
+echo "[e2e-smoke] case15d rl-task-agent blocks task file mutations during runner execution"
+cat > "$RUNNER_MOCKDIR/openclaw" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "agent" ]]; then
+  printf '\n- [ ] S5X-15D-EXTRA: illegal tasklist mutation\n' >> "$CLAW_TASK_FILE"
+  cat <<'JSON'
+{"payloads":null,"text":"TASK_DONE PR_URL=https://github.com/demo/repo/pull/315c\nthis should be rejected because the task file was modified"}
+JSON
+  exit 0
+fi
+
+echo "unsupported mock openclaw args: $*" >&2
+exit 1
+EOF
+chmod +x "$RUNNER_MOCKDIR/openclaw"
+
+TASKFILE15D="$WORKDIR/docs/roadmaps/s5-case15d-tasklist.md"
+mkdir -p "$(dirname "$TASKFILE15D")"
+cat > "$TASKFILE15D" <<'EOF'
+- [ ] S5X-15D: forbid tasklist mutation
+EOF
+
+set +e
+OUT15D="$(PATH="$RUNNER_MOCKDIR:$PATH" CLAW_TASK_ID="S5X-15D" CLAW_TASK_TEXT="forbid tasklist mutation" CLAW_TASK_FILE="$TASKFILE15D" CLAW_RUN_ID="run15d" bash ./scripts/rl-task-agent.sh 2>&1)"
+RC15D=$?
+set -e
+if [[ "$RC15D" -eq 0 ]]; then
+  echo "[e2e-smoke] expected case15d to fail when task file mutates"
+  printf '%s\n' "$OUT15D"
+  exit 1
+fi
+if [[ "$OUT15D" != *"TASK_BLOCKED: task file was modified during runner execution"* ]]; then
+  echo "[e2e-smoke] expected case15d mutation block message"
+  printf '%s\n' "$OUT15D"
   exit 1
 fi
 

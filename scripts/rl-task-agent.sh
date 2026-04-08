@@ -19,8 +19,55 @@ state_file="${state_root}/${CLAW_TASK_ID}.env"
 extract_json_object() {
   RAW_OUT="$1" python3 - <<'PY'
 import json, os, sys
+
+
+def extract_text(obj):
+    if not isinstance(obj, dict):
+        return ""
+
+    payloads = obj.get("payloads")
+    if isinstance(payloads, list):
+        texts = [
+            item.get("text", "")
+            for item in payloads
+            if isinstance(item, dict) and isinstance(item.get("text"), str) and item.get("text")
+        ]
+        if texts:
+            return "\n".join(texts)
+
+    text = obj.get("text")
+    if isinstance(text, str) and text:
+        return text
+
+    for key in ("message",):
+        container = obj.get(key)
+        if isinstance(container, dict):
+            content = container.get("content")
+            if isinstance(content, list):
+                texts = [
+                    item.get("text", "")
+                    for item in content
+                    if isinstance(item, dict) and isinstance(item.get("text"), str) and item.get("text")
+                ]
+                if texts:
+                    return "\n".join(texts)
+
+    content = obj.get("content")
+    if isinstance(content, list):
+        texts = [
+            item.get("text", "")
+            for item in content
+            if isinstance(item, dict) and isinstance(item.get("text"), str) and item.get("text")
+        ]
+        if texts:
+            return "\n".join(texts)
+
+    return ""
+
+
 s = os.environ.get("RAW_OUT", "")
 decoder = json.JSONDecoder()
+selected = None
 for i, ch in enumerate(s):
     if ch != '{':
         continue
@@ -28,10 +75,67 @@ for i, ch in enumerate(s):
         obj, _ = decoder.raw_decode(s[i:])
     except Exception:
         continue
-    print(json.dumps(obj, ensure_ascii=False))
+    if selected is None:
+        selected = obj
+    if extract_text(obj).strip():
+        selected = obj
+
+if selected is not None:
+    print(json.dumps(selected, ensure_ascii=False))
     sys.exit(0)
+
 print("parse-error: no json object found in openclaw output", file=sys.stderr)
 sys.exit(1)
+PY
+}
+
+extract_agent_text() {
+  JSON_OUT="$1" python3 - <<'PY'
+import json, os, sys
+
+obj = json.loads(os.environ["JSON_OUT"])
+
+payloads = obj.get("payloads")
+if isinstance(payloads, list):
+    texts = [
+        item.get("text", "")
+        for item in payloads
+        if isinstance(item, dict) and isinstance(item.get("text"), str)
+    ]
+    if texts:
+        print("\n".join(texts))
+        sys.exit(0)
+
+text = obj.get("text")
+if isinstance(text, str):
+    print(text)
+    sys.exit(0)
+
+message = obj.get("message")
+if isinstance(message, dict):
+    content = message.get("content")
+    if isinstance(content, list):
+        texts = [
+            item.get("text", "")
+            for item in content
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        ]
+        if texts:
+            print("\n".join(texts))
+            sys.exit(0)
+
+content = obj.get("content")
+if isinstance(content, list):
+    texts = [
+        item.get("text", "")
+        for item in content
+        if isinstance(item, dict) and isinstance(item.get("text"), str)
+    ]
+    if texts:
+        print("\n".join(texts))
+        sys.exit(0)
+
+print("")
 PY
 }
 
@@ -545,7 +649,7 @@ if [[ "$rc" -ne 0 ]]; then
 fi
 
 json_out="$(extract_json_object "$raw_out")"
-text="$(printf '%s' "$json_out" | jq -r 'if (.payloads | type) == "array" then [(.payloads[]? | .text? // empty)] | join("\n") elif (.text? // null) != null then .text else "" end')"
+text="$(extract_agent_text "$json_out")"
 printf '%s\n' "$text"
 
 if [[ -n "$task_file_hash_before" && -f "${CLAW_TASK_FILE:-}" ]]; then
