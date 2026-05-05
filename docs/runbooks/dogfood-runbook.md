@@ -38,6 +38,17 @@ status edit が失敗した場合:
 
 機能追加時は、責務を持つモジュール側へ実装し、`main.rs` は配線・制御に限定する。
 
+
+## 0.5) PR body と実行報告の所有境界
+
+Dogfood runner の PR body は **runner-owned artifact** として扱う。レビュー対象の説明だけを載せ、実行中の運用ログや agent 実行報告は載せない。
+
+- task agent は通常 PR を自作しない。必須の first-line `TASK_*` に続けて `ACPX_TASK_RESULT_JSON`（`summary` / `verification` / `notes` / `pushed_branch`）を返し、runner が `gh pr create --body-file <runner-temp-file>` で PR を作る。
+- 例外は、runner が生成済み body file path を明示して「この body file で PR を作成せよ」と指示した場合だけ。
+- PR body は成果物説明に限定する: 何を変えたか、どう検証したか、レビュアーへの補足。
+- 実行報告は通知・state・event 側に残す: agent/session id、worktree path、runner prompt/body-file lifecycle、cleanup、CI/merge 待ち、blocked/recovery 理由など。
+- `waiting_merge` / `blocked` / `done` の運用状態は `runner-state.json`、`events.jsonl`、single-status 通知、task-level 通知で追跡する。PR body を状態掲示板として使わない。
+
 ## 1) 確認ポイント（通常監視）
 
 ### A. まず `status` を確認
