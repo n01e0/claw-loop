@@ -14,6 +14,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
+use std::time::{Duration as StdDuration, Instant};
 #[cfg(test)]
 use tasklist::parse_task_checklist_entry;
 use tasklist::{
@@ -839,7 +840,22 @@ fn read_runner_state(run_dir: &Path) -> Result<RunnerState> {
 }
 
 fn write_runner_state(run_dir: &Path, runner: &RunnerState) -> Result<()> {
-    write_json(&runner_state_path(run_dir), runner)
+    let path = runner_state_path(run_dir);
+    let mut next = runner.clone();
+    if path.exists()
+        && let Ok(existing) = read_json::<RunnerState>(&path)
+    {
+        let existing_is_newer = match (existing.status_updated_at, next.status_updated_at) {
+            (Some(existing_at), Some(next_at)) => existing_at > next_at,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if existing_is_newer {
+            next.status_message_id = existing.status_message_id;
+            next.status_updated_at = existing.status_updated_at;
+        }
+    }
+    write_json(&path, &next)
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -857,6 +873,10 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
 }
 
 fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    with_jsonl_file_lock(path, || append_jsonl_unlocked(path, value))
+}
+
+fn append_jsonl_unlocked<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -865,11 +885,18 @@ fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .append(true)
         .open(path)
         .with_context(|| format!("open {}", path.display()))?;
-    writeln!(f, "{}", serde_json::to_string(value)?)?;
+    let mut line = serde_json::to_vec(value)?;
+    line.push(b'\n');
+    f.write_all(&line)
+        .with_context(|| format!("append jsonl line to {}", path.display()))?;
     Ok(())
 }
 
 fn rewrite_jsonl<T: Serialize>(path: &Path, values: &[T]) -> Result<()> {
+    with_jsonl_file_lock(path, || rewrite_jsonl_unlocked(path, values))
+}
+
+fn rewrite_jsonl_unlocked<T: Serialize>(path: &Path, values: &[T]) -> Result<()> {
     if values.is_empty() {
         if path.exists() {
             fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
@@ -883,9 +910,88 @@ fn rewrite_jsonl<T: Serialize>(path: &Path, values: &[T]) -> Result<()> {
 
     let mut f = fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
     for v in values {
-        writeln!(f, "{}", serde_json::to_string(v)?)?;
+        let mut line = serde_json::to_vec(v)?;
+        line.push(b'\n');
+        f.write_all(&line)
+            .with_context(|| format!("write jsonl line to {}", path.display()))?;
     }
     Ok(())
+}
+
+fn jsonl_lock_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("jsonl");
+    path.with_file_name(format!(".{file_name}.lock"))
+}
+
+struct FileLock {
+    path: PathBuf,
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_file_lock(lock_path: &Path) -> Result<FileLock> {
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let started = Instant::now();
+    loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)
+        {
+            Ok(mut f) => {
+                writeln!(f, "pid={} ts={}", process::id(), Utc::now())
+                    .with_context(|| format!("write lock {}", lock_path.display()))?;
+                return Ok(FileLock {
+                    path: lock_path.to_path_buf(),
+                });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = fs::metadata(lock_path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|elapsed| elapsed > StdDuration::from_secs(120));
+                if stale {
+                    let _ = fs::remove_file(lock_path);
+                    continue;
+                }
+                if started.elapsed() > StdDuration::from_secs(30) {
+                    bail!("timeout waiting for lock {}", lock_path.display());
+                }
+                std::thread::sleep(StdDuration::from_millis(25));
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("create lock {}", lock_path.display()));
+            }
+        }
+    }
+}
+
+fn with_file_lock<T>(lock_path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _lock = acquire_file_lock(lock_path)?;
+    f()
+}
+
+fn with_jsonl_file_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    with_file_lock(&jsonl_lock_path(path), f)
+}
+
+fn notify_lock_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("notify.lock")
+}
+
+fn with_notify_lock<T>(run_dir: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    with_file_lock(&notify_lock_path(run_dir), f)
 }
 
 fn run_with_timeout_cmd(
@@ -1110,17 +1216,20 @@ fn queue_notification_target(
         next_retry_at: None,
         last_error: None,
     };
-    append_jsonl(&run_dir.join("notify-queue.jsonl"), &n)?;
-    append_event(
-        run_dir,
-        "notify_enqueued",
-        serde_json::json!({
-            "event_id": n.event_id,
-            "kind": n.kind,
-            "channel": n.channel,
-            "thread_id": n.thread_id,
-        }),
-    )?;
+    with_notify_lock(run_dir, || {
+        append_jsonl(&run_dir.join("notify-queue.jsonl"), &n)?;
+        append_event(
+            run_dir,
+            "notify_enqueued",
+            serde_json::json!({
+                "event_id": n.event_id,
+                "kind": n.kind,
+                "channel": n.channel,
+                "thread_id": n.thread_id,
+            }),
+        )?;
+        Ok(())
+    })?;
     Ok(n.event_id)
 }
 
@@ -3052,6 +3161,10 @@ fn append_ack_idempotent(
 }
 
 fn reconcile_delivery_state(run_dir: &Path) -> Result<serde_json::Value> {
+    with_notify_lock(run_dir, || reconcile_delivery_state_locked(run_dir))
+}
+
+fn reconcile_delivery_state_locked(run_dir: &Path) -> Result<serde_json::Value> {
     let queue_path = run_dir.join("notify-queue.jsonl");
     let dispatched_path = run_dir.join("notify-dispatched.jsonl");
     let ack_path = delivery_ack_path(run_dir);
@@ -3096,6 +3209,10 @@ fn reconcile_delivery_state(run_dir: &Path) -> Result<serde_json::Value> {
 }
 
 fn flush_notifications(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
+    with_notify_lock(run_dir, || flush_notifications_locked(run_dir, manifest))
+}
+
+fn flush_notifications_locked(run_dir: &Path, manifest: &Manifest) -> Result<usize> {
     let queue_path = run_dir.join("notify-queue.jsonl");
     let dispatched_path = run_dir.join("notify-dispatched.jsonl");
     let attempts_path = delivery_attempts_path(run_dir);
@@ -6145,11 +6262,11 @@ mod tests {
         normalize_error_reason, notification_delivery_mode, openclaw_notify_timeout_sec_from,
         parse_openclaw_message_id, parse_task_checklist_entry, parse_waiting_contract,
         parse_waiting_dependency_contract, queue_main_feedback_summary, queue_notification,
-        read_backlog_snapshot, read_jsonl, retryable_waiting_merge_error, select_next_task_entry,
-        select_next_task_with_backlog, should_force_status_establish_retry,
+        read_backlog_snapshot, read_json, read_jsonl, retryable_waiting_merge_error,
+        select_next_task_entry, select_next_task_with_backlog, should_force_status_establish_retry,
         should_suppress_waiting_stuck, task_contract_line, tasklist_approval_violation_reason,
         update_waiting_stuck_tracker, validate_task_done_contract_with,
-        waiting_merge_nonprogress_reason, write_json,
+        waiting_merge_nonprogress_reason, write_json, write_runner_state,
     };
     use crate::tasklist::write_task_approval;
     use chrono::{Duration, Utc};
@@ -6346,6 +6463,68 @@ mod tests {
                 .expect("read ack")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn write_runner_state_preserves_newer_status_delivery_fields() {
+        let run = TestRunDir::new("runner-status-preserve");
+        let newer = Utc::now();
+        let older = newer - Duration::seconds(10);
+
+        let existing = RunnerState {
+            status_message_id: Some("msg-new".to_string()),
+            status_updated_at: Some(newer),
+            ..RunnerState::default()
+        };
+        write_json(&run.path.join("runner-state.json"), &existing).expect("write existing state");
+
+        let stale_writer = RunnerState {
+            last_task_id: Some("T1".to_string()),
+            status_message_id: Some("msg-old".to_string()),
+            status_updated_at: Some(older),
+            ..RunnerState::default()
+        };
+        write_runner_state(&run.path, &stale_writer).expect("write stale runner state");
+
+        let actual = read_json::<RunnerState>(&run.path.join("runner-state.json"))
+            .expect("read merged runner state");
+        assert_eq!(actual.last_task_id.as_deref(), Some("T1"));
+        assert_eq!(actual.status_message_id.as_deref(), Some("msg-new"));
+        assert_eq!(actual.status_updated_at, Some(newer));
+    }
+
+    #[test]
+    fn concurrent_queue_notification_writes_valid_dispatched_jsonl() {
+        let run = TestRunDir::new("concurrent-notify");
+        let run_id = Uuid::new_v4();
+        let handles: Vec<_> = (0..16)
+            .map(|idx| {
+                let run_path = run.path.clone();
+                std::thread::spawn(move || {
+                    let manifest = test_manifest(&run_path, run_id, false);
+                    queue_notification(&run_path, &manifest, "progress", format!("message {idx}"))
+                        .expect("queue notification");
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("join notification worker");
+        }
+
+        let dispatched_path = run.path.join("notify-dispatched.jsonl");
+        let raw = fs::read_to_string(&dispatched_path).expect("read dispatched raw");
+        assert_eq!(raw.lines().count(), 16);
+        for line in raw.lines() {
+            serde_json::from_str::<DispatchedNotification>(line).expect("valid dispatched line");
+        }
+
+        let dispatched = read_jsonl::<DispatchedNotification>(&dispatched_path)
+            .expect("read dispatched notifications");
+        assert_eq!(dispatched.len(), 16);
+        let event_ids: std::collections::HashSet<_> =
+            dispatched.iter().map(|d| d.event_id).collect();
+        assert_eq!(event_ids.len(), 16);
     }
 
     #[test]
