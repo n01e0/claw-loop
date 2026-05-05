@@ -296,9 +296,9 @@ import pathlib, re, sys
 body = pathlib.Path(sys.argv[1]).read_text()
 terms = [
     "TASK_DONE", "TASK_WAITING_MERGE", "TASK_WAITING_DEPENDENCY", "TASK_BLOCKED",
-    "auto-merge", "auto merge", "waiting for CI", "waiting on CI", "worktree",
-    "runner", "daemon", "agent session", "session id", "prompt file", "body file",
-    "temp file", "cleanup", "branch deletion", "I pushed", "I created a branch", "I opened the PR",
+    "ACPX_TASK_RESULT_JSON", "agent session", "session id", "prompt file",
+    "temp file", "I pushed", "I created a branch", "I opened the PR",
+    "did not create the PR", "runner should create it", "daemon-owned task file",
 ]
 checks = []
 if "$##" in body:
@@ -395,14 +395,23 @@ import json, os, pathlib, re, sys, uuid
 
 text = os.environ.get("TEXT", "")
 marker = "ACPX_TASK_RESULT_JSON"
-result = None
-inline = re.search(rf"^{marker}:\s*(\{{.*\}})\s*$", text, re.M)
-if inline:
-    result = json.loads(inline.group(1))
-else:
-    fenced = re.search(rf"^```{marker}\s*\n(.*?)\n```\s*$", text, re.M | re.S)
-    if fenced:
-        result = json.loads(fenced.group(1))
+
+def load_result(text: str):
+    patterns = [
+        rf"^{marker}:\s*(\{{.*\}})\s*$",
+        rf"^{marker}\s+(\{{.*\}})\s*$",
+        rf"^```{marker}\s*\n(.*?)\n```\s*$",
+        rf"^{marker}\s*:?\s*```(?:json)?\s*\n(.*?)\n```\s*$",
+        rf"^{marker}\s*:?\s*\n(\{{.*?\}})\s*$",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.M | re.S)
+        if not m:
+            continue
+        return json.loads(m.group(1))
+    return None
+
+result = load_result(text)
 if not isinstance(result, dict):
     print("missing ACPX_TASK_RESULT_JSON for runner-owned PR creation", file=sys.stderr)
     sys.exit(3)
@@ -412,9 +421,23 @@ notes = [str(v).strip() for v in result.get("notes") or [] if str(v).strip()]
 if not summary or not verification:
     print("ACPX_TASK_RESULT_JSON summary and verification are required", file=sys.stderr)
     sys.exit(3)
+
+def is_execution_note(value: str) -> bool:
+    lowered = value.lower()
+    return any(term in lowered for term in (
+        "did not create the pr",
+        "runner should create",
+        "daemon-owned task file",
+        "agent session",
+        "session id",
+        "prompt file",
+        "temporary body file",
+    ))
+
+notes = [note for note in notes if not is_execution_note(note)]
 for value in [summary, *verification, *notes]:
     lowered = value.lower()
-    for term in ("task_done", "task_waiting_merge", "task_blocked", "runner", "daemon", "worktree", "body file", "cleanup"):
+    for term in ("task_done", "task_waiting_merge", "task_waiting_dependency", "task_blocked", "acpx_task_result_json"):
         if term in lowered:
             print(f"PR body content contains execution-report vocabulary: {term}", file=sys.stderr)
             sys.exit(3)
@@ -440,17 +463,20 @@ PY
 import json, os, re
 text = os.environ.get("TEXT", "")
 marker = "ACPX_TASK_RESULT_JSON"
-raw = None
-m = re.search(rf"^{marker}:\s*(\{{.*\}})\s*$", text, re.M)
-if m:
-    raw = m.group(1)
-else:
-    m = re.search(rf"^```{marker}\s*\n(.*?)\n```\s*$", text, re.M | re.S)
-    if m:
-        raw = m.group(1)
-if raw:
-    obj = json.loads(raw)
+patterns = [
+    rf"^{marker}:\s*(\{{.*\}})\s*$",
+    rf"^{marker}\s+(\{{.*\}})\s*$",
+    rf"^```{marker}\s*\n(.*?)\n```\s*$",
+    rf"^{marker}\s*:?\s*```(?:json)?\s*\n(.*?)\n```\s*$",
+    rf"^{marker}\s*:?\s*\n(\{{.*?\}})\s*$",
+]
+for pat in patterns:
+    m = re.search(pat, text, re.M | re.S)
+    if not m:
+        continue
+    obj = json.loads(m.group(1))
     print((obj.get("pushed_branch") or "").strip())
+    break
 PY
 )"
   branch="${branch:-$(git -C "$repo_path" branch --show-current)}"
@@ -957,8 +983,12 @@ fi
 
 first_line="$(get_first_line "$text")"
 pr_url="$(parse_pr_url "$first_line")"
+has_structured_result=false
+if printf '%s\n' "$text" | grep -qE '^(ACPX_TASK_RESULT_JSON|```ACPX_TASK_RESULT_JSON)'; then
+  has_structured_result=true
+fi
 
-if [[ "$first_line" == TASK_DONE* ]]; then
+if [[ "$first_line" == TASK_DONE* || "$has_structured_result" == "true" ]]; then
   if [[ -z "$pr_url" ]]; then
     pr_url="$(create_runner_owned_pr "$text" "$first_line")" || exit $?
     printf 'TASK_WAITING_MERGE PR_URL=%s\n' "$pr_url"
