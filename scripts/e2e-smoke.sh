@@ -1718,6 +1718,43 @@ if [[ "$FIRST15C" != "TASK_DONE PR_URL=https://github.com/demo/repo/pull/315c" ]
   exit 1
 fi
 
+echo "[e2e-smoke] case15cc rl-task-agent blocks empty assistant text with detail"
+cat > "$RUNNER_MOCKDIR/openclaw" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "agent" ]]; then
+  cat <<'JSON'
+{"payloads":null,"text":""}
+JSON
+  exit 0
+fi
+
+echo "unsupported mock openclaw args: $*" >&2
+exit 1
+EOF
+chmod +x "$RUNNER_MOCKDIR/openclaw"
+
+TASKFILE15CC="$WORKDIR/docs/roadmaps/s5-case15cc-tasklist.md"
+mkdir -p "$(dirname "$TASKFILE15CC")"
+cat > "$TASKFILE15CC" <<'EOF'
+- [ ] S5X-15CC: empty assistant text
+EOF
+
+set +e
+OUT15CC="$(PATH="$RUNNER_MOCKDIR:$PATH" CLAW_TASK_ID="S5X-15CC" CLAW_TASK_TEXT="empty assistant text" CLAW_TASK_FILE="$TASKFILE15CC" CLAW_RUN_ID="run15cc" bash ./scripts/rl-task-agent.sh 2>&1)"
+RC15CC=$?
+set -e
+if [[ "$RC15CC" -eq 0 ]]; then
+  echo "[e2e-smoke] expected case15cc to block empty assistant text"
+  printf '%s\n' "$OUT15CC"
+  exit 1
+fi
+if [[ "$OUT15CC" != *"TASK_BLOCKED: openclaw agent returned no assistant text"* ]]; then
+  echo "[e2e-smoke] expected case15cc no-text block detail"
+  printf '%s\n' "$OUT15CC"
+  exit 1
+fi
+
 echo "[e2e-smoke] case15d rl-task-agent blocks task file mutations during runner execution"
 cat > "$RUNNER_MOCKDIR/openclaw" <<'EOF'
 #!/usr/bin/env bash

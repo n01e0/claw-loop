@@ -865,6 +865,9 @@ if [[ -z "$text" ]]; then
   elif is_retryable_session_signal "$session_signal"; then
     echo "TASK_WAITING_DEPENDENCY: subagent request timed out for ${agent_session_id}; retry task"
     exit 10
+  else
+    echo "TASK_BLOCKED: openclaw agent returned no assistant text for ${agent_session_id}" >&2
+    exit 2
   fi
 fi
 
