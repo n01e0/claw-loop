@@ -210,3 +210,32 @@ not be copied into the PR body.
 - APB-6 should implement body-file and read-back validation from this spec.
 - APB-7/APB-9 should keep merge waiting and cleanup in runner/daemon state,
   events, and notifications only.
+
+## APB-2 disposable task worktree lifecycle
+
+`claw-loopd` now treats dogfood task execution as worktree-scoped runner work:
+
+- Each selected task gets a deterministic disposable worktree at
+  `<repo>/<task_worktree_root>/<run-id>/<task-id-slug>`.
+- The runner creates a per-task branch named `ralph/<run-id-prefix>/<task-id-slug>`
+  from the daemon repository `HEAD` and executes the task runner command with
+  that worktree as its current directory.
+- The task runner receives the worktree contract through environment variables:
+  `CLAW_TASK_WORKTREE`, `CLAW_TASK_BRANCH`, `CLAW_TASK_BASE_BRANCH`, and
+  `CLAW_TASK_WORKTREE_CLEANUP_POLICY`.
+- Durable state separates runner mechanics from PR body content:
+  - `manifest.json` stores `task_worktree_root` and a `task_worktrees` map keyed
+    by task id, including worktree path, branch, base branch, cleanup policy, and
+    lifecycle state.
+  - `runner-state.json` stores `current_worktree` / `last_worktree` alongside
+    current and last task status.
+  - `status` exposes the same fields under `runner.current.worktree`,
+    `runner.last.worktree`, `runner.current_worktree`, `runner.last_worktree`,
+    and `runner.task_worktrees`.
+  - `events.jsonl` records `task_worktree_created` and includes the worktree
+    record on `task_runner_tick` events.
+- Cleanup policy is explicitly `remove_after_merge_if_clean`: later merge/cleanup
+  phases may remove only clean worktrees after the PR is confirmed merged; blocked
+  or dirty worktrees must be retained for debugging.
+
+These records are runner/daemon state only and must not be copied into the PR body.
