@@ -302,6 +302,99 @@ resolve_gh_repo() {
   return 1
 }
 
+create_runner_owned_pr() {
+  local text="$1"
+  local first_line="$2"
+  local body_dir body_file title branch gh_repo pr_url
+
+  gh_repo="$(resolve_gh_repo || true)"
+  if [[ -z "$gh_repo" ]]; then
+    echo "TASK_BLOCKED: failed to resolve GitHub repo from remote.origin.url" >&2
+    return 2
+  fi
+
+  body_dir="${CLAW_PR_BODY_DIR:-${state_root}/pr-bodies}"
+  mkdir -p "$body_dir"
+  body_file="$(TEXT="$text" BODY_DIR="$body_dir" python3 - <<'PY'
+import json, os, pathlib, re, sys, uuid
+
+text = os.environ.get("TEXT", "")
+marker = "ACPX_TASK_RESULT_JSON"
+result = None
+inline = re.search(rf"^{marker}:\s*(\{{.*\}})\s*$", text, re.M)
+if inline:
+    result = json.loads(inline.group(1))
+else:
+    fenced = re.search(rf"^```{marker}\s*\n(.*?)\n```\s*$", text, re.M | re.S)
+    if fenced:
+        result = json.loads(fenced.group(1))
+if not isinstance(result, dict):
+    print("missing ACPX_TASK_RESULT_JSON for runner-owned PR creation", file=sys.stderr)
+    sys.exit(3)
+summary = str(result.get("summary") or "").strip()
+verification = [str(v).strip() for v in result.get("verification") or [] if str(v).strip()]
+notes = [str(v).strip() for v in result.get("notes") or [] if str(v).strip()]
+if not summary or not verification:
+    print("ACPX_TASK_RESULT_JSON summary and verification are required", file=sys.stderr)
+    sys.exit(3)
+for value in [summary, *verification, *notes]:
+    lowered = value.lower()
+    for term in ("task_done", "task_waiting_merge", "task_blocked", "runner", "daemon", "worktree", "body file", "cleanup"):
+        if term in lowered:
+            print(f"PR body content contains execution-report vocabulary: {term}", file=sys.stderr)
+            sys.exit(3)
+body = "## Summary\n- " + summary.replace("\n", "\n- ") + "\n\n## Verification\n"
+body += "".join(f"- {v}\n" for v in verification)
+if notes:
+    body += "\n## Notes\n" + "".join(f"- {n}\n" for n in notes)
+path = pathlib.Path(os.environ["BODY_DIR"]) / f"runner-pr-body-{uuid.uuid4()}.md"
+path.write_text(body)
+print(path)
+PY
+)" || {
+    echo "TASK_BLOCKED: failed to create runner-owned PR body file" >&2
+    return 2
+  }
+
+  cleanup_pr_body_file() {
+    [[ -z "${body_file:-}" ]] || rm -f -- "$body_file"
+  }
+  trap cleanup_pr_body_file RETURN
+
+  branch="$(TEXT="$text" python3 - <<'PY'
+import json, os, re
+text = os.environ.get("TEXT", "")
+marker = "ACPX_TASK_RESULT_JSON"
+raw = None
+m = re.search(rf"^{marker}:\s*(\{{.*\}})\s*$", text, re.M)
+if m:
+    raw = m.group(1)
+else:
+    m = re.search(rf"^```{marker}\s*\n(.*?)\n```\s*$", text, re.M | re.S)
+    if m:
+        raw = m.group(1)
+if raw:
+    obj = json.loads(raw)
+    print((obj.get("pushed_branch") or "").strip())
+PY
+)"
+  branch="${branch:-$(git -C "$repo_path" branch --show-current)}"
+  title="${CLAW_PR_TITLE:-${CLAW_TASK_ID}: ${CLAW_TASK_TEXT}}"
+
+  pr_url="$(gh pr create --repo "$gh_repo" --head "$branch" --title "$title" --body-file "$body_file" 2>&1)" || {
+    local err
+    err="$(clip_one_line "$pr_url")"
+    echo "TASK_BLOCKED: gh pr create --body-file failed error=${err}" >&2
+    return 2
+  }
+  pr_url="$(printf '%s\n' "$pr_url" | grep -Eo 'https://github.com/[^[:space:]]+/pull/[0-9]+' | head -n1)"
+  if [[ -z "$pr_url" ]]; then
+    echo "TASK_BLOCKED: gh pr create did not return a PR URL" >&2
+    return 2
+  fi
+  printf '%s\n' "$pr_url"
+}
+
 pr_state_summary() {
   local pr_url="$1"
   if [[ -z "$pr_url" ]]; then
@@ -685,7 +778,7 @@ Hard requirements:
 - Complete exactly the specified task.
 - Do not edit the task file; treat it as daemon-owned planning state. Only claw-loopd may mutate task checkboxes / recovery entries.
 - Commit/push your changes.
-- Create PR for this task. Prefer enabling auto-merge when the repository supports it.
+- Do not create the PR yourself unless explicitly instructed with a runner-generated body file path. By default, emit ACPX_TASK_RESULT_JSON with summary / verification / notes / pushed_branch and let the runner create the PR with gh pr create --body-file.
 - If CI checks fail on that PR, fix the failure and push follow-up commits until checks pass.
 - If the repository does not support auto-merge, return waiting with PR URL after pushing; claw-loopd will watch CI and merge when it turns green.
 - If merge is not complete yet, return waiting with PR URL.
@@ -774,8 +867,6 @@ if [[ -z "$text" ]]; then
     exit 10
   fi
 fi
-printf '%s
-' "$text"
 
 if [[ -n "$task_file_hash_before" && -f "${CLAW_TASK_FILE:-}" ]]; then
   task_file_hash_after="$(task_plan_hash "${CLAW_TASK_FILE}")"
@@ -790,8 +881,10 @@ pr_url="$(parse_pr_url "$first_line")"
 
 if [[ "$first_line" == TASK_DONE* ]]; then
   if [[ -z "$pr_url" ]]; then
-    echo "TASK_BLOCKED: TASK_DONE without PR_URL" >&2
-    exit 2
+    pr_url="$(create_runner_owned_pr "$text" "$first_line")" || exit $?
+    printf 'TASK_WAITING_MERGE PR_URL=%s\n' "$pr_url"
+  else
+    printf '%s\n' "$text"
   fi
   {
     echo "PR_URL='${pr_url}'"
@@ -799,6 +892,8 @@ if [[ "$first_line" == TASK_DONE* ]]; then
   handle_waiting_pr "$pr_url"
   exit $?
 fi
+
+printf '%s\n' "$text"
 
 if [[ "$first_line" == TASK_WAITING_MERGE* ]]; then
   if [[ -n "$pr_url" ]]; then

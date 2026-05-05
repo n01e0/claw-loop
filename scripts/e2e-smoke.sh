@@ -1756,6 +1756,122 @@ if [[ "$OUT15D" != *"TASK_BLOCKED: task file was modified during runner executio
   exit 1
 fi
 
+echo "[e2e-smoke] case15e rl-task-agent creates PR with runner-owned --body-file and cleans it up"
+RUNNER_PR_MOCKDIR="$WORKDIR/mockbin-runner-pr"
+RUNNER_PR_LOG="$WORKDIR/mockbin-runner-pr.log"
+RUNNER_PR_BODY_DIR="$WORKDIR/runner-pr-bodies"
+rm -f "$RUNNER_PR_LOG"
+rm -rf "$RUNNER_PR_BODY_DIR" "$REPO/.ralph/runner-agent-state/run15e"
+mkdir -p "$RUNNER_PR_MOCKDIR" "$RUNNER_PR_BODY_DIR"
+cat > "$RUNNER_PR_MOCKDIR/openclaw" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "agent" ]]; then
+  cat <<'JSON'
+{"payloads":null,"text":"TASK_DONE\n\nACPX_TASK_RESULT_JSON: {\"summary\":\"Added body-file PR creation.\",\"verification\":[\"bash -n scripts/rl-task-agent.sh\"],\"notes\":[\"Reviewer-facing behavior is covered.\"],\"pushed_branch\":\"apb-5-body-file\"}"}
+JSON
+  exit 0
+fi
+
+echo "unsupported mock openclaw args: $*" >&2
+exit 1
+EOF
+chmod +x "$RUNNER_PR_MOCKDIR/openclaw"
+cat > "$RUNNER_PR_MOCKDIR/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+log="${RUNNER_PR_LOG:?}"
+if [[ "${1:-}" == "pr" && "${2:-}" == "create" ]]; then
+  body_file=""
+  prev=""
+  for arg in "$@"; do
+    if [[ "$prev" == "--body-file" ]]; then
+      body_file="$arg"
+    fi
+    if [[ "$arg" == "--body" ]]; then
+      echo "inline --body is forbidden" >&2
+      exit 1
+    fi
+    prev="$arg"
+  done
+  [[ -n "$body_file" && -f "$body_file" ]] || { echo "missing body file" >&2; exit 1; }
+  grep -q '^## Summary' "$body_file"
+  grep -q 'Added body-file PR creation.' "$body_file"
+  printf 'create body_file=%s args=%s\n' "$body_file" "$*" >> "$log"
+  echo 'https://github.com/demo/repo/pull/3155'
+  exit 0
+fi
+if [[ "${1:-}" == "pr" && "${2:-}" == "view" ]]; then
+  joined="$*"
+  if [[ "$joined" == *"state,mergedAt"* ]]; then
+    echo 'OPEN|'
+    exit 0
+  fi
+  if [[ "$joined" == *"state,autoMergeRequest"* ]]; then
+    echo '1'
+    exit 0
+  fi
+  if [[ "$joined" == *"statusCheckRollup"* ]]; then
+    echo ''
+    exit 0
+  fi
+  if [[ "$joined" == *"baseRefName"* ]]; then
+    echo 'main'
+    exit 0
+  fi
+fi
+if [[ "${1:-}" == "pr" && "${2:-}" == "merge" ]]; then
+  exit 0
+fi
+if [[ "${1:-}" == "api" && "${2:-}" == "repos/demo/repo" ]]; then
+  echo 'main'
+  exit 0
+fi
+if [[ "${1:-}" == "api" && "${2:-}" == repos/demo/repo/branches/*/protection ]]; then
+  exit 1
+fi
+if [[ "${1:-}" == "api" ]]; then
+  echo '[]'
+  exit 0
+fi
+
+echo "unsupported mock gh args: $*" >&2
+exit 1
+EOF
+chmod +x "$RUNNER_PR_MOCKDIR/gh"
+
+TASKFILE15E="$WORKDIR/docs/roadmaps/s5-case15e-tasklist.md"
+mkdir -p "$(dirname "$TASKFILE15E")"
+cat > "$TASKFILE15E" <<'EOF'
+- [ ] S5X-15E: runner owned pr create
+EOF
+set +e
+OUT15E="$(PATH="$RUNNER_PR_MOCKDIR:$PATH" RUNNER_PR_LOG="$RUNNER_PR_LOG" CLAW_GH_REPO="demo/repo" CLAW_PR_BODY_DIR="$RUNNER_PR_BODY_DIR" CLAW_TASK_ID="S5X-15E" CLAW_TASK_TEXT="runner owned pr create" CLAW_TASK_FILE="$TASKFILE15E" CLAW_RUN_ID="run15e" bash ./scripts/rl-task-agent.sh 2>&1)"
+RC15E=$?
+set -e
+if [[ "$RC15E" -ne 10 ]]; then
+  echo "[e2e-smoke] expected case15e rc=10, got $RC15E"
+  printf '%s\n' "$OUT15E"
+  exit 1
+fi
+FIRST15E="$(printf '%s\n' "$OUT15E" | awk 'NF { print; exit }')"
+if [[ "$FIRST15E" != "TASK_WAITING_MERGE PR_URL=https://github.com/demo/repo/pull/3155" ]]; then
+  echo "[e2e-smoke] expected case15e waiting merge first line"
+  printf '%s\n' "$OUT15E"
+  exit 1
+fi
+if ! grep -q -- '--body-file' "$RUNNER_PR_LOG"; then
+  echo "[e2e-smoke] expected gh pr create --body-file in case15e"
+  cat "$RUNNER_PR_LOG" || true
+  exit 1
+fi
+if find "$RUNNER_PR_BODY_DIR" -type f | grep -q .; then
+  echo "[e2e-smoke] expected runner PR body file cleanup in case15e"
+  find "$RUNNER_PR_BODY_DIR" -type f -print
+  exit 1
+fi
+
+
 echo "[e2e-smoke] case16 rl-task-agent sees required checks from ruleset detail endpoint"
 RULESET_MOCKDIR="$WORKDIR/mockbin-ruleset"
 mkdir -p "$RULESET_MOCKDIR"
