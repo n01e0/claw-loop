@@ -1834,12 +1834,17 @@ if [[ "${1:-}" == "pr" && "${2:-}" == "create" ]]; then
   [[ -n "$body_file" && -f "$body_file" ]] || { echo "missing body file" >&2; exit 1; }
   grep -q '^## Summary' "$body_file"
   grep -q 'Added body-file PR creation.' "$body_file"
+  cp "$body_file" "${log}.body"
   printf 'create body_file=%s args=%s\n' "$body_file" "$*" >> "$log"
   echo 'https://github.com/demo/repo/pull/3155'
   exit 0
 fi
 if [[ "${1:-}" == "pr" && "${2:-}" == "view" ]]; then
   joined="$*"
+  if [[ "$joined" == *"--json body"* ]]; then
+    cat "${log}.body"
+    exit 0
+  fi
   if [[ "$joined" == *"state,mergedAt"* ]]; then
     echo 'OPEN|'
     exit 0
