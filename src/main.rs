@@ -307,6 +307,65 @@ struct WaitingDependencyContext {
     contract_line: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+struct AcpxTaskPrMetadata {
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    number: Option<u64>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    merge_state: Option<String>,
+    #[serde(default)]
+    auto_merge: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+struct AcpxTaskResult {
+    summary: String,
+    #[serde(default)]
+    verification: Vec<String>,
+    #[serde(default)]
+    notes: Vec<String>,
+    pushed_branch: String,
+    #[serde(default)]
+    pr: Option<AcpxTaskPrMetadata>,
+}
+
+fn parse_acpx_task_result(stdout: &str) -> Result<Option<AcpxTaskResult>> {
+    let marker = "ACPX_TASK_RESULT_JSON";
+    let mut in_fence = false;
+    let mut json_lines: Vec<&str> = Vec::new();
+
+    for line in stdout.lines().map(str::trim) {
+        if let Some(raw) = line.strip_prefix(&format!("{marker}:")) {
+            let result: AcpxTaskResult = serde_json::from_str(raw.trim())
+                .with_context(|| format!("parse {marker} inline payload"))?;
+            return Ok(Some(result));
+        }
+
+        if line == format!("```{marker}") || line == format!("```json {marker}") {
+            in_fence = true;
+            json_lines.clear();
+            continue;
+        }
+
+        if in_fence && line == "```" {
+            let payload = json_lines.join("\n");
+            let result: AcpxTaskResult = serde_json::from_str(&payload)
+                .with_context(|| format!("parse {marker} fenced payload"))?;
+            return Ok(Some(result));
+        }
+
+        if in_fence {
+            json_lines.push(line);
+        }
+    }
+
+    Ok(None)
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum TaskExecutionKind {
@@ -6449,13 +6508,14 @@ mod tests {
         is_phase_or_stacked_dependency_reason, lease_window_sec, maybe_auto_recover_blocked_task,
         missing_current_task_id_guard_reason, normalize_blocked_reason_for_recovery,
         normalize_error_reason, notification_delivery_mode, openclaw_notify_timeout_sec_from,
-        parse_openclaw_message_id, parse_task_checklist_entry, parse_waiting_contract,
-        parse_waiting_dependency_contract, queue_main_feedback_summary, queue_notification,
-        read_backlog_snapshot, read_json, read_jsonl, retryable_waiting_merge_error,
-        select_next_task_entry, select_next_task_with_backlog, should_force_status_establish_retry,
-        should_suppress_waiting_stuck, task_contract_line, tasklist_approval_violation_reason,
-        update_waiting_stuck_tracker, validate_task_done_contract_with,
-        waiting_merge_nonprogress_reason, write_json, write_runner_state,
+        parse_acpx_task_result, parse_openclaw_message_id, parse_task_checklist_entry,
+        parse_waiting_contract, parse_waiting_dependency_contract, queue_main_feedback_summary,
+        queue_notification, read_backlog_snapshot, read_json, read_jsonl,
+        retryable_waiting_merge_error, select_next_task_entry, select_next_task_with_backlog,
+        should_force_status_establish_retry, should_suppress_waiting_stuck, task_contract_line,
+        tasklist_approval_violation_reason, update_waiting_stuck_tracker,
+        validate_task_done_contract_with, waiting_merge_nonprogress_reason, write_json,
+        write_runner_state,
     };
     use crate::tasklist::write_task_approval;
     use chrono::{Duration, Utc};
@@ -6481,6 +6541,57 @@ mod tests {
         fn path(&self) -> &Path {
             &self.path
         }
+    }
+
+    #[test]
+    fn parse_acpx_task_result_reads_fenced_payload() {
+        let stdout = r#"TASK_WAITING_MERGE PR_URL=https://github.com/n01e0/claw-loop/pull/123
+Summary for humans.
+```ACPX_TASK_RESULT_JSON
+{
+  "summary": "Defined the ACPX task result contract.",
+  "verification": ["cargo test"],
+  "notes": ["CI pending under auto-merge."],
+  "pushed_branch": "apb-3-acpx-result-contract",
+  "pr": {
+    "url": "https://github.com/n01e0/claw-loop/pull/123",
+    "number": 123,
+    "title": "Define ACPX task result contract",
+    "merge_state": "pending",
+    "auto_merge": true
+  }
+}
+```
+"#;
+
+        let result = parse_acpx_task_result(stdout)
+            .expect("parse result")
+            .expect("result payload");
+
+        assert_eq!(result.summary, "Defined the ACPX task result contract.");
+        assert_eq!(result.verification, vec!["cargo test"]);
+        assert_eq!(result.notes, vec!["CI pending under auto-merge."]);
+        assert_eq!(result.pushed_branch, "apb-3-acpx-result-contract");
+        let pr = result.pr.expect("pr metadata");
+        assert_eq!(pr.number, Some(123));
+        assert_eq!(pr.merge_state.as_deref(), Some("pending"));
+        assert_eq!(pr.auto_merge, Some(true));
+    }
+
+    #[test]
+    fn parse_acpx_task_result_reads_inline_payload() {
+        let stdout = concat!(
+            "TASK_DONE PR_URL=https://github.com/n01e0/claw-loop/pull/124\n",
+            "ACPX_TASK_RESULT_JSON: {\"summary\":\"done\",\"verification\":[],\"notes\":[],\"pushed_branch\":\"apb-3\"}\n"
+        );
+
+        let result = parse_acpx_task_result(stdout)
+            .expect("parse result")
+            .expect("result payload");
+
+        assert_eq!(result.summary, "done");
+        assert_eq!(result.pushed_branch, "apb-3");
+        assert!(result.pr.is_none());
     }
 
     impl Drop for TestRunDir {
