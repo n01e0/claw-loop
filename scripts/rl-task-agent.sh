@@ -290,32 +290,8 @@ infer_gh_repo() {
   return 1
 }
 
-resolve_gh_repo() {
-  if [[ -n "${CLAW_GH_REPO:-}" ]]; then
-    echo "$CLAW_GH_REPO"
-    return 0
-  fi
-  if infer_gh_repo >/dev/null 2>&1; then
-    infer_gh_repo
-    return 0
-  fi
-  return 1
-}
-
-validate_pr_body_readback() {
-  local pr_url="$1"
-  local body_file="$2"
-  local gh_repo="$3"
-  local actual expected hazard
-
-  expected="$(cat "$body_file")"
-  actual="$(gh pr view "$pr_url" --repo "$gh_repo" --json body --jq '.body // ""' 2>&1)" || {
-    echo "TASK_BLOCKED: gh pr view --json body failed error=$(clip_one_line "$actual")" >&2
-    return 2
-  }
-
-  detect_pr_body_hazard() {
-    python3 - "$1" <<'PY'
+detect_pr_body_hazard() {
+  python3 - "$1" <<'PY'
 import pathlib, re, sys
 body = pathlib.Path(sys.argv[1]).read_text()
 terms = [
@@ -344,6 +320,30 @@ if checks:
     print("; ".join(checks))
     sys.exit(1)
 PY
+}
+
+resolve_gh_repo() {
+  if [[ -n "${CLAW_GH_REPO:-}" ]]; then
+    echo "$CLAW_GH_REPO"
+    return 0
+  fi
+  if infer_gh_repo >/dev/null 2>&1; then
+    infer_gh_repo
+    return 0
+  fi
+  return 1
+}
+
+validate_pr_body_readback() {
+  local pr_url="$1"
+  local body_file="$2"
+  local gh_repo="$3"
+  local actual expected hazard
+
+  expected="$(cat "$body_file")"
+  actual="$(gh pr view "$pr_url" --repo "$gh_repo" --json body --jq '.body // ""' 2>&1)" || {
+    echo "TASK_BLOCKED: gh pr view --json body failed error=$(clip_one_line "$actual")" >&2
+    return 2
   }
 
   local tmp_actual
@@ -364,13 +364,17 @@ PY
   fi
 
   tmp_actual="$(mktemp)"
+  trap 'rm -f -- "$tmp_actual"' RETURN
   printf '%s' "$actual" > "$tmp_actual"
-  if ! hazard="$(detect_pr_body_hazard "$tmp_actual" 2>&1)"; then
+  if hazard="$(detect_pr_body_hazard "$tmp_actual" 2>&1)"; then
     rm -f -- "$tmp_actual"
+    trap - RETURN
+  else
+    rm -f -- "$tmp_actual"
+    trap - RETURN
     echo "TASK_BLOCKED: PR body read-back validation failed for PR_URL=${pr_url}: $(clip_one_line "$hazard")" >&2
     return 2
   fi
-  rm -f -- "$tmp_actual"
 }
 
 create_runner_owned_pr() {
