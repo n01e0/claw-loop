@@ -248,6 +248,10 @@ Design requirement:
   diagnostic capture.
 - Do not use `text` for contract parsing. It is useful for humans but includes
   tool/update stream content.
+- Structured task result metadata is defined in
+  `docs/specs/acpx-task-result-contract.md`; the first-line `TASK_*` signal
+  remains authoritative, and `ACPX_TASK_RESULT_JSON` provides runner-readable
+  summary, verification, notes, pushed branch, and optional PR metadata.
 - If `json` is later used for prompt output, parse NDJSON events and extract the
   final assistant text. Do not grep raw ANSI/PTY output.
 
