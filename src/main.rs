@@ -1660,7 +1660,18 @@ fn build_waiting_merge_blocked_context(
     }
 }
 
+fn retain_task_worktree_for_reason(
+    worktree: &TaskWorktreeRecord,
+    reason: impl Into<String>,
+) -> TaskWorktreeRecord {
+    let mut updated = worktree.clone();
+    updated.state = TaskWorktreeState::Retained;
+    updated.cleanup_reason = Some(reason.into());
+    updated
+}
+
 fn apply_blocked_context(
+    manifest: &mut Manifest,
     runner_state: &mut RunnerState,
     state: &mut State,
     context: &BlockedContext,
@@ -1677,7 +1688,22 @@ fn apply_blocked_context(
     runner_state.last_task_reason = Some(context.reason_summary.clone());
     runner_state.last_blocked_context = Some(context.clone());
     runner_state.last_task_pr_url = context.pr_url.clone();
-    runner_state.last_worktree = runner_state.current_worktree.clone();
+    let retained_worktree = runner_state.current_worktree.as_ref().map(|worktree| {
+        retain_task_worktree_for_reason(
+            worktree,
+            format!(
+                "task {} blocked; worktree retained for debugging/manual repair: {}",
+                context.task_id, context.reason_summary
+            ),
+        )
+    });
+    runner_state.current_worktree = retained_worktree.clone();
+    runner_state.last_worktree = retained_worktree.clone();
+    if let Some(worktree) = retained_worktree {
+        manifest
+            .task_worktrees
+            .insert(context.task_id.clone(), worktree);
+    }
 
     state.version += 1;
     state.status = LoopStatus::Blocked;
@@ -4478,6 +4504,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                                         now,
                                                     );
                                                 apply_blocked_context(
+                                                    &mut manifest,
                                                     &mut runner_state,
                                                     &mut state,
                                                     &blocked_context,
@@ -4564,6 +4591,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                                         now,
                                                     );
                                                 apply_blocked_context(
+                                                    &mut manifest,
                                                     &mut runner_state,
                                                     &mut state,
                                                     &blocked_context,
@@ -5154,6 +5182,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                         now,
                                     );
                                     apply_blocked_context(
+                                        &mut manifest,
                                         &mut runner_state,
                                         &mut state,
                                         &blocked_context,
