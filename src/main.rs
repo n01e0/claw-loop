@@ -6800,6 +6800,190 @@ Summary for humans.
         );
     }
 
+    #[test]
+    fn rl_task_agent_mock_acpx_gh_e2e_body_file_validation_repair_and_merge_retry() {
+        let temp = TestRunDir::new("rl-task-agent-e2e");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("create repo");
+        super::git_output(&repo, &["init", "-b", "main"]).expect("git init");
+        super::git_output(&repo, &["config", "user.email", "test@example.invalid"])
+            .expect("git config email");
+        super::git_output(&repo, &["config", "user.name", "Test User"]).expect("git config name");
+        super::git_output(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/n01e0/claw-loop.git",
+            ],
+        )
+        .expect("add origin");
+        fs::write(repo.join("README.md"), "base\n").expect("write readme");
+        super::git_output(&repo, &["add", "README.md"]).expect("git add");
+        super::git_output(&repo, &["commit", "-m", "init"]).expect("git commit");
+        super::git_output(&repo, &["checkout", "-b", "ralph/test/apb-10"])
+            .expect("checkout task branch");
+
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        let gh_state = temp.path().join("gh-state");
+        fs::create_dir_all(&gh_state).expect("create gh state dir");
+        fs::write(gh_state.join("phase"), "pending").expect("write phase");
+
+        let openclaw = bin_dir.join("openclaw");
+        fs::write(&openclaw, r###"#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{"text":"ACPX_TASK_RESULT_JSON: {\"summary\":\"Added mock ACPX and GitHub regression coverage.\",\"verification\":[\"cargo test rl_task_agent_mock_acpx_gh_e2e_body_file_validation_repair_and_merge_retry passed\"],\"notes\":[\"Covers body-file PR creation and merge retry behavior.\"],\"pushed_branch\":\"ralph/test/apb-10\"}"}
+JSON
+"###).expect("write mock openclaw");
+
+        let gh = bin_dir.join("gh");
+        fs::write(&gh, format!(r###"#!/usr/bin/env bash
+set -euo pipefail
+STATE={state:?}
+mkdir -p "$STATE"
+log() {{ printf '%s\n' "$*" >> "$STATE/calls"; }}
+log "$*"
+if [[ "${{1:-}} ${{2:-}}" == "pr create" ]]; then
+  body_file=""
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--body-file" ]]; then shift; body_file="$1"; fi
+    shift || true
+  done
+  [[ -n "$body_file" ]]
+  cp "$body_file" "$STATE/expected-body"
+  printf 'TASK_DONE PR_URL=bad execution report\n' > "$STATE/body"
+  echo https://github.com/n01e0/claw-loop/pull/910
+  exit 0
+fi
+if [[ "${{1:-}} ${{2:-}}" == "pr view" ]]; then
+  if printf '%s\n' "$*" | grep -q -- '--json body'; then cat "$STATE/body"; exit 0; fi
+  if printf '%s\n' "$*" | grep -q -- 'statusCheckRollup'; then
+    args="$*"
+    phase="$(cat "$STATE/phase")"
+    if [[ "$args" == *'FAILURE'* || "$args" == *'TIMED_OUT'* ]]; then
+      echo ''
+    elif [[ "$args" == *'IN_PROGRESS'* || "$args" == *'COMPLETED" and (.status'* ]]; then
+      [[ "$phase" == pending ]] && echo ci || echo ''
+    elif [[ "$args" == *'length'* ]]; then
+      [[ "$phase" == pending ]] && echo 0 || echo 1
+    elif [[ "$phase" == pending ]]; then
+      echo '{{"state":"OPEN","mergedAt":null,"autoMergeRequest":null,"statusCheckRollup":[{{"name":"ci","status":"IN_PROGRESS","conclusion":""}}],"baseRefName":"main"}}'
+    else
+      echo '{{"state":"OPEN","mergedAt":null,"autoMergeRequest":null,"statusCheckRollup":[{{"name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}}],"baseRefName":"main"}}'
+    fi
+    exit 0
+  fi
+  if printf '%s\n' "$*" | grep -q -- 'state,mergedAt'; then
+    if [[ -f "$STATE/merged" ]]; then echo 'MERGED|2026-01-01T00:00:00Z'; else echo 'OPEN|'; fi
+    exit 0
+  fi
+  if printf '%s\n' "$*" | grep -q -- 'state,autoMergeRequest'; then echo 0; exit 0; fi
+  if printf '%s\n' "$*" | grep -q -- 'baseRefName'; then echo main; exit 0; fi
+fi
+if [[ "${{1:-}} ${{2:-}}" == "pr edit" ]]; then
+  body_file=""
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--body-file" ]]; then shift; body_file="$1"; fi
+    shift || true
+  done
+  cp "$body_file" "$STATE/body"
+  exit 0
+fi
+if [[ "${{1:-}} ${{2:-}}" == "pr merge" ]]; then
+  if printf '%s\n' "$*" | grep -q -- '--auto'; then echo 'auto merge is disabled' >&2; exit 1; fi
+  touch "$STATE/merged"; exit 0
+fi
+if [[ "${{1:-}}" == api ]]; then
+  if [[ "${{2:-}}" == repos/n01e0/claw-loop ]]; then echo main; else echo '[]'; fi
+  exit 0
+fi
+echo unsupported gh "$@" >&2
+exit 1
+"###, state = gh_state.display())).expect("write mock gh");
+
+        #[cfg(unix)]
+        for script in [&openclaw, &gh] {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(script).expect("stat script").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(script, perms).expect("chmod script");
+        }
+
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/rl-task-agent.sh");
+        let path = format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let first = std::process::Command::new("bash")
+            .arg(&script)
+            .current_dir(&repo)
+            .env("PATH", &path)
+            .env("CLAW_TASK_ID", "APB-10")
+            .env("CLAW_TASK_TEXT", "mock e2e")
+            .env("CLAW_RUN_ID", "run-e2e")
+            .env("CLAW_AGENT_TIMEOUT_SEC", "1")
+            .output()
+            .expect("run first task agent pass");
+        assert_eq!(
+            first.status.code(),
+            Some(10),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&first.stdout),
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let first_stdout = String::from_utf8_lossy(&first.stdout);
+        assert!(
+            first_stdout
+                .contains("TASK_WAITING_MERGE PR_URL=https://github.com/n01e0/claw-loop/pull/910")
+        );
+        assert!(
+            fs::read_to_string(gh_state.join("calls"))
+                .expect("read gh calls")
+                .contains("pr create")
+        );
+        assert!(
+            fs::read_to_string(gh_state.join("calls"))
+                .expect("read gh calls")
+                .contains("--body-file")
+        );
+        assert!(
+            fs::read_to_string(gh_state.join("calls"))
+                .expect("read gh calls")
+                .contains("pr edit")
+        );
+        assert!(
+            fs::read_dir(repo.join(".ralph/runner-agent-state/run-e2e/pr-bodies"))
+                .expect("read body dir")
+                .next()
+                .is_none()
+        );
+
+        fs::write(gh_state.join("phase"), "success").expect("advance phase");
+        let second = std::process::Command::new("bash")
+            .arg(&script)
+            .current_dir(&repo)
+            .env("PATH", &path)
+            .env("CLAW_TASK_ID", "APB-10")
+            .env("CLAW_TASK_TEXT", "mock e2e")
+            .env("CLAW_RUN_ID", "run-e2e")
+            .output()
+            .expect("run retry task agent pass");
+        assert!(
+            second.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&second.stdout),
+            String::from_utf8_lossy(&second.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&second.stdout)
+                .contains("TASK_DONE PR_URL=https://github.com/n01e0/claw-loop/pull/910")
+        );
+    }
+
     impl Drop for TestRunDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
