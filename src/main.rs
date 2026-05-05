@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, Utc};
 use clap::{Parser, Subcommand};
@@ -85,6 +87,8 @@ enum Commands {
         backlog_detector_file: Option<PathBuf>,
         #[arg(long, default_value_t = default_backlog_detector_max_age_sec())]
         backlog_detector_max_age_sec: u64,
+        #[arg(long, default_value = ".ralph/worktrees")]
+        task_worktree_root: PathBuf,
     },
     Daemon {
         #[arg(long)]
@@ -239,6 +243,10 @@ struct Manifest {
     backlog_detector_file: Option<PathBuf>,
     #[serde(default = "default_backlog_detector_max_age_sec")]
     backlog_detector_max_age_sec: u64,
+    #[serde(default = "default_task_worktree_root")]
+    task_worktree_root: PathBuf,
+    #[serde(default)]
+    task_worktrees: HashMap<String, TaskWorktreeRecord>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -305,6 +313,35 @@ enum TaskExecutionKind {
     Repair,
     Feature,
     Unknown,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TaskWorktreeCleanupPolicy {
+    RemoveAfterMergeIfClean,
+    RetainUntilManualCleanup,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TaskWorktreeState {
+    Planned,
+    Created,
+    Retained,
+    Removed,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+struct TaskWorktreeRecord {
+    task_id: String,
+    path: PathBuf,
+    branch: String,
+    base_branch: String,
+    cleanup_policy: TaskWorktreeCleanupPolicy,
+    state: TaskWorktreeState,
+    created_at: DateTime<Utc>,
+    #[serde(default)]
+    cleanup_reason: Option<String>,
 }
 
 impl TaskExecutionKind {
@@ -434,6 +471,8 @@ struct RunnerState {
     #[serde(default)]
     current_waiting_dependency: Option<WaitingDependencyContext>,
     #[serde(default)]
+    current_worktree: Option<TaskWorktreeRecord>,
+    #[serde(default)]
     current_task_blocked_reason: Option<String>,
     #[serde(default)]
     current_blocked_context: Option<BlockedContext>,
@@ -453,6 +492,8 @@ struct RunnerState {
     last_task_pr_url: Option<String>,
     #[serde(default)]
     last_waiting_dependency: Option<WaitingDependencyContext>,
+    #[serde(default)]
+    last_worktree: Option<TaskWorktreeRecord>,
     #[serde(default)]
     preferred_next_task_id: Option<String>,
     #[serde(default)]
@@ -635,6 +676,7 @@ struct StartOptions {
     auto_recover_blocked_max_attempts: u64,
     backlog_detector_file: Option<PathBuf>,
     backlog_detector_max_age_sec: u64,
+    task_worktree_root: PathBuf,
 }
 
 fn default_max_task_loops() -> u64 {
@@ -661,6 +703,10 @@ fn stuck_wait_ticks_threshold() -> u64 {
         .unwrap_or(30)
 }
 
+fn default_task_worktree_root() -> PathBuf {
+    PathBuf::from(".ralph/worktrees")
+}
+
 fn default_task_file() -> PathBuf {
     PathBuf::from("docs/roadmaps/ack-integration-tasklist.md")
 }
@@ -671,6 +717,93 @@ fn resolve_task_file_path(repo: &Path, task_file: &Path) -> PathBuf {
     } else {
         repo.join(task_file)
     }
+}
+
+fn resolve_task_worktree_root(repo: &Path, root: &Path) -> PathBuf {
+    if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        repo.join(root)
+    }
+}
+
+fn sanitize_git_ref_part(input: &str) -> String {
+    let mut out = String::new();
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches(|ch| ch == '-' || ch == '.' || ch == '_');
+    if trimmed.is_empty() {
+        "task".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .with_context(|| format!("git {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: status={:?} stderr={}",
+            args.join(" "),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn ensure_task_worktree(
+    repo: &Path,
+    run_id: Uuid,
+    root: &Path,
+    task: &TaskChecklistEntry,
+    now: DateTime<Utc>,
+) -> Result<TaskWorktreeRecord> {
+    let abs_root = resolve_task_worktree_root(repo, root);
+    fs::create_dir_all(&abs_root)?;
+    let task_slug = sanitize_git_ref_part(&task.id);
+    let run_slug = run_id.to_string();
+    let path = abs_root.join(&run_slug).join(&task_slug);
+    let branch = format!("ralph/{}/{}", &run_slug[..8], task_slug);
+    let base_branch =
+        git_output(repo, &["branch", "--show-current"]).unwrap_or_else(|_| "HEAD".to_string());
+
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        git_output(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch.as_str(),
+                path.to_string_lossy().as_ref(),
+                "HEAD",
+            ],
+        )?;
+    }
+
+    Ok(TaskWorktreeRecord {
+        task_id: task.id.clone(),
+        path,
+        branch,
+        base_branch,
+        cleanup_policy: TaskWorktreeCleanupPolicy::RemoveAfterMergeIfClean,
+        state: TaskWorktreeState::Created,
+        created_at: now,
+        cleanup_reason: Some("retain until PR is confirmed merged; remove only if clean".into()),
+    })
 }
 
 fn require_tasklist_approval(
@@ -1315,6 +1448,7 @@ struct TaskRunOptions<'a> {
     task_agent_id: Option<&'a str>,
     task_kind: Option<TaskExecutionKind>,
     backlog_snapshot: Option<&'a BacklogSnapshot>,
+    worktree: Option<&'a TaskWorktreeRecord>,
 }
 
 fn clip_text(input: &str, max_chars: usize) -> String {
@@ -1439,6 +1573,7 @@ fn apply_blocked_context(
     runner_state.last_task_reason = Some(context.reason_summary.clone());
     runner_state.last_blocked_context = Some(context.clone());
     runner_state.last_task_pr_url = context.pr_url.clone();
+    runner_state.last_worktree = runner_state.current_worktree.clone();
 
     state.version += 1;
     state.status = LoopStatus::Blocked;
@@ -3063,6 +3198,19 @@ fn run_task_once(opts: TaskRunOptions<'_>) -> Result<TaskRunOutcome> {
     if let Some(task_kind) = opts.task_kind {
         command.env("CLAW_TASK_KIND", task_kind.as_str());
     }
+    if let Some(worktree) = opts.worktree {
+        command
+            .env(
+                "CLAW_TASK_WORKTREE",
+                worktree.path.to_string_lossy().to_string(),
+            )
+            .env("CLAW_TASK_BRANCH", worktree.branch.as_str())
+            .env("CLAW_TASK_BASE_BRANCH", worktree.base_branch.as_str())
+            .env(
+                "CLAW_TASK_WORKTREE_CLEANUP_POLICY",
+                "remove_after_merge_if_clean",
+            );
+    }
     if let Some(backlog_snapshot) = opts.backlog_snapshot {
         command
             .env("CLAW_BACKLOG_STATUS", backlog_snapshot.status.as_str())
@@ -3919,6 +4067,8 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
         auto_recover_blocked_max_attempts: opts.auto_recover_blocked_max_attempts,
         backlog_detector_file: opts.backlog_detector_file,
         backlog_detector_max_age_sec: opts.backlog_detector_max_age_sec,
+        task_worktree_root: opts.task_worktree_root,
+        task_worktrees: HashMap::new(),
     };
     let state = State {
         version: 1,
@@ -4643,6 +4793,31 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                 )?;
 
                                 let task_kind = classify_task_execution_kind(&queued_task);
+                                let worktree = ensure_task_worktree(
+                                    &manifest.repo_path,
+                                    run_id,
+                                    &manifest.task_worktree_root,
+                                    &queued_task,
+                                    now,
+                                )?;
+                                runner_state.current_worktree = Some(worktree.clone());
+                                write_runner_state(&dir, &runner_state)?;
+                                manifest
+                                    .task_worktrees
+                                    .insert(queued_task.id.clone(), worktree.clone());
+                                write_json(&manifest_path, &manifest)?;
+                                append_event(
+                                    &dir,
+                                    "task_worktree_created",
+                                    serde_json::json!({
+                                        "task_id": queued_task.id,
+                                        "path": worktree.path,
+                                        "branch": worktree.branch,
+                                        "base_branch": worktree.base_branch,
+                                        "cleanup_policy": worktree.cleanup_policy,
+                                        "state": worktree.state,
+                                    }),
+                                )?;
                                 let backlog_snapshot = manifest
                                     .backlog_detector_file
                                     .as_deref()
@@ -4662,13 +4837,14 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                     cmd: &cmd,
                                     auto_check_on_success: manifest.auto_check_on_success,
                                     dry_run: false,
-                                    cwd: Some(&manifest.repo_path),
+                                    cwd: Some(&worktree.path),
                                     run_id: Some(run_id),
                                     thread_id: Some(&manifest.thread_id),
                                     channel: Some(&manifest.channel),
                                     task_agent_id: manifest.task_agent_id.as_deref(),
                                     task_kind: Some(task_kind),
                                     backlog_snapshot: backlog_snapshot.as_ref(),
+                                    worktree: Some(&worktree),
                                 })?;
 
                                 append_event(
@@ -4685,6 +4861,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                         "success": runner.success,
                                         "exit_code": runner.exit_code,
                                         "auto_check_on_success": manifest.auto_check_on_success,
+                                        "worktree": runner_state.current_worktree.clone(),
                                         "check_result": runner.check_result,
                                         "stdout": clip_text(&runner.stdout, 1000),
                                         "stderr": clip_text(&runner.stderr, 1000),
@@ -4937,6 +5114,8 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                         runner_state.last_task_reason =
                                             Some("runner success + auto-check".into());
                                         runner_state.last_task_pr_url = first_line_pr_url.clone();
+                                        runner_state.last_worktree =
+                                            runner_state.current_worktree.clone();
                                         track_task_pr_url(
                                             &mut runner_state,
                                             Some(task.id.as_str()),
@@ -4950,6 +5129,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                         clear_current_blocked_context(&mut runner_state);
                                         clear_current_waiting_dependency(&mut runner_state);
                                         runner_state.current_task_pr_url = None;
+                                        runner_state.current_worktree = None;
 
                                         task_done_now = task_checklist_done_count(&task_file_abs)?;
                                         task_loops_completed = task_done_now
@@ -5358,6 +5538,7 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
         "started_at": runner_state.current_task_started_at,
         "state": runner_state.current_task_state.clone(),
         "waiting_dependency": runner_state.current_waiting_dependency.clone(),
+        "worktree": runner_state.current_worktree.clone(),
         "blocked_reason": runner_state.current_task_blocked_reason.clone(),
         "blocked_context": runner_state.current_blocked_context.clone(),
         "pr_url": runner_state.current_task_pr_url.clone(),
@@ -5368,6 +5549,7 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
         "at": runner_state.last_task_at,
         "reason": runner_state.last_task_reason.clone(),
         "pr_url": runner_state.last_task_pr_url.clone(),
+        "worktree": runner_state.last_worktree.clone(),
     });
     let runner_view = serde_json::json!({
         "mode": runner_mode,
@@ -5376,6 +5558,8 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
         "auto_check_on_success": manifest.auto_check_on_success,
         "auto_recover_blocked": manifest.auto_recover_blocked,
         "auto_recover_blocked_max_attempts": manifest.auto_recover_blocked_max_attempts,
+        "task_worktree_root": manifest.task_worktree_root.clone(),
+        "task_worktrees": manifest.task_worktrees.clone(),
         "auto_recover_attempts": runner_state.auto_recover_attempts,
         "auto_recover_last_reason": runner_state.auto_recover_last_reason.clone(),
         "auto_recover_same_reason_count": runner_state.auto_recover_same_reason_count,
@@ -5395,6 +5579,7 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
         "current_task_started_at": runner_state.current_task_started_at,
         "current_task_state": runner_state.current_task_state.clone(),
         "current_waiting_dependency": runner_state.current_waiting_dependency.clone(),
+        "current_worktree": runner_state.current_worktree.clone(),
         "current_task_blocked_reason": runner_state.current_task_blocked_reason.clone(),
         "current_blocked_context": runner_state.current_blocked_context.clone(),
         "current_task_pr_url": runner_state.current_task_pr_url.clone(),
@@ -5405,6 +5590,7 @@ fn cmd_status(repo: PathBuf, run_id: Uuid) -> Result<()> {
         "last_blocked_context": runner_state.last_blocked_context.clone(),
         "last_task_pr_url": last_task_pr_url.clone(),
         "last_waiting_dependency": runner_state.last_waiting_dependency.clone(),
+        "last_worktree": runner_state.last_worktree.clone(),
         "current": runner_current_view,
         "last": runner_last_view,
         "paused": runner_state.paused,
@@ -6088,6 +6274,7 @@ fn cmd_task_run_once(
         task_agent_id: None,
         task_kind: None,
         backlog_snapshot: None,
+        worktree: None,
     })?;
 
     println!(
@@ -6156,6 +6343,7 @@ fn main() -> Result<()> {
             auto_recover_blocked_max_attempts,
             backlog_detector_file,
             backlog_detector_max_age_sec,
+            task_worktree_root,
         } => cmd_start(StartOptions {
             repo,
             session_key,
@@ -6180,6 +6368,7 @@ fn main() -> Result<()> {
             auto_recover_blocked_max_attempts,
             backlog_detector_file,
             backlog_detector_max_age_sec,
+            task_worktree_root,
         }),
         Commands::Daemon {
             repo,
@@ -6271,6 +6460,7 @@ mod tests {
     use crate::tasklist::write_task_approval;
     use chrono::{Duration, Utc};
     use std::{
+        collections::HashMap,
         fs,
         path::{Path, PathBuf},
     };
@@ -6353,6 +6543,8 @@ mod tests {
             auto_recover_blocked_max_attempts: 3,
             backlog_detector_file: None,
             backlog_detector_max_age_sec: 900,
+            task_worktree_root: PathBuf::from(".ralph/worktrees"),
+            task_worktrees: HashMap::new(),
         }
     }
 

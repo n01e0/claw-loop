@@ -10,6 +10,12 @@ if [[ ! -x "$BIN" ]]; then
 fi
 
 WORKDIR="$(mktemp -d)"
+git -C "$WORKDIR" init -q
+git -C "$WORKDIR" config user.email e2e-smoke@example.invalid
+git -C "$WORKDIR" config user.name e2e-smoke
+printf 'smoke\n' > "$WORKDIR/.gitkeep"
+git -C "$WORKDIR" add .gitkeep
+git -C "$WORKDIR" commit -q -m 'init smoke repo'
 cleanup() {
   pkill -f "claw-loopd.*--repo $WORKDIR" >/dev/null 2>&1 || true
   rm -rf "$WORKDIR" >/dev/null 2>&1 || true
