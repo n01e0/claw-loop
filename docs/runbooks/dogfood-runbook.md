@@ -180,7 +180,28 @@ CLAW_LOOPD_STUCK_WAIT_TICKS=10 cargo run -- start ...
 - `delivery-report` で failed/pending が許容範囲
 - 必要なら thread 通知（`task_blocked` / `task_waiting_stuck` 対応内容）を残す
 
-## 5) 開発時チェックリスト（PR前）
+## 5) APB smoke rollup（実小タスク）
+
+ACPX / runner-owned PR body / merge cleanup 系の dogfood は、実装差分が小さい
+タスクで次の観点を 1 本の rollup として確認する。
+
+- **PR body**: runner が生成した body file だけを `gh pr create --body-file` に渡し、
+  作成後の read-back validation が通る。本文は `Summary` / `Verification` /
+  `Notes` の成果物説明に限定し、worktree・runner・auto-merge・cleanup などの
+  実行報告語彙を含めない。
+- **auto merge**: PR が open の間は `TASK_WAITING_MERGE PR_URL=...` として保持し、
+  checks pending / merge queue / auto-merge disabled を runner/daemon state 側で分類する。
+  `TASK_DONE` は GitHub 上で merged が確認できた後だけ有効。
+- **cleanup**: merged 確認後、clean な disposable worktree だけを削除する。dirty / blocked /
+  debug 用 worktree は保持し、保持理由を status/events に残す。
+- **次 task 遷移**: cleanup または保持理由の記録後に current task を完了扱いにし、
+  backlog が残っている場合だけ次 task を選択する。PR body にはこの遷移ログを載せない。
+
+APB-12 の確認対象はこの docs-only 小タスク自体で、runner がこの branch を push した後に
+PR body 作成・auto merge 待ち・merge 後 cleanup・次 task 遷移を daemon 側で観測する。
+観測結果は PR body ではなく runner state / events / 通知に残す。
+
+## 6) 開発時チェックリスト（PR前）
 
 S3以降の標準確認手順:
 
