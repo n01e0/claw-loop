@@ -5471,7 +5471,7 @@ fn cmd_delivery_report(
         ));
     }
 
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.0));
     let items: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|(_, v)| v)
@@ -5496,7 +5496,7 @@ fn cmd_delivery_report(
         .max();
 
     let mut failed_for_hist: Vec<&DeadLetterEntry> = dead_letter_items.iter().collect();
-    failed_for_hist.sort_by(|a, b| b.moved_at.cmp(&a.moved_at));
+    failed_for_hist.sort_by_key(|dlq| std::cmp::Reverse(dlq.moved_at));
     if failed_window > 0 && failed_for_hist.len() > failed_window {
         failed_for_hist.truncate(failed_window);
     }
