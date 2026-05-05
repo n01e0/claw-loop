@@ -27,6 +27,7 @@ use tasklist::{
 use uuid::Uuid;
 
 mod notify_policy;
+mod pr_body;
 mod tasklist;
 
 #[derive(Parser, Debug)]
@@ -307,6 +308,7 @@ struct WaitingDependencyContext {
     contract_line: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 struct AcpxTaskPrMetadata {
     #[serde(default)]
@@ -321,6 +323,7 @@ struct AcpxTaskPrMetadata {
     auto_merge: Option<bool>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 struct AcpxTaskResult {
     summary: String,
@@ -333,6 +336,7 @@ struct AcpxTaskResult {
     pr: Option<AcpxTaskPrMetadata>,
 }
 
+#[allow(dead_code)]
 fn parse_acpx_task_result(stdout: &str) -> Result<Option<AcpxTaskResult>> {
     let marker = "ACPX_TASK_RESULT_JSON";
     let mut in_fence = false;
