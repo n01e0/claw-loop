@@ -869,6 +869,42 @@ fn ensure_task_worktree(
     })
 }
 
+fn cleanup_task_worktree_after_merge(
+    repo: &Path,
+    worktree: &TaskWorktreeRecord,
+    now: DateTime<Utc>,
+) -> Result<TaskWorktreeRecord> {
+    let mut updated = worktree.clone();
+    updated.cleanup_policy = TaskWorktreeCleanupPolicy::RemoveAfterMergeIfClean;
+
+    if !worktree.path.exists() {
+        updated.state = TaskWorktreeState::Removed;
+        updated.cleanup_reason = Some("worktree path already absent after PR merge".into());
+        return Ok(updated);
+    }
+
+    let status = git_output(&worktree.path, &["status", "--porcelain"])?;
+    if !status.trim().is_empty() {
+        updated.state = TaskWorktreeState::Retained;
+        updated.cleanup_reason = Some(format!(
+            "PR merged at {now}; worktree retained because it is dirty"
+        ));
+        return Ok(updated);
+    }
+
+    git_output(
+        repo,
+        &[
+            "worktree",
+            "remove",
+            worktree.path.to_string_lossy().as_ref(),
+        ],
+    )?;
+    updated.state = TaskWorktreeState::Removed;
+    updated.cleanup_reason = Some(format!("PR merged at {now}; clean worktree removed"));
+    Ok(updated)
+}
+
 fn require_tasklist_approval(
     task_file: &Path,
     approved_tasklist_hash: Option<&str>,
@@ -4334,6 +4370,23 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                     if let Some(pr_url) = runner_state.current_task_pr_url.clone() {
                                         match ensure_waiting_merge_progress(&pr_url) {
                                             Ok(WaitingMergeProgress::Merged) => {
+                                                let cleaned_worktree = if let Some(worktree) =
+                                                    runner_state.current_worktree.as_ref()
+                                                {
+                                                    let cleaned =
+                                                        cleanup_task_worktree_after_merge(
+                                                            &manifest.repo_path,
+                                                            worktree,
+                                                            now,
+                                                        )?;
+                                                    manifest
+                                                        .task_worktrees
+                                                        .insert(entry.id.clone(), cleaned.clone());
+                                                    write_json(&manifest_path, &manifest)?;
+                                                    Some(cleaned)
+                                                } else {
+                                                    None
+                                                };
                                                 let check_result = update_task_check(
                                                     &task_file_abs,
                                                     &entry.id,
@@ -4356,6 +4409,10 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                                     Some("PR merged while waiting_merge".into());
                                                 runner_state.last_task_pr_url =
                                                     Some(pr_url.clone());
+                                                runner_state.last_worktree = cleaned_worktree
+                                                    .or_else(|| {
+                                                        runner_state.current_worktree.clone()
+                                                    });
                                                 track_task_pr_url(
                                                     &mut runner_state,
                                                     Some(entry.id.as_str()),
@@ -4369,6 +4426,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                                 clear_current_blocked_context(&mut runner_state);
                                                 clear_current_waiting_dependency(&mut runner_state);
                                                 runner_state.current_task_pr_url = None;
+                                                runner_state.current_worktree = None;
 
                                                 append_event(
                                                     &dir,
@@ -4377,6 +4435,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                                         "task_id": entry.id,
                                                         "pr_url": pr_url,
                                                         "check_result": check_result,
+                                                        "worktree": runner_state.last_worktree,
                                                         "done": task_done_now,
                                                     }),
                                                 )?;
@@ -5171,14 +5230,31 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                             runner_state.current_task_started_at.as_ref(),
                                             now,
                                         );
+                                        let cleaned_worktree = if first_line_pr_url.is_some()
+                                            && let Some(worktree) =
+                                                runner_state.current_worktree.as_ref()
+                                        {
+                                            let cleaned = cleanup_task_worktree_after_merge(
+                                                &manifest.repo_path,
+                                                worktree,
+                                                now,
+                                            )?;
+                                            manifest
+                                                .task_worktrees
+                                                .insert(task.id.clone(), cleaned.clone());
+                                            write_json(&manifest_path, &manifest)?;
+                                            Some(cleaned)
+                                        } else {
+                                            None
+                                        };
                                         runner_state.last_task_id = Some(task.id.clone());
                                         runner_state.last_task_state = Some(RunnerTaskState::Done);
                                         runner_state.last_task_at = Some(now);
                                         runner_state.last_task_reason =
                                             Some("runner success + auto-check".into());
                                         runner_state.last_task_pr_url = first_line_pr_url.clone();
-                                        runner_state.last_worktree =
-                                            runner_state.current_worktree.clone();
+                                        runner_state.last_worktree = cleaned_worktree
+                                            .or_else(|| runner_state.current_worktree.clone());
                                         track_task_pr_url(
                                             &mut runner_state,
                                             Some(task.id.as_str()),
