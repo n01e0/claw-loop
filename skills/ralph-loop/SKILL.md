@@ -74,6 +74,14 @@ Never start without `thread_id` + `session_key`.
   - `claw-loopd stop --repo <repo> --run-id <run_id>`
   - `claw-loopd stop --repo <repo> --run-id <run_id> --immediate` (kill switch)
 
+
+## PR body / execution-report ownership
+- Treat the PR body as a **runner-owned artifact description**. The task agent should not create or edit the PR body during normal dogfood runs.
+- Normal task completion must emit `ACPX_TASK_RESULT_JSON` (`summary`, `verification`, optional `notes`, `pushed_branch`) after the required first-line `TASK_*` status so `scripts/rl-task-agent.sh` can build the body and call `gh pr create --body-file <runner-temp-file>`.
+- Only create the PR directly when the runner explicitly provides a generated body-file path and instructs the agent to use it.
+- Keep execution reports out of the PR body. Agent/session ids, worktree paths, runner prompts, cleanup details, and recovery chatter belong in notifications, runner state, and `events.jsonl`, not reviewer-facing PR text.
+- If a task is waiting on CI/merge or blocked, report that via the first-line `TASK_WAITING_*` / `TASK_BLOCKED` contract so daemon state and notifications carry the operational status.
+
 ## Notification contract (what arrives and when)
 Task-level notifications are single-channel from `scripts/rl-task-agent.sh`:
 - `🚀 <task> started`
