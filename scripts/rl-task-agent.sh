@@ -290,6 +290,38 @@ infer_gh_repo() {
   return 1
 }
 
+detect_pr_body_hazard() {
+  python3 - "$1" <<'PY'
+import pathlib, re, sys
+body = pathlib.Path(sys.argv[1]).read_text()
+terms = [
+    "TASK_DONE", "TASK_WAITING_MERGE", "TASK_WAITING_DEPENDENCY", "TASK_BLOCKED",
+    "auto-merge", "auto merge", "waiting for CI", "waiting on CI", "worktree",
+    "runner", "daemon", "agent session", "session id", "prompt file", "body file",
+    "temp file", "cleanup", "branch deletion", "I pushed", "I created a branch", "I opened the PR",
+]
+checks = []
+if "$##" in body:
+    checks.append("contains $##")
+if "\\n" in body:
+    checks.append("contains literal \\n")
+for line in body.splitlines():
+    if re.match(r"^\s*#+\s*[-*]\s", line) or re.match(r"^\s*[-*]\s*#+\s", line):
+        checks.append("contains broken heading")
+        break
+if sum(1 for line in body.splitlines() if line.strip().startswith("```")) % 2:
+    checks.append("contains unclosed code fence")
+lower = body.lower()
+for term in terms:
+    if term.lower() in lower:
+        checks.append(f"contains execution-report vocabulary: {term}")
+        break
+if checks:
+    print("; ".join(checks))
+    sys.exit(1)
+PY
+}
+
 resolve_gh_repo() {
   if [[ -n "${CLAW_GH_REPO:-}" ]]; then
     echo "$CLAW_GH_REPO"
@@ -300,6 +332,49 @@ resolve_gh_repo() {
     return 0
   fi
   return 1
+}
+
+validate_pr_body_readback() {
+  local pr_url="$1"
+  local body_file="$2"
+  local gh_repo="$3"
+  local actual expected hazard
+
+  expected="$(cat "$body_file")"
+  actual="$(gh pr view "$pr_url" --repo "$gh_repo" --json body --jq '.body // ""' 2>&1)" || {
+    echo "TASK_BLOCKED: gh pr view --json body failed error=$(clip_one_line "$actual")" >&2
+    return 2
+  }
+
+  local tmp_actual
+  if [[ "$actual" != "$expected" ]]; then
+    local edit_out
+    edit_out="$(gh pr edit "$pr_url" --repo "$gh_repo" --body-file "$body_file" 2>&1)" || {
+      echo "TASK_BLOCKED: PR body read-back mismatch and auto-fix failed for PR_URL=${pr_url} error=$(clip_one_line "$edit_out")" >&2
+      return 2
+    }
+    actual="$(gh pr view "$pr_url" --repo "$gh_repo" --json body --jq '.body // ""' 2>&1)" || {
+      echo "TASK_BLOCKED: gh pr view --json body after auto-fix failed error=$(clip_one_line "$actual")" >&2
+      return 2
+    }
+    if [[ "$actual" != "$expected" ]]; then
+      echo "TASK_BLOCKED: PR body read-back mismatch persisted after auto-fix for PR_URL=${pr_url}" >&2
+      return 2
+    fi
+  fi
+
+  tmp_actual="$(mktemp)"
+  trap 'rm -f -- "$tmp_actual"' RETURN
+  printf '%s' "$actual" > "$tmp_actual"
+  if hazard="$(detect_pr_body_hazard "$tmp_actual" 2>&1)"; then
+    rm -f -- "$tmp_actual"
+    trap - RETURN
+  else
+    rm -f -- "$tmp_actual"
+    trap - RETURN
+    echo "TASK_BLOCKED: PR body read-back validation failed for PR_URL=${pr_url}: $(clip_one_line "$hazard")" >&2
+    return 2
+  fi
 }
 
 create_runner_owned_pr() {
@@ -392,6 +467,7 @@ PY
     echo "TASK_BLOCKED: gh pr create did not return a PR URL" >&2
     return 2
   fi
+  validate_pr_body_readback "$pr_url" "$body_file" "$gh_repo" || return 2
   printf '%s\n' "$pr_url"
 }
 
