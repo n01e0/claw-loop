@@ -531,6 +531,36 @@ pr_exists() {
 AUTO_MERGE_LAST_ERROR=""
 AUTO_MERGE_MODE="auto"
 MANUAL_MERGE_LAST_ERROR=""
+WAITING_PR_BLOCK_CLASS=""
+WAITING_PR_BLOCK_REASON=""
+
+pr_merge_state_status() {
+  local pr_url="$1"
+  if [[ -z "$pr_url" ]]; then
+    return 0
+  fi
+  local gh_repo
+  gh_repo="$(resolve_gh_repo || true)"
+  if [[ -z "$gh_repo" ]]; then
+    return 0
+  fi
+  gh pr view "$pr_url" --repo "$gh_repo" --json mergeStateStatus --jq '.mergeStateStatus // ""' 2>/dev/null || true
+}
+
+classify_merge_repair_block() {
+  local reason="$1"
+  local lowered
+  lowered="$(printf '%s' "$reason" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$lowered" == *"ci failed"* || "$lowered" == *"checks="* || "$lowered" == *"failure"* || "$lowered" == *"timed_out"* || "$lowered" == *"cancelled"* || "$lowered" == *"action_required"* || "$lowered" == *"startup_failure"* ]]; then
+    echo "ci_failure"
+  elif [[ "$lowered" == *"dirty"* || "$lowered" == *"merge conflict"* || "$lowered" == *"conflict"* ]]; then
+    echo "conflict"
+  elif [[ "$lowered" == *"manual merge failed"* || "$lowered" == *"auto-merge enable failed"* || "$lowered" == *"auto merge"* || "$lowered" == *"not mergeable"* || "$lowered" == *"merge failed"* ]]; then
+    echo "non_mergeable"
+  else
+    echo "unknown_merge_block"
+  fi
+}
 
 is_auto_merge_unavailable_error() {
   local lowered
@@ -682,10 +712,14 @@ manual_merge_pr() {
 
 handle_waiting_pr() {
   local pr_url="$1"
+  WAITING_PR_BLOCK_CLASS=""
+  WAITING_PR_BLOCK_REASON=""
 
   if ! enable_pr_auto_merge "$pr_url"; then
     local err
     err="${AUTO_MERGE_LAST_ERROR:-unknown auto-merge error}"
+    WAITING_PR_BLOCK_REASON="auto-merge enable failed for PR_URL=${pr_url} error=${err}"
+    WAITING_PR_BLOCK_CLASS="$(classify_merge_repair_block "$WAITING_PR_BLOCK_REASON")"
     echo "TASK_BLOCKED: auto-merge enable failed for PR_URL=${pr_url} error=${err}" >&2
     return 2
   fi
@@ -698,7 +732,18 @@ handle_waiting_pr() {
   local failed_checks
   failed_checks="$(pr_failed_checks_csv "$pr_url")"
   if [[ -n "$failed_checks" ]]; then
+    WAITING_PR_BLOCK_REASON="CI failed for PR_URL=${pr_url} checks=${failed_checks}"
+    WAITING_PR_BLOCK_CLASS="$(classify_merge_repair_block "$WAITING_PR_BLOCK_REASON")"
     echo "TASK_BLOCKED: CI failed for PR_URL=${pr_url} checks=${failed_checks}" >&2
+    return 2
+  fi
+
+  local merge_state_status
+  merge_state_status="$(pr_merge_state_status "$pr_url")"
+  if [[ "$merge_state_status" == "DIRTY" ]]; then
+    WAITING_PR_BLOCK_REASON="merge state is DIRTY for PR_URL=${pr_url}; branch has merge conflicts or cannot be cleanly merged"
+    WAITING_PR_BLOCK_CLASS="conflict"
+    echo "TASK_BLOCKED: ${WAITING_PR_BLOCK_REASON}" >&2
     return 2
   fi
 
@@ -710,6 +755,8 @@ handle_waiting_pr() {
       if ! manual_merge_pr "$pr_url"; then
         local err
         err="${MANUAL_MERGE_LAST_ERROR:-unknown manual merge error}"
+        WAITING_PR_BLOCK_REASON="manual merge failed for PR_URL=${pr_url} error=${err}"
+        WAITING_PR_BLOCK_CLASS="$(classify_merge_repair_block "$WAITING_PR_BLOCK_REASON")"
         echo "TASK_BLOCKED: manual merge failed for PR_URL=${pr_url} error=${err}" >&2
         return 2
       fi
@@ -853,12 +900,27 @@ PY
   echo "required status checks are not enforced on ${gh_repo}#${base_branch}; merges may bypass CI"
 }
 
+WAITING_PR_REPAIR_PROMPT=""
 if [[ -f "$state_file" ]]; then
   # shellcheck disable=SC1090
   source "$state_file"
   if [[ -n "${PR_URL:-}" ]]; then
-    handle_waiting_pr "$PR_URL"
-    exit $?
+    waiting_tmp="$(mktemp)"
+    set +e
+    handle_waiting_pr "$PR_URL" >"$waiting_tmp" 2>&1
+    waiting_rc=$?
+    set -e
+    waiting_out="$(cat "$waiting_tmp")"
+    rm -f "$waiting_tmp"
+    if [[ "$waiting_rc" -ne 2 ]]; then
+      printf '%s\n' "$waiting_out"
+      exit "$waiting_rc"
+    fi
+    WAITING_PR_REPAIR_PROMPT+=$'\n\n'
+    WAITING_PR_REPAIR_PROMPT+="Repair context for existing PR: ${PR_URL}"$'\n'
+    WAITING_PR_REPAIR_PROMPT+="Merge blocker class: ${WAITING_PR_BLOCK_CLASS:-unknown_merge_block}"$'\n'
+    WAITING_PR_REPAIR_PROMPT+="Merge blocker detail: ${WAITING_PR_BLOCK_REASON:-$(clip_one_line "$waiting_out")}"$'\n'
+    WAITING_PR_REPAIR_PROMPT+="You are running in the same worktree and ACPX session that produced this PR. Fix this existing branch/PR in place, commit and push follow-up changes to the same branch, then return TASK_WAITING_MERGE PR_URL=${PR_URL} (or TASK_DONE if it is already merged). Do not create a new PR."$'\n'
   fi
 fi
 
@@ -912,6 +974,9 @@ PROMPT+="Task file: ${CLAW_TASK_FILE:-}"$'\n'
 PROMPT+="Run ID: ${run_id}"$'\n'
 if [[ -n "${CLAW_TASK_KIND:-}" ]]; then
   PROMPT+="Task kind: ${CLAW_TASK_KIND}"$'\n'
+fi
+if [[ -n "$WAITING_PR_REPAIR_PROMPT" ]]; then
+  PROMPT+="$WAITING_PR_REPAIR_PROMPT"
 fi
 if [[ -n "${CLAW_BACKLOG_STATUS:-}" ]]; then
   PROMPT+="Backlog detector status: ${CLAW_BACKLOG_STATUS}"$'\n'
