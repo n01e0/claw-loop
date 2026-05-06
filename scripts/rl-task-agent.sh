@@ -11,6 +11,8 @@ run_id="${CLAW_RUN_ID:-local}"
 agent_id="${CLAW_AGENT_ID:-main}"
 agent_session_id="rl-${run_id}-${CLAW_TASK_ID}"
 agent_timeout_sec="${CLAW_AGENT_TIMEOUT_SEC:-1800}"
+task_runner_backend="${CLAW_TASK_RUNNER_BACKEND:-${CLAW_TASK_BACKEND:-openclaw-agent}}"
+acpx_permission_mode="${CLAW_ACPX_PERMISSION_MODE:-approve-all}"
 
 state_root="${repo_path}/.ralph/runner-agent-state/${run_id}"
 mkdir -p "$state_root"
@@ -140,8 +142,7 @@ PY
 }
 
 get_first_line() {
-  printf '%s
-' "$1" | awk '
+  printf '%s\n' "$1" | awk '
     {
       sub(/\r$/, "")
       if (first_nonempty == "" && $0 ~ /[^[:space:]]/) {
@@ -995,33 +996,114 @@ if [[ -n "${CLAW_BACKLOG_STATUS:-}" ]]; then
   fi
 fi
 
+resolve_acpx_bin() {
+  if [[ -n "${CLAW_ACPX_BIN:-}" ]]; then
+    if [[ -x "${CLAW_ACPX_BIN}" ]]; then
+      printf '%s\n' "${CLAW_ACPX_BIN}"
+      return 0
+    fi
+    echo "configured CLAW_ACPX_BIN is not executable: ${CLAW_ACPX_BIN}" >&2
+    return 1
+  fi
+
+  local candidate
+  for candidate in \
+    "${repo_path}/node_modules/.bin/acpx" \
+    "${OPENCLAW_HOME:-$HOME/.openclaw}/extensions/acpx/node_modules/.bin/acpx" \
+    "${OPENCLAW_HOME:-$HOME/.openclaw}/extensions/node_modules/.bin/acpx" \
+    "$HOME/.npm-global/lib/node_modules/openclaw/dist/extensions/acpx/node_modules/.bin/acpx"
+  do
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  command -v acpx 2>/dev/null || {
+    echo "acpx binary not found" >&2
+    return 1
+  }
+}
+
+acpx_permission_arg() {
+  case "$1" in
+    approve-all|approve-reads|deny-all)
+      printf '%s\n' "--$1"
+      ;;
+    *)
+      echo "invalid ACPX permission mode: $1 (expected approve-all, approve-reads, or deny-all)" >&2
+      return 1
+      ;;
+  esac
+}
+
 task_file_hash_before=""
 if [[ -n "${CLAW_TASK_FILE:-}" && -f "${CLAW_TASK_FILE}" ]]; then
   task_file_hash_before="$(task_plan_hash "${CLAW_TASK_FILE}")"
 fi
 
-set +e
-raw_out="$(openclaw agent --local --agent "$agent_id" --session-id "$agent_session_id" --timeout "$agent_timeout_sec" --message "$PROMPT" --json 2>&1)"
-rc=$?
-set -e
+case "$task_runner_backend" in
+  openclaw-agent)
+    set +e
+    raw_out="$(openclaw agent --local --agent "$agent_id" --session-id "$agent_session_id" --timeout "$agent_timeout_sec" --message "$PROMPT" --json 2>&1)"
+    rc=$?
+    set -e
+    ;;
+  acpx-codex)
+    acpx_bin="$(resolve_acpx_bin)" || { echo "TASK_BLOCKED: acpx binary unavailable" >&2; exit 2; }
+    acpx_perm_arg="$(acpx_permission_arg "$acpx_permission_mode")" || { echo "TASK_BLOCKED: invalid acpx permission mode" >&2; exit 2; }
+    safe_task_id="${CLAW_TASK_ID//[^A-Za-z0-9_.-]/_}"
+    prompt_file="$(mktemp "${state_root}/prompt-${safe_task_id}.XXXXXX")"
+    printf '%s\n' "$PROMPT" >"$prompt_file"
+
+    set +e
+    ensure_out="$("$acpx_bin" --cwd "$repo_path" "$acpx_perm_arg" --format json codex sessions ensure --name "$agent_session_id" 2>&1)"
+    ensure_rc=$?
+    if [[ "$ensure_rc" -eq 0 ]]; then
+      raw_out="$("$acpx_bin" --cwd "$repo_path" "$acpx_perm_arg" --non-interactive-permissions deny --format quiet --timeout "$agent_timeout_sec" codex -s "$agent_session_id" --file "$prompt_file" 2>&1)"
+      rc=$?
+    else
+      raw_out="$ensure_out"
+      rc=$ensure_rc
+    fi
+    set -e
+    rm -f "$prompt_file"
+
+    if [[ "$ensure_rc" -ne 0 ]]; then
+      echo "TASK_BLOCKED: acpx codex session ensure failed (rc=$ensure_rc)" >&2
+      printf '%s\n' "$ensure_out" >&2
+      exit 2
+    fi
+    ;;
+  *)
+    echo "TASK_BLOCKED: unsupported task runner backend: ${task_runner_backend}" >&2
+    exit 2
+    ;;
+esac
 
 if [[ "$rc" -ne 0 ]]; then
-  if printf '%s' "$raw_out" | grep -qi "session file locked"; then
-    echo "TASK_WAITING_AGENT_LOCK"
-    exit 10
-  fi
-  session_signal="$(session_signal_for_failure "$agent_session_id" "$agent_id" || true)"
-  if [[ "$session_signal" == TASK_DONE* || "$session_signal" == TASK_WAITING_MERGE* || "$session_signal" == TASK_WAITING_DEPENDENCY* || "$session_signal" == TASK_WAITING_AGENT_LOCK* || "$session_signal" == TASK_BLOCKED* ]]; then
-    raw_out="$session_signal"
-  elif is_retryable_session_signal "$session_signal"; then
-    echo "TASK_WAITING_DEPENDENCY: subagent request timed out for ${agent_session_id}; retry task"
-    exit 10
-  else
-    echo "TASK_BLOCKED: openclaw agent command failed (rc=$rc)" >&2
-    printf '%s\n' "$raw_out" >&2
-    if [[ -n "$session_signal" ]]; then
-      printf '%s\n' "$session_signal" >&2
+  if [[ "$task_runner_backend" == "openclaw-agent" ]]; then
+    if printf '%s' "$raw_out" | grep -qi "session file locked"; then
+      echo "TASK_WAITING_AGENT_LOCK"
+      exit 10
     fi
+    session_signal="$(session_signal_for_failure "$agent_session_id" "$agent_id" || true)"
+    if [[ "$session_signal" == TASK_DONE* || "$session_signal" == TASK_WAITING_MERGE* || "$session_signal" == TASK_WAITING_DEPENDENCY* || "$session_signal" == TASK_WAITING_AGENT_LOCK* || "$session_signal" == TASK_BLOCKED* ]]; then
+      raw_out="$session_signal"
+    elif is_retryable_session_signal "$session_signal"; then
+      echo "TASK_WAITING_DEPENDENCY: subagent request timed out for ${agent_session_id}; retry task"
+      exit 10
+    else
+      echo "TASK_BLOCKED: openclaw agent command failed (rc=$rc)" >&2
+      printf '%s\n' "$raw_out" >&2
+      if [[ -n "$session_signal" ]]; then
+        printf '%s\n' "$session_signal" >&2
+      fi
+      exit 2
+    fi
+  else
+    echo "TASK_BLOCKED: acpx codex prompt failed (rc=$rc)" >&2
+    printf '%s\n' "$raw_out" >&2
     exit 2
   fi
 fi
@@ -1040,7 +1122,11 @@ if [[ -z "$text" ]]; then
     echo "TASK_WAITING_DEPENDENCY: subagent request timed out for ${agent_session_id}; retry task"
     exit 10
   else
-    echo "TASK_BLOCKED: openclaw agent returned no assistant text for ${agent_session_id}" >&2
+    if [[ "$task_runner_backend" == "acpx-codex" ]]; then
+      echo "TASK_BLOCKED: acpx codex returned no assistant text for ${agent_session_id}" >&2
+    else
+      echo "TASK_BLOCKED: openclaw agent returned no assistant text for ${agent_session_id}" >&2
+    fi
     exit 2
   fi
 fi

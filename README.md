@@ -51,6 +51,7 @@ cargo run -- start \
   --deliver-openclaw \
   --max-task-loops 10 \
   --task-runner-cmd './scripts/rl-task-agent.sh' \
+  --task-runner-backend acpx-codex \
   --require-task-approval \
   --approved-tasklist-hash <approved_tasklist_hash> \
   --auto-recover-blocked \
@@ -64,9 +65,9 @@ If you pass `--require-task-approval`, start will fail if:
 - approval markers are missing
 - `--approved-tasklist-hash` is missing
 - current task plan hash does not match the approved hash
-- `--task-agent-id` creation/check fails before daemon start
+- `--task-agent-id` creation/check fails before daemon start when `--task-runner-backend openclaw-agent` is selected
 
-If `--task-agent-id` does not exist yet, `claw-loopd start` now auto-creates it with `openclaw agents add --workspace <repo>` before spawning the daemon.
+If `--task-agent-id` does not exist yet, `claw-loopd start` auto-creates it with `openclaw agents add --workspace <repo>` before spawning the daemon for the legacy `openclaw-agent` backend. The `acpx-codex` backend does not create OpenClaw agents or sessions.
 
 ### 4) Inspect status
 
@@ -90,6 +91,7 @@ cargo run -- stop --repo . --run-id <run_id> --immediate
 
 - One task at a time from a markdown checklist (`--task-file`)
 - Runner command (`--task-runner-cmd`) receives task context env vars
+- Runner backend (`--task-runner-backend`) is explicit: `acpx-codex` uses ACPX/Codex with `--approve-all` by default; `openclaw-agent` keeps the legacy OpenClaw agent path
 - Daemon ticks periodically (`--tick-sec`) and records every transition
 - Start is not gated by tasklist approval unless you explicitly pass `--require-task-approval` together with `--approved-tasklist-hash`
 

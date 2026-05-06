@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, Utc};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(test)]
 use notify_policy::delivery_retry_backoff_sec;
 use notify_policy::{
@@ -36,6 +36,18 @@ mod tasklist;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+#[clap(rename_all = "kebab-case")]
+enum TaskRunnerBackend {
+    OpenclawAgent,
+    AcpxCodex,
+}
+
+fn default_task_runner_backend() -> TaskRunnerBackend {
+    TaskRunnerBackend::OpenclawAgent
 }
 
 #[derive(Subcommand, Debug)]
@@ -74,6 +86,8 @@ enum Commands {
         task_file: PathBuf,
         #[arg(long)]
         task_runner_cmd: Option<String>,
+        #[arg(long, value_enum, default_value = "openclaw-agent")]
+        task_runner_backend: TaskRunnerBackend,
         #[arg(long)]
         approved_tasklist_hash: Option<String>,
         #[arg(long, default_value_t = false)]
@@ -229,6 +243,8 @@ struct Manifest {
     task_done_baseline: u64,
     #[serde(default)]
     task_runner_cmd: Option<String>,
+    #[serde(default = "default_task_runner_backend")]
+    task_runner_backend: TaskRunnerBackend,
     approved_tasklist_hash: String,
     approved_by: String,
     approved_at: DateTime<Utc>,
@@ -732,6 +748,7 @@ struct StartOptions {
     max_task_loops: u64,
     task_file: PathBuf,
     task_runner_cmd: Option<String>,
+    task_runner_backend: TaskRunnerBackend,
     approved_tasklist_hash: Option<String>,
     require_task_approval: bool,
     auto_check_on_success: bool,
@@ -1550,6 +1567,7 @@ struct TaskRunOptions<'a> {
     thread_id: Option<&'a str>,
     channel: Option<&'a str>,
     task_agent_id: Option<&'a str>,
+    task_runner_backend: TaskRunnerBackend,
     task_kind: Option<TaskExecutionKind>,
     backlog_snapshot: Option<&'a BacklogSnapshot>,
     worktree: Option<&'a TaskWorktreeRecord>,
@@ -3322,6 +3340,13 @@ fn run_task_once(opts: TaskRunOptions<'_>) -> Result<TaskRunOutcome> {
     if let Some(channel) = opts.channel {
         command.env("CLAW_CHANNEL", channel);
     }
+    command.env(
+        "CLAW_TASK_RUNNER_BACKEND",
+        match opts.task_runner_backend {
+            TaskRunnerBackend::OpenclawAgent => "openclaw-agent",
+            TaskRunnerBackend::AcpxCodex => "acpx-codex",
+        },
+    );
     if let Some(task_agent_id) = opts.task_agent_id {
         command.env("CLAW_AGENT_ID", task_agent_id);
     }
@@ -4128,7 +4153,9 @@ fn reduce_pr_tracking(run_dir: &Path, manifest: &Manifest, state: &mut State) ->
 }
 
 fn cmd_start(opts: StartOptions) -> Result<()> {
-    if let Some(task_agent_id) = opts.task_agent_id.as_deref() {
+    if opts.task_runner_backend == TaskRunnerBackend::OpenclawAgent
+        && let Some(task_agent_id) = opts.task_agent_id.as_deref()
+    {
         ensure_task_agent_exists(task_agent_id, &opts.repo)
             .with_context(|| format!("ensure task agent exists before start: {task_agent_id}"))?;
     }
@@ -4188,6 +4215,7 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
         task_file,
         task_done_baseline,
         task_runner_cmd: opts.task_runner_cmd,
+        task_runner_backend: opts.task_runner_backend,
         approved_tasklist_hash,
         approved_by: approval.approved_by,
         approved_at: approval.approved_at,
@@ -4994,6 +5022,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                     thread_id: Some(&manifest.thread_id),
                                     channel: Some(&manifest.channel),
                                     task_agent_id: manifest.task_agent_id.as_deref(),
+                                    task_runner_backend: manifest.task_runner_backend,
                                     task_kind: Some(task_kind),
                                     backlog_snapshot: backlog_snapshot.as_ref(),
                                     worktree: Some(&worktree),
@@ -6438,6 +6467,7 @@ fn cmd_task_run_once(
         thread_id: None,
         channel: None,
         task_agent_id: None,
+        task_runner_backend: TaskRunnerBackend::OpenclawAgent,
         task_kind: None,
         backlog_snapshot: None,
         worktree: None,
@@ -6502,6 +6532,7 @@ fn main() -> Result<()> {
             max_task_loops,
             task_file,
             task_runner_cmd,
+            task_runner_backend,
             approved_tasklist_hash,
             require_task_approval,
             auto_check_on_success,
@@ -6527,6 +6558,7 @@ fn main() -> Result<()> {
             max_task_loops,
             task_file,
             task_runner_cmd,
+            task_runner_backend,
             approved_tasklist_hash,
             require_task_approval,
             auto_check_on_success,
@@ -6599,7 +6631,7 @@ mod tests {
         BacklogSnapshot, BlockedContext, BlockedContextSource, DeadLetterEntry, DeliveryAck,
         DeliveryAttempt, DispatchedNotification, GhPrView, GhStatusCheck, LoopStatus, Manifest,
         Notification, NotificationDeliveryMode, RecoveryTaskSnapshot, RunnerState, RunnerTaskState,
-        State, TaskChecklistEntry, TaskExecutionKind, TaskSelectionOutcome,
+        State, TaskChecklistEntry, TaskExecutionKind, TaskRunnerBackend, TaskSelectionOutcome,
         TaskWorktreeCleanupPolicy, TaskWorktreeRecord, TaskWorktreeState, WaitingContract,
         WaitingDependencyContext, WaitingDependencyProgress, WaitingMergeProgress,
         ack_retry_policy, append_jsonl, apply_status_establish_retry_override,
@@ -7035,6 +7067,7 @@ exit 1
             task_file: PathBuf::from("docs/roadmaps/ack-integration-tasklist.md"),
             task_done_baseline: 0,
             task_runner_cmd: None,
+            task_runner_backend: TaskRunnerBackend::OpenclawAgent,
             approved_tasklist_hash: "test-approved-hash".to_string(),
             approved_by: "test-approver".to_string(),
             approved_at: Utc::now(),

@@ -60,6 +60,11 @@ acpx --cwd <repo> --format quiet --timeout <seconds> codex -s <session-name> --f
 
 Important global options:
 
+- `--approve-all` is passed for `acpx-codex` runner calls by default. This is
+  required for non-interactive dogfood tasks so Codex edit/write requests do not
+  fail as permission prompts. Operators may override the mode with
+  `CLAW_ACPX_PERMISSION_MODE=approve-reads|deny-all` only when they explicitly
+  want fail-closed permission blocking.
 - `--cwd <dir>` sets the working directory used for session scope and client
   filesystem/terminal handling.
 - `--format <text|json|quiet>` controls output mode.
@@ -76,7 +81,7 @@ Persistent prompt mode requires an existing saved session record. Create or
 ensure that record before the task prompt:
 
 ```bash
-acpx --cwd <repo> --format json codex sessions ensure --name <session-name>
+acpx --cwd <repo> --approve-all --format json codex sessions ensure --name <session-name>
 ```
 
 Observed semantics:
@@ -109,8 +114,8 @@ plugin-local pinned ACPX before implementation tests assert exact fields.
 Persistent prompt uses the saved session:
 
 ```bash
-acpx --cwd <repo> --format quiet --timeout <seconds> codex \
-  -s <session-name> --file <prompt-file>
+acpx --cwd <repo> --approve-all --non-interactive-permissions deny \
+  --format quiet --timeout <seconds> codex -s <session-name> --file <prompt-file>
 ```
 
 Equivalent explicit form:
@@ -540,7 +545,7 @@ New behavior:
 - Ensures session:
 
 ```bash
-acpx --cwd <repo> --format json codex sessions ensure --name <session-name>
+acpx --cwd <repo> --approve-all --format json codex sessions ensure --name <session-name>
 ```
 
 - Writes prompt to a runner-owned prompt file under `.ralph/runs/<run-id>/` or
@@ -548,8 +553,8 @@ acpx --cwd <repo> --format json codex sessions ensure --name <session-name>
 - Runs persistent prompt:
 
 ```bash
-acpx --cwd <repo> --format quiet --timeout <seconds> codex \
-  -s <session-name> --file <prompt-file>
+acpx --cwd <repo> --approve-all --non-interactive-permissions deny \
+  --format quiet --timeout <seconds> codex -s <session-name> --file <prompt-file>
 ```
 
 - Extracts the contract from final assistant text.
