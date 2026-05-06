@@ -1643,6 +1643,59 @@ if [[ "$FIRST15B" != "TASK_DONE PR_URL=https://github.com/demo/repo/pull/315b" ]
   exit 1
 fi
 
+echo "[e2e-smoke] case15ba rl-task-agent acpx-codex backend uses approve-all and avoids openclaw agent"
+OPENCLAW_MARKER15BA="$WORKDIR/.ralph/case15ba-openclaw-called"
+rm -f "$OPENCLAW_MARKER15BA"
+cat > "$RUNNER_MOCKDIR/acpx" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" != *"--approve-all"* ]]; then
+  echo "missing --approve-all: $*" >&2
+  exit 1
+fi
+if [[ "$*" == *"sessions ensure"* ]]; then
+  echo '{"acpxRecordId":"mock-record"}'
+  exit 0
+fi
+if [[ "$*" == *"codex -s"* && "$*" == *"--file"* ]]; then
+  if [[ "$*" != *"--non-interactive-permissions deny"* ]]; then
+    echo "missing fail-closed non-interactive policy: $*" >&2
+    exit 1
+  fi
+  echo 'TASK_DONE PR_URL=https://github.com/demo/repo/pull/315ba'
+  echo 'summary from acpx codex backend'
+  exit 0
+fi
+echo "unsupported mock acpx args: $*" >&2
+exit 1
+EOF
+chmod +x "$RUNNER_MOCKDIR/acpx"
+cat > "$RUNNER_MOCKDIR/openclaw" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+: > "${OPENCLAW_MARKER15BA:?}"
+echo "openclaw should not be called for acpx-codex backend" >&2
+exit 1
+EOF
+chmod +x "$RUNNER_MOCKDIR/openclaw"
+
+TASKFILE15BA="$WORKDIR/docs/roadmaps/s5-case15ba-tasklist.md"
+mkdir -p "$(dirname "$TASKFILE15BA")"
+cat > "$TASKFILE15BA" <<'EOF'
+- [ ] S5X-15BA: acpx codex backend approve all
+EOF
+
+OUT15BA="$(PATH="$RUNNER_MOCKDIR:$PATH" CLAW_ACPX_BIN="$RUNNER_MOCKDIR/acpx" OPENCLAW_MARKER15BA="$OPENCLAW_MARKER15BA" CLAW_TASK_RUNNER_BACKEND="acpx-codex" CLAW_TASK_ID="S5X-15BA" CLAW_TASK_TEXT="acpx codex backend approve all" CLAW_TASK_FILE="$TASKFILE15BA" CLAW_RUN_ID="run15ba" bash ./scripts/rl-task-agent.sh)"
+FIRST15BA="$(printf '%s\n' "$OUT15BA" | awk 'NF { print; exit }')"
+if [[ "$FIRST15BA" != "TASK_DONE PR_URL=https://github.com/demo/repo/pull/315ba" ]]; then
+  echo "[e2e-smoke] expected case15ba TASK_DONE first line"
+  printf '%s\n' "$OUT15BA"
+  exit 1
+fi
+if [[ -f "$OPENCLAW_MARKER15BA" ]]; then
+  echo "[e2e-smoke] acpx-codex backend should not call openclaw agent"
+  exit 1
+fi
 echo "[e2e-smoke] case15bb rl-task-agent blocks feature tasks while backlog gate is active"
 BACKLOG_GUARD_MARKER="$WORKDIR/.ralph/case15bb-openclaw-called"
 rm -f "$BACKLOG_GUARD_MARKER"

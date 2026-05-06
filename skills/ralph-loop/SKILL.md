@@ -16,8 +16,9 @@ Collect all of these before start:
 - safety guard (`--max-task-loops` / `--max-ticks`), with `max_task_loops` defaulting to `10`
 - `--max-runtime-sec` only when needed (omit for long pause-oriented operation)
 - dogfood runner command (`--task-runner-cmd`), monitor-only when omitted
+- dogfood runner backend (`--task-runner-backend acpx-codex` preferred; `openclaw-agent` is legacy compatibility)
 - recommended runner: `scripts/rl-task-agent.sh` (PR creation → auto-merge preferred → merge confirmation; if repo auto-merge is unavailable, daemon keeps watching CI and squash-merges after green; auto-merge/CI failures during initial run and `waiting_merge` recheck are fail-closed as blocked for auto-recovery; missing required checks policy is surfaced as waiting warning)
-- `--task-agent-id <agent_id>` (dedicated loop agent; split per loop for parallel operation; `claw-loopd start` auto-creates it if missing)
+- `--task-agent-id <agent_id>` only for `openclaw-agent`; omit it for `acpx-codex` because that backend must not create OpenClaw agents/sessions
 - approved tasklist gate:
   - `claw-loopd task-approve --file <task_file> --approved-by <name>`
   - `--approved-tasklist-hash <hash>` is required on `start`
@@ -41,15 +42,15 @@ Never start without `thread_id` + `session_key`.
 2. Resolve requester id from inbound metadata:
    - use current message `sender_id` as `<discord_user_id>`
 3. Resolve loop agent id:
-   - use project-specific agent id (e.g., `loop-worker-<project>`)
-   - if it is missing locally, `claw-loopd start` will create it before the run starts; if creation fails, start must fail immediately instead of letting the first task crash
+   - for `acpx-codex`, omit `--task-agent-id`; ACPX session name is derived from run/task ids and the runner passes `--approve-all` by default
+   - for legacy `openclaw-agent`, use a project-specific agent id (e.g., `loop-worker-<project>`); if it is missing locally, `claw-loopd start` will create it before the run starts
 4. Resolve aggregation target:
    - use main control thread id as `<feedback_thread_id>`
 5. Stamp and hash the approved tasklist:
    - `claw-loopd task-approve --file <task_file> --approved-by <name>`
    - capture `approved_tasklist_hash` from JSON output
 6. Start daemon:
-   - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --requester-user-id <discord_user_id> --task-agent-id <agent_id> --feedback-thread-id <feedback_thread_id> --feedback-channel discord --tick-sec 60 --deliver-openclaw --max-task-loops 10 --task-runner-cmd './scripts/rl-task-agent.sh' --auto-recover-blocked --auto-recover-blocked-max-attempts 3
+   - `claw-loopd start --repo <repo> --session-key <session_key> --channel discord --thread-id <thread_id> --requester-user-id <discord_user_id> --feedback-thread-id <feedback_thread_id> --feedback-channel discord --tick-sec 60 --deliver-openclaw --max-task-loops 10 --task-runner-cmd './scripts/rl-task-agent.sh' --task-runner-backend acpx-codex --auto-recover-blocked --auto-recover-blocked-max-attempts 3
    - add `--require-task-approval --approved-tasklist-hash <hash>` only when you explicitly want the stricter approval gate`
    - default: auto-check and continue on runner success (`--auto-check-on-success=true`)
    - with `--auto-check-on-success=false`, run in completion-gated mode (do not start the next task until the active task is checked complete)
