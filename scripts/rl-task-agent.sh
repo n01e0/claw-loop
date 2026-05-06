@@ -605,10 +605,11 @@ enable_pr_auto_merge() {
   fi
 
   local merge_out merge_rc
-  set +e
-  merge_out="$(gh pr merge "$pr_url" --repo "$gh_repo" --auto --squash --delete-branch 2>&1)"
-  merge_rc=$?
-  set -e
+  if merge_out="$(gh pr merge "$pr_url" --repo "$gh_repo" --auto --squash --delete-branch 2>&1)"; then
+    merge_rc=0
+  else
+    merge_rc=$?
+  fi
   if [[ "$merge_rc" -ne 0 ]]; then
     AUTO_MERGE_LAST_ERROR="$(clip_one_line "$merge_out")"
     if is_auto_merge_unavailable_error "$AUTO_MERGE_LAST_ERROR"; then
@@ -698,10 +699,11 @@ manual_merge_pr() {
   fi
 
   local merge_out merge_rc
-  set +e
-  merge_out="$(gh pr merge "$pr_url" --repo "$gh_repo" --squash --delete-branch 2>&1)"
-  merge_rc=$?
-  set -e
+  if merge_out="$(gh pr merge "$pr_url" --repo "$gh_repo" --squash --delete-branch 2>&1)"; then
+    merge_rc=0
+  else
+    merge_rc=$?
+  fi
   if [[ "$merge_rc" -ne 0 ]]; then
     MANUAL_MERGE_LAST_ERROR="$(clip_one_line "$merge_out")"
     return 1
@@ -915,6 +917,11 @@ if [[ -f "$state_file" ]]; then
     if [[ "$waiting_rc" -ne 2 ]]; then
       printf '%s\n' "$waiting_out"
       exit "$waiting_rc"
+    fi
+    waiting_block_reason_lc="$(printf '%s' "${WAITING_PR_BLOCK_REASON:-$waiting_out}" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$waiting_block_reason_lc" == *"could not resolve to a pullrequest"* || "$waiting_block_reason_lc" == *"not found"* ]]; then
+      printf '%s\n' "$waiting_out"
+      exit 2
     fi
     WAITING_PR_REPAIR_PROMPT+=$'\n\n'
     WAITING_PR_REPAIR_PROMPT+="Repair context for existing PR: ${PR_URL}"$'\n'
