@@ -238,6 +238,12 @@ is_retryable_session_signal() {
   [[ "$signal" == PROMPT_ERROR:*request\ timed\ out* ||      "$signal" == PROMPT_ERROR:*timed\ out* ||      "$signal" == ABORTED:*operation\ was\ aborted* ]]
 }
 
+is_direct_runner_result() {
+  local output="$1"
+  [[ "$output" == TASK_DONE* || "$output" == TASK_WAITING_MERGE* || "$output" == TASK_WAITING_DEPENDENCY* || "$output" == TASK_WAITING_AGENT_LOCK* || "$output" == TASK_BLOCKED* ]] && return 0
+  grep -qE '^(ACPX_TASK_RESULT_JSON|```ACPX_TASK_RESULT_JSON)' <<<"$output"
+}
+
 parse_pr_url() {
   local line="$1"
   printf '%s\n' "$line" | sed -n 's/.*PR_URL=\([^ ]\+\).*/\1/p' | head -n1
@@ -1108,7 +1114,7 @@ if [[ "$rc" -ne 0 ]]; then
   fi
 fi
 
-if [[ "$raw_out" == TASK_DONE* || "$raw_out" == TASK_WAITING_MERGE* || "$raw_out" == TASK_WAITING_DEPENDENCY* || "$raw_out" == TASK_WAITING_AGENT_LOCK* || "$raw_out" == TASK_BLOCKED* ]]; then
+if is_direct_runner_result "$raw_out"; then
   text="$raw_out"
 else
   json_out="$(extract_json_object "$raw_out")"

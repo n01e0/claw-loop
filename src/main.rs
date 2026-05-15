@@ -6958,6 +6958,7 @@ exit 1
             .env("CLAW_TASK_TEXT", "mock e2e")
             .env("CLAW_RUN_ID", "run-e2e")
             .env("CLAW_AGENT_TIMEOUT_SEC", "1")
+            .env("CLAW_TASK_RUNNER_BACKEND", "openclaw-agent")
             .output()
             .expect("run first task agent pass");
         assert_eq!(
@@ -7002,6 +7003,7 @@ exit 1
             .env("CLAW_TASK_ID", "APB-10")
             .env("CLAW_TASK_TEXT", "mock e2e")
             .env("CLAW_RUN_ID", "run-e2e")
+            .env("CLAW_TASK_RUNNER_BACKEND", "openclaw-agent")
             .output()
             .expect("run retry task agent pass");
         assert!(

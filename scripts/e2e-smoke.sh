@@ -3,6 +3,7 @@ set -euo pipefail
 
 BIN="${1:-./target/debug/claw-loopd}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+unset CLAW_TASK_RUNNER_BACKEND CLAW_TASK_BACKEND
 
 if [[ ! -x "$BIN" ]]; then
   echo "[e2e-smoke] binary not found or not executable: $BIN" >&2
@@ -1696,6 +1697,142 @@ if [[ -f "$OPENCLAW_MARKER15BA" ]]; then
   echo "[e2e-smoke] acpx-codex backend should not call openclaw agent"
   exit 1
 fi
+
+echo "[e2e-smoke] case15baa rl-task-agent accepts direct acpx structured result text"
+ACPX_DIRECT_LOG="$WORKDIR/mockbin-acpx-direct-pr.log"
+ACPX_DIRECT_BODY_DIR="$WORKDIR/acpx-direct-pr-bodies"
+rm -f "$ACPX_DIRECT_LOG" "${ACPX_DIRECT_LOG}.body"
+rm -rf "$ACPX_DIRECT_BODY_DIR"
+mkdir -p "$ACPX_DIRECT_BODY_DIR"
+cat > "$RUNNER_MOCKDIR/acpx" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" != *"--approve-all"* ]]; then
+  echo "missing --approve-all: $*" >&2
+  exit 1
+fi
+if [[ "$*" == *"sessions ensure"* ]]; then
+  echo '{"acpxRecordId":"mock-record"}'
+  exit 0
+fi
+if [[ "$*" == *"codex -s"* && "$*" == *"--file"* ]]; then
+  echo 'ACPX_TASK_RESULT_JSON: {"summary":"Accepted direct structured runner output.","verification":["bash -n scripts/rl-task-agent.sh"],"notes":["Covers direct quiet-format output without JSON wrapping."],"pushed_branch":"ralph/test/acpx-direct-result"}'
+  exit 0
+fi
+echo "unsupported mock acpx args: $*" >&2
+exit 1
+EOF
+chmod +x "$RUNNER_MOCKDIR/acpx"
+cat > "$RUNNER_MOCKDIR/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+log="${ACPX_DIRECT_LOG:?}"
+if [[ "${1:-}" == "pr" && "${2:-}" == "create" ]]; then
+  body_file=""
+  prev=""
+  for arg in "$@"; do
+    if [[ "$prev" == "--body-file" ]]; then
+      body_file="$arg"
+    fi
+    prev="$arg"
+  done
+  [[ -n "$body_file" && -f "$body_file" ]] || { echo "missing body file" >&2; exit 1; }
+  grep -q '^## Summary' "$body_file"
+  grep -q 'Accepted direct structured runner output.' "$body_file"
+  cp "$body_file" "${log}.body"
+  printf 'create body_file=%s args=%s\n' "$body_file" "$*" >> "$log"
+  echo 'https://github.com/demo/repo/pull/31501'
+  exit 0
+fi
+if [[ "${1:-}" == "pr" && "${2:-}" == "view" ]]; then
+  joined="$*"
+  if [[ "$joined" == *"--json body"* ]]; then
+    cat "${log}.body"
+    exit 0
+  fi
+  if [[ "$joined" == *"state,mergedAt"* ]]; then
+    echo 'OPEN|'
+    exit 0
+  fi
+  if [[ "$joined" == *"state,autoMergeRequest"* ]]; then
+    echo '1'
+    exit 0
+  fi
+  if [[ "$joined" == *"statusCheckRollup"* ]]; then
+    echo ''
+    exit 0
+  fi
+  if [[ "$joined" == *"baseRefName"* ]]; then
+    echo 'main'
+    exit 0
+  fi
+fi
+if [[ "${1:-}" == "pr" && "${2:-}" == "merge" ]]; then
+  exit 0
+fi
+if [[ "${1:-}" == "api" && "${2:-}" == "repos/demo/repo" ]]; then
+  echo 'main'
+  exit 0
+fi
+if [[ "${1:-}" == "api" && "${2:-}" == repos/demo/repo/branches/*/protection ]]; then
+  echo '1'
+  exit 0
+fi
+if [[ "${1:-}" == "api" && "${2:-}" == "repos/demo/repo/rulesets" ]]; then
+  if [[ "$*" == *"--jq"* ]]; then
+    echo ''
+  else
+    echo '[]'
+  fi
+  exit 0
+fi
+if [[ "${1:-}" == "api" ]]; then
+  echo '[]'
+  exit 0
+fi
+echo "unsupported mock gh args: $*" >&2
+exit 1
+EOF
+chmod +x "$RUNNER_MOCKDIR/gh"
+
+TASKFILE15BAA="$WORKDIR/docs/roadmaps/s5-case15baa-tasklist.md"
+mkdir -p "$(dirname "$TASKFILE15BAA")"
+cat > "$TASKFILE15BAA" <<'EOF'
+- [ ] S5X-15BAA: direct acpx structured result
+EOF
+
+set +e
+OUT15BAA="$(PATH="$RUNNER_MOCKDIR:$PATH" CLAW_ACPX_BIN="$RUNNER_MOCKDIR/acpx" CLAW_GH_REPO="demo/repo" CLAW_PR_BODY_DIR="$ACPX_DIRECT_BODY_DIR" ACPX_DIRECT_LOG="$ACPX_DIRECT_LOG" CLAW_TASK_RUNNER_BACKEND="acpx-codex" CLAW_TASK_ID="S5X-15BAA" CLAW_TASK_TEXT="direct acpx structured result" CLAW_TASK_FILE="$TASKFILE15BAA" CLAW_RUN_ID="run15baa" bash ./scripts/rl-task-agent.sh 2>&1)"
+RC15BAA=$?
+set -e
+if [[ "$RC15BAA" -ne 10 ]]; then
+  echo "[e2e-smoke] expected case15baa rc=10, got $RC15BAA"
+  printf '%s\n' "$OUT15BAA"
+  exit 1
+fi
+FIRST15BAA="$(printf '%s\n' "$OUT15BAA" | awk 'NF { print; exit }')"
+if [[ "$FIRST15BAA" != "TASK_WAITING_MERGE PR_URL=https://github.com/demo/repo/pull/31501" ]]; then
+  echo "[e2e-smoke] expected case15baa waiting merge first line"
+  printf '%s\n' "$OUT15BAA"
+  exit 1
+fi
+if [[ "$OUT15BAA" == *"returned no assistant text"* ]]; then
+  echo "[e2e-smoke] case15baa should not discard direct structured output"
+  printf '%s\n' "$OUT15BAA"
+  exit 1
+fi
+cat > "$RUNNER_MOCKDIR/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "pr" && "${2:-}" == "view" ]]; then
+  echo 'MERGED|2026-03-16T00:00:00Z'
+  exit 0
+fi
+
+echo "unsupported mock gh args: $*" >&2
+exit 1
+EOF
+chmod +x "$RUNNER_MOCKDIR/gh"
 echo "[e2e-smoke] case15bb rl-task-agent blocks feature tasks while backlog gate is active"
 BACKLOG_GUARD_MARKER="$WORKDIR/.ralph/case15bb-openclaw-called"
 rm -f "$BACKLOG_GUARD_MARKER"
