@@ -3,6 +3,7 @@ set -euo pipefail
 
 BIN="${1:-./target/debug/claw-loopd}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+unset CLAW_TASK_RUNNER_BACKEND CLAW_TASK_BACKEND
 
 if [[ ! -x "$BIN" ]]; then
   echo "[e2e-smoke] binary not found or not executable: $BIN" >&2
@@ -982,6 +983,91 @@ if int(status.get("pending_notifications", 0)) < 0:
 PY
 
 $BIN stop --repo "$WORKDIR" --run-id "$RUN11" >/dev/null || true
+sleep 1
+
+echo "[e2e-smoke] case11b task_done elapsed stale tick repro"
+TASKFILE11B="$WORKDIR/docs/roadmaps/s4-case11b-tasklist.md"
+cat > "$TASKFILE11B" <<'EOF'
+- [ ] S4X-1B: delayed task completion
+EOF
+APPROVED11B="$(approve_task_file "$TASKFILE11B")"
+OUT11B="$(CLAW_LOOPD_GH_BIN="$MOCKDIR/gh" $BIN start --repo "$WORKDIR" --session-key test-session --channel discord --thread-id test-thread --tick-sec 1 --task-file "$TASKFILE11B" --task-runner-cmd 'sleep 3; echo "TASK_DONE PR_URL=https://example.invalid/pr/201"' --require-task-approval --approved-tasklist-hash "$APPROVED11B")"
+RUN11B="$(echo "$OUT11B" | awk -F= '/^run_id=/{print $2}')"
+if [[ -z "$RUN11B" ]]; then
+  echo "[e2e-smoke] failed to parse run11b id"
+  echo "$OUT11B"
+  exit 1
+fi
+
+STATUS11B_STARTED=""
+OBSERVED11B_STARTED=0
+for _ in {1..20}; do
+  STATUS11B_STARTED="$($BIN status --repo "$WORKDIR" --run-id "$RUN11B")"
+  if python3 - <<'PY' "$STATUS11B_STARTED"
+import json, sys
+obj = json.loads(sys.argv[1])
+runner = obj.get("runner") or {}
+ok = (
+    runner.get("current_task_id") == "S4X-1B"
+    and runner.get("current_task_started_at")
+)
+raise SystemExit(0 if ok else 1)
+PY
+  then
+    OBSERVED11B_STARTED=1
+    break
+  fi
+  sleep 0.2
+done
+if [[ "$OBSERVED11B_STARTED" != 1 ]]; then
+  echo "[e2e-smoke] expected run11b to retain current_task_started_at during delayed runner"
+  echo "$STATUS11B_STARTED"
+  exit 1
+fi
+
+STATUS11B_DONE=""
+for _ in {1..20}; do
+  STATUS11B_DONE="$($BIN status --repo "$WORKDIR" --run-id "$RUN11B")"
+  if python3 - <<'PY' "$STATUS11B_DONE"
+import json, sys
+obj = json.loads(sys.argv[1])
+runner = obj.get("runner") or {}
+ok = (
+    obj.get("status") == "stopped"
+    and runner.get("pause_reason") == "all tasklist items completed"
+)
+raise SystemExit(0 if ok else 1)
+PY
+  then
+    break
+  fi
+  sleep 1
+done
+
+python3 - <<'PY' "$STATUS11B_STARTED" "$STATUS11B_DONE" "$WORKDIR/.ralph/runs/$RUN11B"
+import json, pathlib, sys
+started = json.loads(sys.argv[1])
+done = json.loads(sys.argv[2])
+run_dir = pathlib.Path(sys.argv[3])
+
+started_runner = started.get("runner") or {}
+if started_runner.get("current_task_id") != "S4X-1B":
+    raise SystemExit(f"expected retained current task S4X-1B, got {started_runner}")
+if not started_runner.get("current_task_started_at"):
+    raise SystemExit(f"expected retained current_task_started_at, got {started_runner}")
+if done.get("status") != "stopped":
+    raise SystemExit(f"expected stopped after delayed completion, got {done.get('status')!r}")
+
+dispatched_path = run_dir / "notify-dispatched.jsonl"
+dispatched = [json.loads(line) for line in dispatched_path.read_text().splitlines() if line.strip()]
+task_done_messages = [row.get("message") or "" for row in dispatched if row.get("kind") == "task_done"]
+if not task_done_messages:
+    raise SystemExit(f"expected task_done dispatch, got kinds={[row.get('kind') for row in dispatched]}")
+if not any("elapsed=0s" in message for message in task_done_messages):
+    raise SystemExit(f"expected current repro elapsed=0s, got {task_done_messages}")
+PY
+
+$BIN stop --repo "$WORKDIR" --run-id "$RUN11B" >/dev/null || true
 sleep 1
 
 echo "[e2e-smoke] case12 timeout-delay behavior (configurable OpenClaw timeout)"

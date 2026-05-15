@@ -6958,6 +6958,7 @@ exit 1
             .env("CLAW_TASK_TEXT", "mock e2e")
             .env("CLAW_RUN_ID", "run-e2e")
             .env("CLAW_AGENT_TIMEOUT_SEC", "1")
+            .env("CLAW_TASK_RUNNER_BACKEND", "openclaw-agent")
             .output()
             .expect("run first task agent pass");
         assert_eq!(
@@ -7002,6 +7003,7 @@ exit 1
             .env("CLAW_TASK_ID", "APB-10")
             .env("CLAW_TASK_TEXT", "mock e2e")
             .env("CLAW_RUN_ID", "run-e2e")
+            .env("CLAW_TASK_RUNNER_BACKEND", "openclaw-agent")
             .output()
             .expect("run retry task agent pass");
         assert!(
@@ -7465,6 +7467,28 @@ exit 1
         let kinds: Vec<_> = dispatched.iter().map(|d| d.kind.as_str()).collect();
         assert!(kinds.contains(&"all_tasks_completed"));
         assert!(kinds.contains(&"main_feedback"));
+    }
+
+    #[test]
+    fn task_done_elapsed_repro_uses_tick_time_while_started_at_is_retained() {
+        let task_started_at = Utc::now();
+        let runner_finished_at = task_started_at + Duration::seconds(5);
+        let runner_state = RunnerState {
+            current_task_started_at: Some(task_started_at),
+            ..RunnerState::default()
+        };
+
+        let elapsed_from_current_path = super::task_elapsed_suffix(
+            runner_state.current_task_started_at.as_ref(),
+            task_started_at,
+        );
+        let elapsed_if_finish_time_used = super::task_elapsed_suffix(
+            runner_state.current_task_started_at.as_ref(),
+            runner_finished_at,
+        );
+
+        assert_eq!(elapsed_from_current_path, " elapsed=0s");
+        assert_eq!(elapsed_if_finish_time_used, " elapsed=5s");
     }
 
     #[test]
