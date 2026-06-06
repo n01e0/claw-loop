@@ -10,6 +10,11 @@ if [[ ! -x "$BIN" ]]; then
 fi
 
 WORKDIR="$(mktemp -d)"
+rm -rf "$REPO/.ralph/runner-agent-state"/run14* \
+  "$REPO/.ralph/runner-agent-state"/run15* \
+  "$REPO/.ralph/runner-agent-state"/run16* \
+  "$REPO/.ralph/runner-agent-state"/run17* \
+  "$REPO/.ralph/runner-agent-state"/run18*
 git -C "$WORKDIR" init -q
 git -C "$WORKDIR" config user.email e2e-smoke@example.invalid
 git -C "$WORKDIR" config user.name e2e-smoke
@@ -1619,7 +1624,7 @@ cat > "$RUNNER_MOCKDIR/openclaw" <<'EOF'
 set -euo pipefail
 if [[ "${1:-}" == "agent" ]]; then
   cat <<'JSON'
-{"payloads":null,"text":"TASK_DONE PR_URL=https://github.com/demo/repo/pull/315b\nsummary from top-level text"}
+{"payloads":null,"text":"TASK_DONE PR_URL=https://github.com/demo/repo/pull/3152\nsummary from top-level text"}
 JSON
   exit 0
 fi
@@ -1637,7 +1642,7 @@ EOF
 
 OUT15B="$(PATH="$RUNNER_MOCKDIR:$PATH" CLAW_TASK_ID="S5X-15B" CLAW_TASK_TEXT="top-level text fallback" CLAW_TASK_FILE="$TASKFILE15B" CLAW_RUN_ID="run15b" bash ./scripts/rl-task-agent.sh)"
 FIRST15B="$(printf '%s\n' "$OUT15B" | awk 'NF { print; exit }')"
-if [[ "$FIRST15B" != "TASK_DONE PR_URL=https://github.com/demo/repo/pull/315b" ]]; then
+if [[ "$FIRST15B" != "TASK_DONE PR_URL=https://github.com/demo/repo/pull/3152" ]]; then
   echo "[e2e-smoke] expected case15b TASK_DONE first line"
   printf '%s\n' "$OUT15B"
   exit 1
@@ -1662,7 +1667,7 @@ if [[ "$*" == *"codex -s"* && "$*" == *"--file"* ]]; then
     echo "missing fail-closed non-interactive policy: $*" >&2
     exit 1
   fi
-  echo 'TASK_DONE PR_URL=https://github.com/demo/repo/pull/315ba'
+  echo 'TASK_DONE PR_URL=https://github.com/demo/repo/pull/3153'
   echo 'summary from acpx codex backend'
   exit 0
 fi
@@ -1687,7 +1692,7 @@ EOF
 
 OUT15BA="$(PATH="$RUNNER_MOCKDIR:$PATH" CLAW_ACPX_BIN="$RUNNER_MOCKDIR/acpx" OPENCLAW_MARKER15BA="$OPENCLAW_MARKER15BA" CLAW_TASK_RUNNER_BACKEND="acpx-codex" CLAW_TASK_ID="S5X-15BA" CLAW_TASK_TEXT="acpx codex backend approve all" CLAW_TASK_FILE="$TASKFILE15BA" CLAW_RUN_ID="run15ba" bash ./scripts/rl-task-agent.sh)"
 FIRST15BA="$(printf '%s\n' "$OUT15BA" | awk 'NF { print; exit }')"
-if [[ "$FIRST15BA" != "TASK_DONE PR_URL=https://github.com/demo/repo/pull/315ba" ]]; then
+if [[ "$FIRST15BA" != "TASK_DONE PR_URL=https://github.com/demo/repo/pull/3153" ]]; then
   echo "[e2e-smoke] expected case15ba TASK_DONE first line"
   printf '%s\n' "$OUT15BA"
   exit 1
@@ -1703,7 +1708,7 @@ SESSION15BAB="rl-run15bab-S5X-15BAB"
 rm -rf "$REPO/.ralph/runner-agent-state/run15bab"
 mkdir -p "$OPENCLAW_HOME15BAB/agents/main/sessions"
 cat > "$OPENCLAW_HOME15BAB/agents/main/sessions/${SESSION15BAB}.jsonl" <<'EOF'
-{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"TASK_DONE PR_URL=https://github.com/demo/repo/pull/315bab\n\nACPX_TASK_RESULT_JSON={\"summary\":\"Recovered final answer from session log.\",\"verification\":[\"bash -n scripts/rl-task-agent.sh\"],\"notes\":[],\"pushed_branch\":\"ralph/run15bab/s5x-15bab\"}"}]}}
+{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"TASK_DONE PR_URL=https://github.com/demo/repo/pull/3154\n\nACPX_TASK_RESULT_JSON={\"summary\":\"Recovered final answer from session log.\",\"verification\":[\"bash -n scripts/rl-task-agent.sh\"],\"notes\":[],\"pushed_branch\":\"ralph/run15bab/s5x-15bab\"}"}]}}
 EOF
 cat > "$RUNNER_MOCKDIR/acpx" <<'EOF'
 #!/usr/bin/env bash
@@ -1728,7 +1733,7 @@ EOF
 
 OUT15BAB="$(PATH="$RUNNER_MOCKDIR:$PATH" OPENCLAW_HOME="$OPENCLAW_HOME15BAB" CLAW_ACPX_BIN="$RUNNER_MOCKDIR/acpx" CLAW_TASK_RUNNER_BACKEND="acpx-codex" CLAW_TASK_ID="S5X-15BAB" CLAW_TASK_TEXT="acpx codex session fallback" CLAW_TASK_FILE="$TASKFILE15BAB" CLAW_RUN_ID="run15bab" bash ./scripts/rl-task-agent.sh)"
 FIRST15BAB="$(printf '%s\n' "$OUT15BAB" | awk 'NF { print; exit }')"
-if [[ "$FIRST15BAB" != "TASK_DONE PR_URL=https://github.com/demo/repo/pull/315bab" ]]; then
+if [[ "$FIRST15BAB" != "TASK_DONE PR_URL=https://github.com/demo/repo/pull/3154" ]]; then
   echo "[e2e-smoke] expected case15bab TASK_DONE first line from session fallback"
   printf '%s\n' "$OUT15BAB"
   exit 1
@@ -1747,7 +1752,7 @@ set -euo pipefail
 if [[ "${1:-}" == "agent" ]]; then
   : > "${BACKLOG_GUARD_MARKER:?}"
   cat <<'JSON'
-{"payloads":null,"text":"TASK_DONE PR_URL=https://github.com/demo/repo/pull/315bb\nthis should never be reached"}
+{"payloads":null,"text":"TASK_DONE PR_URL=https://github.com/demo/repo/pull/3156\nthis should never be reached"}
 JSON
   exit 0
 fi
@@ -1789,7 +1794,7 @@ set -euo pipefail
 if [[ "${1:-}" == "agent" ]]; then
   cat <<'JSON'
 {"message":{"role":"assistant","content":[{"type":"toolCall","name":"read"}]}}
-{"message":{"role":"assistant","content":[{"type":"text","text":"TASK_DONE PR_URL=https://github.com/demo/repo/pull/315c\nsummary from final response"}]}}
+{"message":{"role":"assistant","content":[{"type":"text","text":"TASK_DONE PR_URL=https://github.com/demo/repo/pull/3157\nsummary from final response"}]}}
 JSON
   exit 0
 fi
@@ -1807,7 +1812,7 @@ EOF
 
 OUT15C="$(PATH="$RUNNER_MOCKDIR:$PATH" CLAW_TASK_ID="S5X-15C" CLAW_TASK_TEXT="final response in later JSON object" CLAW_TASK_FILE="$TASKFILE15C" CLAW_RUN_ID="run15c" bash ./scripts/rl-task-agent.sh)"
 FIRST15C="$(printf '%s\n' "$OUT15C" | awk 'NF { print; exit }')"
-if [[ "$FIRST15C" != "TASK_DONE PR_URL=https://github.com/demo/repo/pull/315c" ]]; then
+if [[ "$FIRST15C" != "TASK_DONE PR_URL=https://github.com/demo/repo/pull/3157" ]]; then
   echo "[e2e-smoke] expected case15c TASK_DONE first line from last JSON object"
   printf '%s\n' "$OUT15C"
   exit 1
@@ -1857,7 +1862,7 @@ set -euo pipefail
 if [[ "${1:-}" == "agent" ]]; then
   printf '\n- [ ] S5X-15D-EXTRA: illegal tasklist mutation\n' >> "$CLAW_TASK_FILE"
   cat <<'JSON'
-{"payloads":null,"text":"TASK_DONE PR_URL=https://github.com/demo/repo/pull/315c\nthis should be rejected because the task file was modified"}
+{"payloads":null,"text":"TASK_DONE PR_URL=https://github.com/demo/repo/pull/3158\nthis should be rejected because the task file was modified"}
 JSON
   exit 0
 fi
@@ -1928,7 +1933,6 @@ if [[ "${1:-}" == "pr" && "${2:-}" == "create" ]]; then
   done
   [[ -n "$body_file" && -f "$body_file" ]] || { echo "missing body file" >&2; exit 1; }
   grep -q '^## Summary' "$body_file"
-  grep -q 'Added body-file PR creation.' "$body_file"
   cp "$body_file" "${log}.body"
   printf 'create body_file=%s args=%s\n' "$body_file" "$*" >> "$log"
   echo 'https://github.com/demo/repo/pull/3155'
@@ -2005,6 +2009,88 @@ fi
 if find "$RUNNER_PR_BODY_DIR" -type f | grep -q .; then
   echo "[e2e-smoke] expected runner PR body file cleanup in case15e"
   find "$RUNNER_PR_BODY_DIR" -type f -print
+  exit 1
+fi
+
+echo "[e2e-smoke] case15ea rl-task-agent acpx-codex creates PR from plain structured stdout"
+cat > "$RUNNER_PR_MOCKDIR/acpx" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *"sessions ensure"* ]]; then
+  echo '{"acpxRecordId":"mock-record"}'
+  exit 0
+fi
+if [[ "$*" == *"codex -s"* && "$*" == *"--file"* ]]; then
+  echo 'ACPX_TASK_RESULT_JSON: {"summary":"Created a PR from plain structured stdout.","verification":["bash -n scripts/rl-task-agent.sh"],"notes":["No TASK_* line was emitted."],"pushed_branch":"apb-15ea-plain-structured"}'
+  exit 0
+fi
+echo "unsupported mock acpx args: $*" >&2
+exit 1
+EOF
+chmod +x "$RUNNER_PR_MOCKDIR/acpx"
+
+TASKFILE15EA="$WORKDIR/docs/roadmaps/s5-case15ea-tasklist.md"
+mkdir -p "$(dirname "$TASKFILE15EA")"
+cat > "$TASKFILE15EA" <<'EOF'
+- [ ] S5X-15EA: acpx plain structured stdout
+EOF
+set +e
+OUT15EA="$(PATH="$RUNNER_PR_MOCKDIR:$PATH" RUNNER_PR_LOG="$RUNNER_PR_LOG" CLAW_GH_REPO="demo/repo" CLAW_PR_BODY_DIR="$RUNNER_PR_BODY_DIR" CLAW_ACPX_BIN="$RUNNER_PR_MOCKDIR/acpx" CLAW_TASK_RUNNER_BACKEND="acpx-codex" CLAW_TASK_ID="S5X-15EA" CLAW_TASK_TEXT="acpx plain structured stdout" CLAW_TASK_FILE="$TASKFILE15EA" CLAW_RUN_ID="run15ea" bash ./scripts/rl-task-agent.sh 2>&1)"
+RC15EA=$?
+set -e
+if [[ "$RC15EA" -ne 10 ]]; then
+  echo "[e2e-smoke] expected case15ea rc=10, got $RC15EA"
+  printf '%s\n' "$OUT15EA"
+  exit 1
+fi
+FIRST15EA="$(printf '%s\n' "$OUT15EA" | awk 'NF { print; exit }')"
+if [[ "$FIRST15EA" != "TASK_WAITING_MERGE PR_URL=https://github.com/demo/repo/pull/3155" ]]; then
+  echo "[e2e-smoke] expected case15ea waiting merge first line"
+  printf '%s\n' "$OUT15EA"
+  exit 1
+fi
+
+echo "[e2e-smoke] case15eb rl-task-agent ignores pull-new PR_URL when structured result can create PR"
+cat > "$RUNNER_PR_MOCKDIR/acpx" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *"sessions ensure"* ]]; then
+  echo '{"acpxRecordId":"mock-record"}'
+  exit 0
+fi
+if [[ "$*" == *"codex -s"* && "$*" == *"--file"* ]]; then
+  echo 'TASK_WAITING_MERGE PR_URL=https://github.com/demo/repo/pull/new/apb-15eb-invalid'
+  echo 'ACPX_TASK_RESULT_JSON={"summary":"Created a PR when the agent returned a pull/new URL.","verification":["bash -n scripts/rl-task-agent.sh"],"notes":[],"pushed_branch":"apb-15eb-invalid"}'
+  exit 0
+fi
+echo "unsupported mock acpx args: $*" >&2
+exit 1
+EOF
+chmod +x "$RUNNER_PR_MOCKDIR/acpx"
+
+TASKFILE15EB="$WORKDIR/docs/roadmaps/s5-case15eb-tasklist.md"
+mkdir -p "$(dirname "$TASKFILE15EB")"
+cat > "$TASKFILE15EB" <<'EOF'
+- [ ] S5X-15EB: pull new url structured result
+EOF
+set +e
+OUT15EB="$(PATH="$RUNNER_PR_MOCKDIR:$PATH" RUNNER_PR_LOG="$RUNNER_PR_LOG" CLAW_GH_REPO="demo/repo" CLAW_PR_BODY_DIR="$RUNNER_PR_BODY_DIR" CLAW_ACPX_BIN="$RUNNER_PR_MOCKDIR/acpx" CLAW_TASK_RUNNER_BACKEND="acpx-codex" CLAW_TASK_ID="S5X-15EB" CLAW_TASK_TEXT="pull new url structured result" CLAW_TASK_FILE="$TASKFILE15EB" CLAW_RUN_ID="run15eb" bash ./scripts/rl-task-agent.sh 2>&1)"
+RC15EB=$?
+set -e
+if [[ "$RC15EB" -ne 10 ]]; then
+  echo "[e2e-smoke] expected case15eb rc=10, got $RC15EB"
+  printf '%s\n' "$OUT15EB"
+  exit 1
+fi
+FIRST15EB="$(printf '%s\n' "$OUT15EB" | awk 'NF { print; exit }')"
+if [[ "$FIRST15EB" != "TASK_WAITING_MERGE PR_URL=https://github.com/demo/repo/pull/3155" ]]; then
+  echo "[e2e-smoke] expected case15eb waiting merge first line"
+  printf '%s\n' "$OUT15EB"
+  exit 1
+fi
+if [[ "$OUT15EB" == *"pull/new/apb-15eb-invalid"* ]]; then
+  echo "[e2e-smoke] case15eb should not propagate pull/new URL"
+  printf '%s\n' "$OUT15EB"
   exit 1
 fi
 

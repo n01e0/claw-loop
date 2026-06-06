@@ -159,6 +159,20 @@ get_first_line() {
   '
 }
 
+is_raw_runner_result_text() {
+  local text="$1"
+  local first
+  first="$(get_first_line "$text")"
+  [[ "$first" == TASK_DONE* || "$first" == TASK_WAITING_MERGE* || "$first" == TASK_WAITING_DEPENDENCY* || "$first" == TASK_WAITING_AGENT_LOCK* || "$first" == TASK_BLOCKED* || "$first" == ACPX_TASK_RESULT_JSON* || "$first" == '```ACPX_TASK_RESULT_JSON'* ]]
+}
+
+is_session_runner_result_text() {
+  local text="$1"
+  local first
+  first="$(get_first_line "$text")"
+  [[ "$first" == TASK_DONE* || "$first" == TASK_WAITING_MERGE* || "$first" == TASK_WAITING_DEPENDENCY* || "$first" == TASK_WAITING_AGENT_LOCK* || "$first" == TASK_BLOCKED* || "$text" == *ACPX_TASK_RESULT_JSON* ]]
+}
+
 resolve_session_jsonl() {
   local session_id="$1"
   local agent_id="$2"
@@ -283,6 +297,11 @@ is_retryable_session_signal() {
 parse_pr_url() {
   local line="$1"
   printf '%s\n' "$line" | sed -n 's/.*PR_URL=\([^ ]\+\).*/\1/p' | head -n1
+}
+
+is_concrete_pr_url() {
+  local pr_url="$1"
+  [[ "$pr_url" =~ ^https://github\.com/[^[:space:]/]+/[^[:space:]/]+/pull/[0-9]+/?$ ]]
 }
 
 task_plan_hash() {
@@ -1138,7 +1157,7 @@ if [[ "$rc" -ne 0 ]]; then
       exit 10
     fi
     session_signal="$(session_signal_for_failure "$agent_session_id" "$agent_id" || true)"
-    if [[ "$session_signal" == TASK_DONE* || "$session_signal" == TASK_WAITING_MERGE* || "$session_signal" == TASK_WAITING_DEPENDENCY* || "$session_signal" == TASK_WAITING_AGENT_LOCK* || "$session_signal" == TASK_BLOCKED* ]]; then
+    if is_session_runner_result_text "$session_signal"; then
       raw_out="$session_signal"
     elif is_retryable_session_signal "$session_signal"; then
       echo "TASK_WAITING_DEPENDENCY: subagent request timed out for ${agent_session_id}; retry task"
@@ -1158,7 +1177,7 @@ if [[ "$rc" -ne 0 ]]; then
   fi
 fi
 
-if [[ "$raw_out" == TASK_DONE* || "$raw_out" == TASK_WAITING_MERGE* || "$raw_out" == TASK_WAITING_DEPENDENCY* || "$raw_out" == TASK_WAITING_AGENT_LOCK* || "$raw_out" == TASK_BLOCKED* ]]; then
+if is_raw_runner_result_text "$raw_out"; then
   text="$raw_out"
 else
   if json_out="$(extract_json_object "$raw_out" 2>"$parse_err_file")"; then
@@ -1169,7 +1188,7 @@ else
 fi
 if [[ -z "$text" ]]; then
   session_signal="$(session_signal_for_failure "$agent_session_id" "$agent_id" || true)"
-  if [[ "$session_signal" == TASK_DONE* || "$session_signal" == TASK_WAITING_MERGE* || "$session_signal" == TASK_WAITING_DEPENDENCY* || "$session_signal" == TASK_WAITING_AGENT_LOCK* || "$session_signal" == TASK_BLOCKED* ]]; then
+  if is_session_runner_result_text "$session_signal"; then
     text="$session_signal"
   elif is_retryable_session_signal "$session_signal"; then
     echo "TASK_WAITING_DEPENDENCY: subagent request timed out for ${agent_session_id}; retry task"
@@ -1197,6 +1216,11 @@ fi
 
 first_line="$(get_first_line "$text")"
 pr_url="$(parse_pr_url "$first_line")"
+invalid_pr_url=""
+if [[ -n "$pr_url" ]] && ! is_concrete_pr_url "$pr_url"; then
+  invalid_pr_url="$pr_url"
+  pr_url=""
+fi
 has_structured_result=false
 if printf '%s\n' "$text" | grep -q 'ACPX_TASK_RESULT_JSON'; then
   has_structured_result=true
@@ -1225,6 +1249,10 @@ if [[ "$first_line" == TASK_WAITING_MERGE* ]]; then
     } >"$state_file"
     handle_waiting_pr "$pr_url"
     exit $?
+  fi
+  if [[ -n "$invalid_pr_url" ]]; then
+    echo "TASK_BLOCKED: invalid PR_URL in TASK_WAITING_MERGE: ${invalid_pr_url}; expected https://github.com/<owner>/<repo>/pull/<number>" >&2
+    exit 2
   fi
   exit 10
 fi
