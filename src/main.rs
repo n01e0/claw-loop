@@ -2320,22 +2320,75 @@ fn blocked_intervention_line(
     }
 }
 
+fn blocked_task_summary_line(blocked: &BlockedContext) -> String {
+    let task_text = blocked
+        .task_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| clip_text(text, 220))
+        .unwrap_or_else(|| "task text unavailable".to_string());
+    let line = blocked
+        .task_line
+        .map(|line| format!(" line={line}"))
+        .unwrap_or_default();
+    format!("- 対象: {}{}: {}", blocked.task_id, line, task_text)
+}
+
+fn compact_distinct_line(
+    label: &str,
+    value: Option<&str>,
+    seen: &mut Vec<String>,
+    max_chars: usize,
+) -> String {
+    let Some(value) = value else {
+        return String::new();
+    };
+    let compact = compact_blocked_reason(value);
+    if compact.is_empty() || seen.iter().any(|item| item == &compact) {
+        return String::new();
+    }
+    seen.push(compact.clone());
+    format!("\n- {label}: {}", clip_text(&compact, max_chars))
+}
+
+fn blocked_observation_lines(blocked: &BlockedContext) -> String {
+    let mut seen = vec![compact_blocked_reason(&blocked.reason_summary)];
+    let mut lines = String::new();
+    lines.push_str(&compact_distinct_line(
+        "詳細",
+        blocked.reason_detail.as_deref(),
+        &mut seen,
+        700,
+    ));
+    lines.push_str(&compact_distinct_line(
+        "stderr",
+        blocked.runner_stderr_excerpt.as_deref(),
+        &mut seen,
+        500,
+    ));
+    lines.push_str(&compact_distinct_line(
+        "stdout",
+        blocked.runner_stdout_excerpt.as_deref(),
+        &mut seen,
+        500,
+    ));
+    if lines.is_empty() {
+        "\n- ログ: stderr/stdout の詳細は捕捉されていない。runner-state.json / events.jsonl を確認する"
+            .to_string()
+    } else {
+        lines
+    }
+}
+
 fn format_task_blocked_notification(manifest: &Manifest, blocked: &BlockedContext) -> String {
     let mention = completion_mention_prefix(manifest);
     let compact_reason = compact_blocked_reason(&blocked.reason_summary);
     let reason_summary = clip_text(&compact_reason, 240);
-    let detail_source = blocked
-        .reason_detail
-        .as_deref()
-        .unwrap_or(blocked.reason_summary.as_str());
+    let detail_source = blocked.reason_detail.as_deref().unwrap_or_default();
     let compact_detail = compact_blocked_reason(detail_source);
-    let detail_line = if compact_detail != compact_reason {
-        format!("\n- 詳細: {}", clip_text(&compact_detail, 600))
-    } else if compact_reason.chars().count() > 240 {
-        format!("\n- 詳細: {}", clip_text(&compact_reason, 600))
-    } else {
-        String::new()
-    };
+    let task_line = blocked_task_summary_line(blocked);
+    let observation_lines = blocked_observation_lines(blocked);
     let phase_or_stacked = is_phase_or_stacked_dependency_reason(&compact_reason)
         || is_phase_or_stacked_dependency_reason(&compact_detail);
     let classification_line = if phase_or_stacked {
@@ -2363,7 +2416,7 @@ fn format_task_blocked_notification(manifest: &Manifest, blocked: &BlockedContex
         .unwrap_or_default();
 
     format!(
-        "{mention}タスクが block された: {}{pr_suffix}\n- 原因: {reason_summary}{detail_line}{classification_line}{waiting_line}\n- 解決方法: {recovery}\n- {intervention_line}\n- {next}",
+        "{mention}タスクが block された: {}{pr_suffix}\n{task_line}\n- 原因: {reason_summary}{observation_lines}{classification_line}{waiting_line}\n- 解決方法: {recovery}\n- {intervention_line}\n- {next}",
         blocked.task_id
     )
 }
@@ -2390,18 +2443,8 @@ fn format_auto_recover_decision_notification(blocked: &BlockedContext) -> Option
     let decision = blocked.auto_recover.as_ref()?;
     let compact_reason = compact_blocked_reason(&blocked.reason_summary);
     let reason_summary = clip_text(&compact_reason, 240);
-    let detail_source = blocked
-        .reason_detail
-        .as_deref()
-        .unwrap_or(blocked.reason_summary.as_str());
-    let compact_detail = compact_blocked_reason(detail_source);
-    let detail_line = if compact_detail != compact_reason {
-        format!("\n- 詳細: {}", clip_text(&compact_detail, 600))
-    } else if compact_reason.chars().count() > 240 {
-        format!("\n- 詳細: {}", clip_text(&compact_reason, 600))
-    } else {
-        String::new()
-    };
+    let task_summary_line = blocked_task_summary_line(blocked);
+    let observation_lines = blocked_observation_lines(blocked);
     let recovery = blocked
         .recovery_hint
         .as_deref()
@@ -2443,7 +2486,7 @@ fn format_auto_recover_decision_notification(blocked: &BlockedContext) -> Option
         .unwrap_or_default();
 
     Some(format!(
-        "auto-recovery decision: {}{pr_suffix}\n- 原因: {reason_summary}{detail_line}\n- 解決方針: {recovery}{task_line}\n- 状態: {status_line}",
+        "auto-recovery decision: {}{pr_suffix}\n{task_summary_line}\n- 原因: {reason_summary}{observation_lines}\n- 解決方針: {recovery}{task_line}\n- 状態: {status_line}",
         blocked.task_id
     ))
 }
@@ -2466,18 +2509,7 @@ fn format_auto_recover_halt_notification(blocked: &BlockedContext) -> Option<Str
 
     let compact_reason = compact_blocked_reason(&blocked.reason_summary);
     let reason_summary = clip_text(&compact_reason, 240);
-    let detail_source = blocked
-        .reason_detail
-        .as_deref()
-        .unwrap_or(blocked.reason_summary.as_str());
-    let compact_detail = compact_blocked_reason(detail_source);
-    let detail_line = if compact_detail != compact_reason {
-        format!("\n- 詳細: {}", clip_text(&compact_detail, 600))
-    } else if compact_reason.chars().count() > 240 {
-        format!("\n- 詳細: {}", clip_text(&compact_reason, 600))
-    } else {
-        String::new()
-    };
+    let observation_lines = blocked_observation_lines(blocked);
 
     let guard = decision
         .guard_reason
@@ -2527,7 +2559,7 @@ fn format_auto_recover_halt_notification(blocked: &BlockedContext) -> Option<Str
         .unwrap_or_default();
 
     Some(format!(
-        "auto-recovery halted: {}\n- 停止理由: {}\n- 原因: {reason_summary}{detail_line}\n- 次に見るポイント:\n  - 失敗した recovery task: {}: {}{}{}{}{}\n  - 手動での解決方針: {}",
+        "auto-recovery halted: {}\n- 停止理由: {}\n- 原因: {reason_summary}{observation_lines}\n- 次に見るポイント:\n  - 失敗した recovery task: {}: {}{}{}{}{}\n  - 手動での解決方針: {}",
         blocked.task_id,
         guard,
         blocked.task_id,
@@ -2648,11 +2680,31 @@ fn normalize_blocked_reason_for_recovery(reason: &str) -> String {
     clip_text(&compact, 160)
 }
 
+fn is_low_information_blocked_seed(reason: &str) -> bool {
+    let compact = compact_blocked_reason(reason).to_ascii_lowercase();
+    [
+        "runner produced no stderr/stdout detail",
+        "acpx-codex returned no assistant text",
+        "parse-error: no json object found in openclaw output",
+        "subagent request timed out",
+    ]
+    .iter()
+    .any(|needle| compact.contains(needle))
+}
+
 fn blocked_reason_seed_for_auto_recovery(blocked: &BlockedContext) -> &str {
-    blocked
+    let primary = blocked
         .reason_detail
         .as_deref()
-        .unwrap_or(blocked.reason_summary.as_str())
+        .unwrap_or(blocked.reason_summary.as_str());
+    if !is_low_information_blocked_seed(primary) {
+        return primary;
+    }
+    blocked
+        .runner_stderr_excerpt
+        .as_deref()
+        .or(blocked.runner_stdout_excerpt.as_deref())
+        .unwrap_or(primary)
 }
 
 fn recovery_task_subject(blocked: &BlockedContext) -> String {
@@ -8017,6 +8069,34 @@ exit 1
     }
 
     #[test]
+    fn format_task_blocked_notification_surfaces_task_and_runner_output() {
+        let run = TestRunDir::new("blocked-notify-output");
+        let run_id = Uuid::new_v4();
+        let mut manifest = test_manifest(&run.path, run_id, false);
+        manifest.auto_recover_blocked = true;
+
+        let mut blocked = test_blocked_context(
+            "D2",
+            "fix parser output handling for JSON payloads",
+            12,
+            None,
+            "runner exit=Some(2): runner produced no stderr/stdout detail",
+            Some("runner exit=Some(2): runner produced no stderr/stdout detail"),
+            Utc::now(),
+        );
+        blocked.runner_stderr_excerpt =
+            Some("parse-error: no json object found in openclaw output".to_string());
+        blocked.runner_stdout_excerpt =
+            Some("raw agent output contained progress logs but no task contract".to_string());
+
+        let msg = format_task_blocked_notification(&manifest, &blocked);
+
+        assert!(msg.contains("- 対象: D2 line=12: fix parser output handling for JSON payloads"));
+        assert!(msg.contains("- stderr: parse-error: no json object found"));
+        assert!(msg.contains("- stdout: raw agent output contained progress logs"));
+    }
+
+    #[test]
     fn format_task_blocked_notification_shows_detail_and_recovery_halt_for_recover_task() {
         let run = TestRunDir::new("blocked-notify-recover");
         let run_id = Uuid::new_v4();
@@ -8170,6 +8250,26 @@ exit 1
         assert!(text.contains("merge 不能"));
         assert!(text.contains("blocked: merge state is dirty"));
         assert!(text.chars().count() <= 241);
+    }
+
+    #[test]
+    fn build_recovery_task_text_uses_runner_output_when_reason_is_low_information() {
+        let mut blocked = test_blocked_context(
+            "D2",
+            "fix parser output handling",
+            12,
+            None,
+            "runner exit=Some(2): runner produced no stderr/stdout detail",
+            Some("runner exit=Some(2): runner produced no stderr/stdout detail"),
+            Utc::now(),
+        );
+        blocked.runner_stderr_excerpt =
+            Some("parse-error: no json object found in openclaw output".to_string());
+
+        let text = build_recovery_task_text(&blocked);
+
+        assert!(text.contains("parse-error: no json object found"));
+        assert!(!text.contains("runner produced no stderr/stdout detail"));
     }
 
     #[test]
