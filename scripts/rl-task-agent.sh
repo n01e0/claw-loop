@@ -13,10 +13,14 @@ agent_session_id="rl-${run_id}-${CLAW_TASK_ID}"
 agent_timeout_sec="${CLAW_AGENT_TIMEOUT_SEC:-1800}"
 task_runner_backend="${CLAW_TASK_RUNNER_BACKEND:-${CLAW_TASK_BACKEND:-openclaw-agent}}"
 acpx_permission_mode="${CLAW_ACPX_PERMISSION_MODE:-approve-all}"
+safe_task_id="${CLAW_TASK_ID//[^A-Za-z0-9_.-]/_}"
 
 state_root="${repo_path}/.ralph/runner-agent-state/${run_id}"
 mkdir -p "$state_root"
 state_file="${state_root}/${CLAW_TASK_ID}.env"
+raw_out_file="${state_root}/${safe_task_id}.raw.out"
+ensure_out_file="${state_root}/${safe_task_id}.ensure.out"
+parse_err_file="${state_root}/${safe_task_id}.parse.err"
 
 extract_json_object() {
   RAW_OUT="$1" python3 - <<'PY'
@@ -169,6 +173,15 @@ resolve_session_jsonl() {
     printf '%s\n' "$candidate"
     return 0
   fi
+  if [[ -f "$base/${session_id}.trajectory.jsonl" ]]; then
+    printf '%s\n' "$base/${session_id}.trajectory.jsonl"
+    return 0
+  fi
+  candidate="$(find "$base" -maxdepth 1 -type f -name "${session_id}*.trajectory.jsonl" 2>/dev/null | head -n1 || true)"
+  if [[ -n "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
   return 1
 }
 
@@ -179,6 +192,15 @@ import json, sys
 path = sys.argv[1]
 with open(path, 'r') as fh:
     rows = [json.loads(line) for line in fh if line.strip()]
+
+def text_is_runner_result(text):
+    text = (text or '').strip()
+    if not text:
+        return False
+    first = text.splitlines()[0].strip()
+    if first.startswith(('TASK_DONE', 'TASK_WAITING_MERGE', 'TASK_WAITING_DEPENDENCY', 'TASK_WAITING_AGENT_LOCK', 'TASK_BLOCKED')):
+        return True
+    return 'ACPX_TASK_RESULT_JSON' in text
 
 def assistant_text(row):
     msg = row.get('message') or {}
@@ -197,13 +219,33 @@ def assistant_text(row):
     text = '\n'.join(p for p in parts if p).strip()
     return text or None
 
+def custom_texts(row):
+    out = []
+    data = row.get('data') or {}
+    for key in ('last_agent_message', 'lastAgentMessage', 'last_assistant_message', 'lastAssistantMessage'):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            out.append(value.strip())
+    assistant_texts = data.get('assistantTexts')
+    if isinstance(assistant_texts, list):
+        out.extend(item.strip() for item in assistant_texts if isinstance(item, str) and item.strip())
+    task_complete = data.get('task_complete') or data.get('taskComplete') or {}
+    if isinstance(task_complete, dict):
+        value = task_complete.get('last_agent_message') or task_complete.get('lastAgentMessage')
+        if isinstance(value, str) and value.strip():
+            out.append(value.strip())
+    return out
+
+for row in reversed(rows):
+    for text in custom_texts(row):
+        if text_is_runner_result(text):
+            print(text)
+            raise SystemExit(0)
+
 for row in reversed(rows):
     text = assistant_text(row)
-    if not text:
-        continue
-    first = text.splitlines()[0].strip()
-    if first.startswith(('TASK_DONE', 'TASK_WAITING_MERGE', 'TASK_WAITING_DEPENDENCY', 'TASK_WAITING_AGENT_LOCK', 'TASK_BLOCKED')):
-        print(first)
+    if text_is_runner_result(text):
+        print(text)
         raise SystemExit(0)
 
 for row in reversed(rows):
@@ -400,9 +442,11 @@ marker = "ACPX_TASK_RESULT_JSON"
 def load_result(text: str):
     patterns = [
         rf"^{marker}:\s*(\{{.*\}})\s*$",
+        rf"^{marker}\s*=\s*(\{{.*\}})\s*$",
         rf"^{marker}\s+(\{{.*\}})\s*$",
         rf"^```{marker}\s*\n(.*?)\n```\s*$",
         rf"^{marker}\s*:?\s*```(?:json)?\s*\n(.*?)\n```\s*$",
+        rf"^{marker}\s*=\s*```(?:json)?\s*\n(.*?)\n```\s*$",
         rf"^{marker}\s*:?\s*\n(\{{.*?\}})\s*$",
     ]
     for pat in patterns:
@@ -466,9 +510,11 @@ text = os.environ.get("TEXT", "")
 marker = "ACPX_TASK_RESULT_JSON"
 patterns = [
     rf"^{marker}:\s*(\{{.*\}})\s*$",
+    rf"^{marker}\s*=\s*(\{{.*\}})\s*$",
     rf"^{marker}\s+(\{{.*\}})\s*$",
     rf"^```{marker}\s*\n(.*?)\n```\s*$",
     rf"^{marker}\s*:?\s*```(?:json)?\s*\n(.*?)\n```\s*$",
+    rf"^{marker}\s*=\s*```(?:json)?\s*\n(.*?)\n```\s*$",
     rf"^{marker}\s*:?\s*\n(\{{.*?\}})\s*$",
 ]
 for pat in patterns:
@@ -1052,7 +1098,6 @@ case "$task_runner_backend" in
   acpx-codex)
     acpx_bin="$(resolve_acpx_bin)" || { echo "TASK_BLOCKED: acpx binary unavailable" >&2; exit 2; }
     acpx_perm_arg="$(acpx_permission_arg "$acpx_permission_mode")" || { echo "TASK_BLOCKED: invalid acpx permission mode" >&2; exit 2; }
-    safe_task_id="${CLAW_TASK_ID//[^A-Za-z0-9_.-]/_}"
     prompt_file="$(mktemp "${state_root}/prompt-${safe_task_id}.XXXXXX")"
     printf '%s\n' "$PROMPT" >"$prompt_file"
 
@@ -1080,6 +1125,11 @@ case "$task_runner_backend" in
     exit 2
     ;;
 esac
+
+printf '%s\n' "$raw_out" >"$raw_out_file"
+if [[ -n "${ensure_out:-}" ]]; then
+  printf '%s\n' "$ensure_out" >"$ensure_out_file"
+fi
 
 if [[ "$rc" -ne 0 ]]; then
   if [[ "$task_runner_backend" == "openclaw-agent" ]]; then
@@ -1111,8 +1161,11 @@ fi
 if [[ "$raw_out" == TASK_DONE* || "$raw_out" == TASK_WAITING_MERGE* || "$raw_out" == TASK_WAITING_DEPENDENCY* || "$raw_out" == TASK_WAITING_AGENT_LOCK* || "$raw_out" == TASK_BLOCKED* ]]; then
   text="$raw_out"
 else
-  json_out="$(extract_json_object "$raw_out")"
-  text="$(extract_agent_text "$json_out")"
+  if json_out="$(extract_json_object "$raw_out" 2>"$parse_err_file")"; then
+    text="$(extract_agent_text "$json_out")"
+  else
+    text=""
+  fi
 fi
 if [[ -z "$text" ]]; then
   session_signal="$(session_signal_for_failure "$agent_session_id" "$agent_id" || true)"
@@ -1123,9 +1176,12 @@ if [[ -z "$text" ]]; then
     exit 10
   else
     if [[ "$task_runner_backend" == "acpx-codex" ]]; then
-      echo "TASK_BLOCKED: acpx codex returned no assistant text for ${agent_session_id}" >&2
+      echo "TASK_BLOCKED: acpx codex returned no assistant text for ${agent_session_id}; raw_out=${raw_out_file}" >&2
     else
-      echo "TASK_BLOCKED: openclaw agent returned no assistant text for ${agent_session_id}" >&2
+      echo "TASK_BLOCKED: openclaw agent returned no assistant text for ${agent_session_id}; raw_out=${raw_out_file}" >&2
+    fi
+    if [[ -s "$parse_err_file" ]]; then
+      cat "$parse_err_file" >&2
     fi
     exit 2
   fi
@@ -1142,7 +1198,7 @@ fi
 first_line="$(get_first_line "$text")"
 pr_url="$(parse_pr_url "$first_line")"
 has_structured_result=false
-if printf '%s\n' "$text" | grep -qE '^(ACPX_TASK_RESULT_JSON|```ACPX_TASK_RESULT_JSON)'; then
+if printf '%s\n' "$text" | grep -q 'ACPX_TASK_RESULT_JSON'; then
   has_structured_result=true
 fi
 

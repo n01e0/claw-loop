@@ -1696,6 +1696,48 @@ if [[ -f "$OPENCLAW_MARKER15BA" ]]; then
   echo "[e2e-smoke] acpx-codex backend should not call openclaw agent"
   exit 1
 fi
+
+echo "[e2e-smoke] case15bab rl-task-agent acpx-codex falls back to session final answer"
+OPENCLAW_HOME15BAB="$WORKDIR/openclaw-home-15bab"
+SESSION15BAB="rl-run15bab-S5X-15BAB"
+rm -rf "$REPO/.ralph/runner-agent-state/run15bab"
+mkdir -p "$OPENCLAW_HOME15BAB/agents/main/sessions"
+cat > "$OPENCLAW_HOME15BAB/agents/main/sessions/${SESSION15BAB}.jsonl" <<'EOF'
+{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"TASK_DONE PR_URL=https://github.com/demo/repo/pull/315bab\n\nACPX_TASK_RESULT_JSON={\"summary\":\"Recovered final answer from session log.\",\"verification\":[\"bash -n scripts/rl-task-agent.sh\"],\"notes\":[],\"pushed_branch\":\"ralph/run15bab/s5x-15bab\"}"}]}}
+EOF
+cat > "$RUNNER_MOCKDIR/acpx" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *"sessions ensure"* ]]; then
+  echo '{"acpxRecordId":"mock-record"}'
+  exit 0
+fi
+if [[ "$*" == *"codex -s"* && "$*" == *"--file"* ]]; then
+  exit 0
+fi
+echo "unsupported mock acpx args: $*" >&2
+exit 1
+EOF
+chmod +x "$RUNNER_MOCKDIR/acpx"
+
+TASKFILE15BAB="$WORKDIR/docs/roadmaps/s5-case15bab-tasklist.md"
+mkdir -p "$(dirname "$TASKFILE15BAB")"
+cat > "$TASKFILE15BAB" <<'EOF'
+- [ ] S5X-15BAB: acpx codex session fallback
+EOF
+
+OUT15BAB="$(PATH="$RUNNER_MOCKDIR:$PATH" OPENCLAW_HOME="$OPENCLAW_HOME15BAB" CLAW_ACPX_BIN="$RUNNER_MOCKDIR/acpx" CLAW_TASK_RUNNER_BACKEND="acpx-codex" CLAW_TASK_ID="S5X-15BAB" CLAW_TASK_TEXT="acpx codex session fallback" CLAW_TASK_FILE="$TASKFILE15BAB" CLAW_RUN_ID="run15bab" bash ./scripts/rl-task-agent.sh)"
+FIRST15BAB="$(printf '%s\n' "$OUT15BAB" | awk 'NF { print; exit }')"
+if [[ "$FIRST15BAB" != "TASK_DONE PR_URL=https://github.com/demo/repo/pull/315bab" ]]; then
+  echo "[e2e-smoke] expected case15bab TASK_DONE first line from session fallback"
+  printf '%s\n' "$OUT15BAB"
+  exit 1
+fi
+if [[ ! -f "$REPO/.ralph/runner-agent-state/run15bab/S5X-15BAB.raw.out" ]]; then
+  echo "[e2e-smoke] expected case15bab raw_out capture"
+  exit 1
+fi
+
 echo "[e2e-smoke] case15bb rl-task-agent blocks feature tasks while backlog gate is active"
 BACKLOG_GUARD_MARKER="$WORKDIR/.ralph/case15bb-openclaw-called"
 rm -f "$BACKLOG_GUARD_MARKER"
