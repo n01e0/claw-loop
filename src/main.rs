@@ -366,6 +366,11 @@ fn parse_acpx_task_result(stdout: &str) -> Result<Option<AcpxTaskResult>> {
                 .with_context(|| format!("parse {marker} inline payload"))?;
             return Ok(Some(result));
         }
+        if let Some(raw) = line.strip_prefix(&format!("{marker}=")) {
+            let result: AcpxTaskResult = serde_json::from_str(raw.trim())
+                .with_context(|| format!("parse {marker} inline payload"))?;
+            return Ok(Some(result));
+        }
 
         if line == format!("```{marker}") || line == format!("```json {marker}") {
             in_fence = true;
