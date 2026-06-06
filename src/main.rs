@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::time::{Duration as StdDuration, Instant};
@@ -4230,7 +4232,8 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
     queue_notification(&dir, &manifest, "run_started", "loop daemon started")?;
 
     let exe = std::env::current_exe().context("resolve current executable")?;
-    let child = Command::new(exe)
+    let mut daemon_cmd = Command::new(exe);
+    daemon_cmd
         .arg("daemon")
         .arg("--repo")
         .arg(&opts.repo)
@@ -4240,9 +4243,12 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
         .arg(opts.tick_sec.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("spawn daemon")?;
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        daemon_cmd.process_group(0);
+    }
+    let child = daemon_cmd.spawn().context("spawn daemon")?;
 
     manifest.daemon_pid = child.id();
     write_json(&dir.join("manifest.json"), &manifest)?;
