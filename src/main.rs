@@ -4180,22 +4180,7 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
     let dir = run_dir(&opts.repo, run_id);
     fs::create_dir_all(&dir)?;
 
-    let exe = std::env::current_exe().context("resolve current executable")?;
-    let child = Command::new(exe)
-        .arg("daemon")
-        .arg("--repo")
-        .arg(&opts.repo)
-        .arg("--run-id")
-        .arg(run_id.to_string())
-        .arg("--tick-sec")
-        .arg(opts.tick_sec.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("spawn daemon")?;
-
-    let manifest = Manifest {
+    let mut manifest = Manifest {
         run_id,
         repo_path: opts.repo.clone(),
         session_key: opts.session_key,
@@ -4207,7 +4192,7 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
         feedback_thread_id: opts.feedback_thread_id,
         feedback_channel: opts.feedback_channel,
         started_at: now,
-        daemon_pid: child.id(),
+        daemon_pid: 0,
         deliver_openclaw: opts.deliver_openclaw,
         max_ticks: opts.max_ticks,
         max_runtime_sec: opts.max_runtime_sec,
@@ -4241,6 +4226,26 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
     write_json(&dir.join("manifest.json"), &manifest)?;
     write_json(&dir.join("state.json"), &state)?;
     write_runner_state(&dir, &RunnerState::default())?;
+
+    queue_notification(&dir, &manifest, "run_started", "loop daemon started")?;
+
+    let exe = std::env::current_exe().context("resolve current executable")?;
+    let child = Command::new(exe)
+        .arg("daemon")
+        .arg("--repo")
+        .arg(&opts.repo)
+        .arg("--run-id")
+        .arg(run_id.to_string())
+        .arg("--tick-sec")
+        .arg(opts.tick_sec.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawn daemon")?;
+
+    manifest.daemon_pid = child.id();
+    write_json(&dir.join("manifest.json"), &manifest)?;
     write_json(
         &dir.join("daemon.pid"),
         &serde_json::json!({"pid": child.id()}),
@@ -4251,7 +4256,6 @@ fn cmd_start(opts: StartOptions) -> Result<()> {
         "daemon_started",
         serde_json::json!({"pid": child.id()}),
     )?;
-    queue_notification(&dir, &manifest, "run_started", "loop daemon started")?;
 
     println!("run_id={}", run_id);
     println!("run_dir={}", dir.display());
