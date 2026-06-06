@@ -884,6 +884,111 @@ fn cleanup_task_worktree_after_merge(
     Ok(updated)
 }
 
+#[derive(Debug, Default)]
+struct TaskWorktreeCleanupSweep {
+    cleaned: Vec<TaskWorktreeRecord>,
+    errors: Vec<TaskWorktreeCleanupError>,
+}
+
+#[derive(Debug)]
+struct TaskWorktreeCleanupError {
+    task_id: String,
+    pr_url: String,
+    error: String,
+}
+
+fn pr_url_for_task_worktree_cleanup(task_id: &str, runner_state: &RunnerState) -> Option<String> {
+    runner_state
+        .tracked_task_pr_urls
+        .get(task_id)
+        .cloned()
+        .or_else(|| {
+            (runner_state.current_task_id.as_deref() == Some(task_id))
+                .then(|| runner_state.current_task_pr_url.clone())
+                .flatten()
+        })
+        .or_else(|| {
+            (runner_state.last_task_id.as_deref() == Some(task_id))
+                .then(|| runner_state.last_task_pr_url.clone())
+                .flatten()
+        })
+}
+
+fn update_runner_worktree_record(
+    runner_state: &mut RunnerState,
+    task_id: &str,
+    updated: &TaskWorktreeRecord,
+) {
+    if runner_state.current_task_id.as_deref() == Some(task_id) {
+        runner_state.current_worktree = Some(updated.clone());
+    }
+    if runner_state.last_task_id.as_deref() == Some(task_id) {
+        runner_state.last_worktree = Some(updated.clone());
+    }
+}
+
+fn cleanup_merged_task_worktrees(
+    repo: &Path,
+    manifest: &mut Manifest,
+    runner_state: &mut RunnerState,
+) -> TaskWorktreeCleanupSweep {
+    cleanup_merged_task_worktrees_with(repo, manifest, runner_state, pr_url_is_merged)
+}
+
+fn cleanup_merged_task_worktrees_with<F>(
+    repo: &Path,
+    manifest: &mut Manifest,
+    runner_state: &mut RunnerState,
+    mut is_merged: F,
+) -> TaskWorktreeCleanupSweep
+where
+    F: FnMut(&str) -> Result<bool>,
+{
+    let mut sweep = TaskWorktreeCleanupSweep::default();
+    let records: Vec<(String, TaskWorktreeRecord)> = manifest
+        .task_worktrees
+        .iter()
+        .map(|(task_id, record)| (task_id.clone(), record.clone()))
+        .collect();
+
+    for (task_id, record) in records {
+        if record.state == TaskWorktreeState::Removed {
+            continue;
+        }
+
+        let Some(pr_url) = pr_url_for_task_worktree_cleanup(&task_id, runner_state) else {
+            continue;
+        };
+
+        match is_merged(&pr_url) {
+            Ok(true) => match cleanup_task_worktree_after_merge(repo, &record) {
+                Ok(updated) => {
+                    if updated != record {
+                        manifest
+                            .task_worktrees
+                            .insert(task_id.clone(), updated.clone());
+                        update_runner_worktree_record(runner_state, &task_id, &updated);
+                        sweep.cleaned.push(updated);
+                    }
+                }
+                Err(err) => sweep.errors.push(TaskWorktreeCleanupError {
+                    task_id,
+                    pr_url,
+                    error: err.to_string(),
+                }),
+            },
+            Ok(false) => {}
+            Err(err) => sweep.errors.push(TaskWorktreeCleanupError {
+                task_id,
+                pr_url,
+                error: err.to_string(),
+            }),
+        }
+    }
+
+    sweep
+}
+
 fn ensure_task_worktree(
     repo: &Path,
     run_id: Uuid,
@@ -4372,6 +4477,24 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
         let mut task_loops_completed = task_done_now.saturating_sub(manifest.task_done_baseline);
         let mut runner_state = read_runner_state(&dir)?;
 
+        let cleanup_sweep = cleanup_merged_task_worktrees(&repo, &mut manifest, &mut runner_state);
+        if !cleanup_sweep.cleaned.is_empty() || !cleanup_sweep.errors.is_empty() {
+            append_event(
+                &dir,
+                "task_worktree_cleanup_sweep",
+                serde_json::json!({
+                    "cleaned": cleanup_sweep.cleaned,
+                    "errors": cleanup_sweep.errors.iter().map(|error| serde_json::json!({
+                        "task_id": error.task_id,
+                        "pr_url": error.pr_url,
+                        "error": clip_text(&error.error, 500),
+                    })).collect::<Vec<_>>(),
+                }),
+            )?;
+            write_json(&manifest_path, &manifest)?;
+            write_runner_state(&dir, &runner_state)?;
+        }
+
         if let Some(cmd) = manifest.task_runner_cmd.clone() {
             if runner_state.paused {
                 state.status = LoopStatus::Waiting;
@@ -6647,25 +6770,26 @@ mod tests {
         ack_retry_policy, append_jsonl, apply_status_establish_retry_override,
         auto_merge_unavailable_error, auto_recover_guard_reason, blocked_reason_from_runner,
         blocked_recovery_hint, build_recovery_task_text, classify_ack_failure_category,
-        classify_task_execution_kind, cleanup_task_worktree_after_merge,
-        completion_guard_waiting_fallback_line, compute_auto_stop_reason, compute_backoff_sec,
-        dead_letter_path, delivery_ack_path, delivery_attempts_path, delivery_retry_backoff_sec,
-        emit_all_tasks_completed_notifications, ensure_task_agent_exists_with,
-        ensure_waiting_dependency_progress_with, ensure_waiting_merge_progress_with,
-        extract_pr_url, flush_notifications, format_auto_recover_decision_notification,
-        format_auto_recover_halt_notification, format_orphan_blocked_notification,
-        format_task_blocked_notification, format_waiting_dependency_notification,
-        format_waiting_merge_notification, is_phase_or_stacked_dependency_reason, lease_window_sec,
-        maybe_auto_recover_blocked_task, missing_current_task_id_guard_reason,
-        normalize_blocked_reason_for_recovery, normalize_error_reason, notification_delivery_mode,
-        openclaw_notify_timeout_sec_from, parse_acpx_task_result, parse_openclaw_message_id,
-        parse_task_checklist_entry, parse_waiting_contract, parse_waiting_dependency_contract,
-        queue_main_feedback_summary, queue_notification, read_backlog_snapshot, read_json,
-        read_jsonl, retryable_waiting_merge_error, select_next_task_entry,
-        select_next_task_with_backlog, should_force_status_establish_retry,
-        should_suppress_waiting_stuck, task_contract_line, tasklist_approval_violation_reason,
-        update_waiting_stuck_tracker, validate_task_done_contract_with,
-        waiting_merge_nonprogress_reason, write_json, write_runner_state,
+        classify_task_execution_kind, cleanup_merged_task_worktrees_with,
+        cleanup_task_worktree_after_merge, completion_guard_waiting_fallback_line,
+        compute_auto_stop_reason, compute_backoff_sec, dead_letter_path, delivery_ack_path,
+        delivery_attempts_path, delivery_retry_backoff_sec, emit_all_tasks_completed_notifications,
+        ensure_task_agent_exists_with, ensure_waiting_dependency_progress_with,
+        ensure_waiting_merge_progress_with, extract_pr_url, flush_notifications,
+        format_auto_recover_decision_notification, format_auto_recover_halt_notification,
+        format_orphan_blocked_notification, format_task_blocked_notification,
+        format_waiting_dependency_notification, format_waiting_merge_notification,
+        is_phase_or_stacked_dependency_reason, lease_window_sec, maybe_auto_recover_blocked_task,
+        missing_current_task_id_guard_reason, normalize_blocked_reason_for_recovery,
+        normalize_error_reason, notification_delivery_mode, openclaw_notify_timeout_sec_from,
+        parse_acpx_task_result, parse_openclaw_message_id, parse_task_checklist_entry,
+        parse_waiting_contract, parse_waiting_dependency_contract, queue_main_feedback_summary,
+        queue_notification, read_backlog_snapshot, read_json, read_jsonl,
+        retryable_waiting_merge_error, select_next_task_entry, select_next_task_with_backlog,
+        should_force_status_establish_retry, should_suppress_waiting_stuck, task_contract_line,
+        tasklist_approval_violation_reason, update_waiting_stuck_tracker,
+        validate_task_done_contract_with, waiting_merge_nonprogress_reason, write_json,
+        write_runner_state,
     };
     use crate::tasklist::write_task_approval;
     use chrono::{Duration, Utc};
@@ -6839,6 +6963,146 @@ Summary for humans.
                 .as_deref()
                 .expect("cleanup reason")
                 .contains("uncommitted changes")
+        );
+    }
+
+    #[test]
+    fn cleanup_merged_task_worktrees_sweeps_tracked_clean_worktree() {
+        let temp = TestRunDir::new("cleanup-worktree-sweep");
+        let repo = temp.path().join("repo");
+        let worktree_path = temp.path().join("task-wt");
+        fs::create_dir_all(&repo).expect("create repo");
+        super::git_output(&repo, &["init", "-b", "main"]).expect("git init");
+        super::git_output(&repo, &["config", "user.email", "test@example.invalid"])
+            .expect("git config email");
+        super::git_output(&repo, &["config", "user.name", "Test User"]).expect("git config name");
+        fs::write(repo.join("README.md"), "base\n").expect("write readme");
+        super::git_output(&repo, &["add", "README.md"]).expect("git add");
+        super::git_output(&repo, &["commit", "-m", "init"]).expect("git commit");
+        super::git_output(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "task-branch",
+                worktree_path.to_string_lossy().as_ref(),
+                "HEAD",
+            ],
+        )
+        .expect("add worktree");
+
+        let record = TaskWorktreeRecord {
+            task_id: "T1".into(),
+            path: worktree_path.clone(),
+            branch: "task-branch".into(),
+            base_branch: "main".into(),
+            cleanup_policy: TaskWorktreeCleanupPolicy::RemoveAfterMergeIfClean,
+            state: TaskWorktreeState::Created,
+            created_at: Utc::now(),
+            cleanup_reason: None,
+        };
+        let pr_url = "https://github.com/n01e0/claw-loop/pull/123";
+        let mut manifest = test_manifest(&repo, Uuid::new_v4(), false);
+        manifest.task_worktrees.insert("T1".into(), record.clone());
+        let mut runner_state = RunnerState {
+            current_task_id: Some("T1".into()),
+            current_task_pr_url: Some(pr_url.into()),
+            current_worktree: Some(record),
+            ..RunnerState::default()
+        };
+        runner_state
+            .tracked_task_pr_urls
+            .insert("T1".into(), pr_url.into());
+
+        let sweep =
+            cleanup_merged_task_worktrees_with(&repo, &mut manifest, &mut runner_state, |url| {
+                assert_eq!(url, pr_url);
+                Ok(true)
+            });
+
+        assert_eq!(sweep.cleaned.len(), 1);
+        assert!(sweep.errors.is_empty());
+        assert!(!worktree_path.exists());
+        assert_eq!(
+            manifest
+                .task_worktrees
+                .get("T1")
+                .expect("manifest record")
+                .state,
+            TaskWorktreeState::Removed
+        );
+        assert_eq!(
+            runner_state
+                .current_worktree
+                .as_ref()
+                .expect("runner current worktree")
+                .state,
+            TaskWorktreeState::Removed
+        );
+    }
+
+    #[test]
+    fn cleanup_merged_task_worktrees_keeps_unmerged_worktree() {
+        let temp = TestRunDir::new("cleanup-worktree-unmerged");
+        let repo = temp.path().join("repo");
+        let worktree_path = temp.path().join("task-wt");
+        fs::create_dir_all(&repo).expect("create repo");
+        super::git_output(&repo, &["init", "-b", "main"]).expect("git init");
+        super::git_output(&repo, &["config", "user.email", "test@example.invalid"])
+            .expect("git config email");
+        super::git_output(&repo, &["config", "user.name", "Test User"]).expect("git config name");
+        fs::write(repo.join("README.md"), "base\n").expect("write readme");
+        super::git_output(&repo, &["add", "README.md"]).expect("git add");
+        super::git_output(&repo, &["commit", "-m", "init"]).expect("git commit");
+        super::git_output(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "task-branch",
+                worktree_path.to_string_lossy().as_ref(),
+                "HEAD",
+            ],
+        )
+        .expect("add worktree");
+
+        let record = TaskWorktreeRecord {
+            task_id: "T1".into(),
+            path: worktree_path.clone(),
+            branch: "task-branch".into(),
+            base_branch: "main".into(),
+            cleanup_policy: TaskWorktreeCleanupPolicy::RemoveAfterMergeIfClean,
+            state: TaskWorktreeState::Created,
+            created_at: Utc::now(),
+            cleanup_reason: None,
+        };
+        let pr_url = "https://github.com/n01e0/claw-loop/pull/123";
+        let mut manifest = test_manifest(&repo, Uuid::new_v4(), false);
+        manifest.task_worktrees.insert("T1".into(), record.clone());
+        let mut runner_state = RunnerState {
+            current_task_id: Some("T1".into()),
+            current_task_pr_url: Some(pr_url.into()),
+            current_worktree: Some(record),
+            ..RunnerState::default()
+        };
+
+        let sweep =
+            cleanup_merged_task_worktrees_with(&repo, &mut manifest, &mut runner_state, |_| {
+                Ok(false)
+            });
+
+        assert!(sweep.cleaned.is_empty());
+        assert!(sweep.errors.is_empty());
+        assert!(worktree_path.exists());
+        assert_eq!(
+            manifest
+                .task_worktrees
+                .get("T1")
+                .expect("manifest record")
+                .state,
+            TaskWorktreeState::Created
         );
     }
 
