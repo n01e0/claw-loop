@@ -145,6 +145,35 @@ print("")
 PY
 }
 
+extract_structured_marker() {
+  RAW_OUT="$1" python3 - <<'PY'
+import json, os, re
+
+raw = os.environ.get("RAW_OUT", "")
+ansi = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+marker = "ACPX_TASK_RESULT_JSON"
+text = ansi.sub("", raw).replace("\r\n", "\n").replace("\r", "\n")
+idx = text.find(marker)
+if idx < 0:
+    raise SystemExit(0)
+
+rest = text[idx + len(marker):].lstrip()
+if rest.startswith((":", "=")):
+    rest = rest[1:].lstrip()
+
+decoder = json.JSONDecoder()
+for i, ch in enumerate(rest):
+    if ch != "{":
+        continue
+    try:
+        obj, _ = decoder.raw_decode(rest[i:])
+    except Exception:
+        continue
+    print(f"{marker}={json.dumps(obj, ensure_ascii=False)}")
+    break
+PY
+}
+
 get_first_line() {
   printf '%s\n' "$1" | awk '
     {
@@ -1180,7 +1209,9 @@ fi
 if is_raw_runner_result_text "$raw_out"; then
   text="$raw_out"
 else
-  if json_out="$(extract_json_object "$raw_out" 2>"$parse_err_file")"; then
+  if structured_out="$(extract_structured_marker "$raw_out")" && [[ -n "$structured_out" ]]; then
+    text="$structured_out"
+  elif json_out="$(extract_json_object "$raw_out" 2>"$parse_err_file")"; then
     text="$(extract_agent_text "$json_out")"
   else
     text=""
