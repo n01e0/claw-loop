@@ -2050,6 +2050,44 @@ if [[ "$FIRST15EA" != "TASK_WAITING_MERGE PR_URL=https://github.com/demo/repo/pu
   exit 1
 fi
 
+echo "[e2e-smoke] case15eaa rl-task-agent creates PR from noisy structured stdout"
+cat > "$RUNNER_PR_MOCKDIR/acpx" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *"sessions ensure"* ]]; then
+  echo '{"acpxRecordId":"mock-record"}'
+  exit 0
+fi
+if [[ "$*" == *"codex -s"* && "$*" == *"--file"* ]]; then
+  echo 'Automatic approval review approved (risk: low, authorization: unknown): Auto-review returned a low-risk allow decision.ACPX_TASK_RESULT_JSON={"summary":"Created a PR from noisy structured stdout.","verification":["bash -n scripts/rl-task-agent.sh"],"notes":["Approval text was concatenated before the marker."],"pushed_branch":"apb-15eaa-noisy-structured"}'
+  exit 0
+fi
+echo "unsupported mock acpx args: $*" >&2
+exit 1
+EOF
+chmod +x "$RUNNER_PR_MOCKDIR/acpx"
+
+TASKFILE15EAA="$WORKDIR/docs/roadmaps/s5-case15eaa-tasklist.md"
+mkdir -p "$(dirname "$TASKFILE15EAA")"
+cat > "$TASKFILE15EAA" <<'EOF'
+- [ ] S5X-15EAA: acpx noisy structured stdout
+EOF
+set +e
+OUT15EAA="$(PATH="$RUNNER_PR_MOCKDIR:$PATH" RUNNER_PR_LOG="$RUNNER_PR_LOG" CLAW_GH_REPO="demo/repo" CLAW_PR_BODY_DIR="$RUNNER_PR_BODY_DIR" CLAW_ACPX_BIN="$RUNNER_PR_MOCKDIR/acpx" CLAW_TASK_RUNNER_BACKEND="acpx-codex" CLAW_TASK_ID="S5X-15EAA" CLAW_TASK_TEXT="acpx noisy structured stdout" CLAW_TASK_FILE="$TASKFILE15EAA" CLAW_RUN_ID="run15eaa" bash ./scripts/rl-task-agent.sh 2>&1)"
+RC15EAA=$?
+set -e
+if [[ "$RC15EAA" -ne 10 ]]; then
+  echo "[e2e-smoke] expected case15eaa rc=10, got $RC15EAA"
+  printf '%s\n' "$OUT15EAA"
+  exit 1
+fi
+FIRST15EAA="$(printf '%s\n' "$OUT15EAA" | awk 'NF { print; exit }')"
+if [[ "$FIRST15EAA" != "TASK_WAITING_MERGE PR_URL=https://github.com/demo/repo/pull/3155" ]]; then
+  echo "[e2e-smoke] expected case15eaa waiting merge first line"
+  printf '%s\n' "$OUT15EAA"
+  exit 1
+fi
+
 echo "[e2e-smoke] case15eb rl-task-agent ignores pull-new PR_URL when structured result can create PR"
 cat > "$RUNNER_PR_MOCKDIR/acpx" <<'EOF'
 #!/usr/bin/env bash
