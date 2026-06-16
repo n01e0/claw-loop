@@ -404,7 +404,8 @@ enum TaskExecutionKind {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum TaskWorktreeCleanupPolicy {
-    RemoveAfterMergeIfClean,
+    #[serde(rename = "remove_after_merge", alias = "remove_after_merge_if_clean")]
+    RemoveAfterMerge,
     RetainUntilManualCleanup,
 }
 
@@ -854,7 +855,7 @@ fn cleanup_task_worktree_after_merge(
 ) -> Result<TaskWorktreeRecord> {
     let mut updated = worktree.clone();
 
-    if worktree.cleanup_policy != TaskWorktreeCleanupPolicy::RemoveAfterMergeIfClean {
+    if worktree.cleanup_policy != TaskWorktreeCleanupPolicy::RemoveAfterMerge {
         updated.state = TaskWorktreeState::Retained;
         updated.cleanup_reason = Some("cleanup policy retains worktree".into());
         return Ok(updated);
@@ -867,25 +868,23 @@ fn cleanup_task_worktree_after_merge(
     }
 
     let status = git_output(&worktree.path, &["status", "--porcelain"])?;
+    let path_string = worktree.path.to_string_lossy().to_string();
+    let mut args = vec!["worktree", "remove"];
     if !status.trim().is_empty() {
-        updated.state = TaskWorktreeState::Retained;
-        updated.cleanup_reason = Some(
-            "PR merge confirmed, but worktree has uncommitted changes; retained for manual cleanup"
-                .into(),
-        );
-        return Ok(updated);
+        args.push("--force");
     }
+    args.push(path_string.as_str());
+    git_output(repo, &args)?;
 
-    git_output(
-        repo,
-        &[
-            "worktree",
-            "remove",
-            worktree.path.to_string_lossy().as_ref(),
-        ],
-    )?;
     updated.state = TaskWorktreeState::Removed;
-    updated.cleanup_reason = Some("PR merge confirmed; clean worktree removed".into());
+    updated.cleanup_reason = if status.trim().is_empty() {
+        Some("PR merge confirmed; clean worktree removed".into())
+    } else {
+        Some(format!(
+            "PR merge confirmed; dirty disposable worktree force-removed; dirty status: {}",
+            clip_text(&status.replace('\n', " "), 300)
+        ))
+    };
     Ok(updated)
 }
 
@@ -1032,11 +1031,41 @@ fn ensure_task_worktree(
         path,
         branch,
         base_branch,
-        cleanup_policy: TaskWorktreeCleanupPolicy::RemoveAfterMergeIfClean,
+        cleanup_policy: TaskWorktreeCleanupPolicy::RemoveAfterMerge,
         state: TaskWorktreeState::Created,
         created_at: now,
-        cleanup_reason: Some("retain until PR is confirmed merged; remove only if clean".into()),
+        cleanup_reason: Some("retain until PR is confirmed merged; remove even if dirty".into()),
     })
+}
+
+fn reusable_auto_recovery_worktree(
+    runner_state: &RunnerState,
+    task: &TaskChecklistEntry,
+    now: DateTime<Utc>,
+) -> Option<TaskWorktreeRecord> {
+    if runner_state.auto_recover_last_task_id.as_deref() != Some(task.id.as_str()) {
+        return None;
+    }
+
+    let source = runner_state
+        .last_worktree
+        .as_ref()
+        .or(runner_state.current_worktree.as_ref())?;
+    if source.state == TaskWorktreeState::Removed || !source.path.exists() {
+        return None;
+    }
+
+    let mut reused = source.clone();
+    let source_task_id = reused.task_id.clone();
+    reused.task_id = task.id.clone();
+    reused.created_at = now;
+    reused.state = TaskWorktreeState::Created;
+    reused.cleanup_policy = TaskWorktreeCleanupPolicy::RemoveAfterMerge;
+    reused.cleanup_reason = Some(format!(
+        "auto-recovery task {} reuses blocked task worktree from {}; remove after PR merge",
+        task.id, source_task_id
+    ));
+    Some(reused)
 }
 
 fn require_tasklist_approval(
@@ -3525,10 +3554,7 @@ fn run_task_once(opts: TaskRunOptions<'_>) -> Result<TaskRunOutcome> {
             )
             .env("CLAW_TASK_BRANCH", worktree.branch.as_str())
             .env("CLAW_TASK_BASE_BRANCH", worktree.base_branch.as_str())
-            .env(
-                "CLAW_TASK_WORKTREE_CLEANUP_POLICY",
-                "remove_after_merge_if_clean",
-            );
+            .env("CLAW_TASK_WORKTREE_CLEANUP_POLICY", "remove_after_merge");
     }
     if let Some(backlog_snapshot) = opts.backlog_snapshot {
         command
@@ -5126,6 +5152,11 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                     } else {
                         match selection {
                             TaskSelectionOutcome::Next(queued_task) => {
+                                let reusable_recovery_worktree = reusable_auto_recovery_worktree(
+                                    &runner_state,
+                                    &queued_task,
+                                    now,
+                                );
                                 if runner_state.preferred_next_task_id.as_deref()
                                     == Some(queued_task.id.as_str())
                                 {
@@ -5163,13 +5194,21 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                 )?;
 
                                 let task_kind = classify_task_execution_kind(&queued_task);
-                                let worktree = ensure_task_worktree(
-                                    &manifest.repo_path,
-                                    run_id,
-                                    &manifest.task_worktree_root,
-                                    &queued_task,
-                                    now,
-                                )?;
+                                let (worktree, worktree_event) =
+                                    if let Some(worktree) = reusable_recovery_worktree {
+                                        (worktree, "task_worktree_reused")
+                                    } else {
+                                        (
+                                            ensure_task_worktree(
+                                                &manifest.repo_path,
+                                                run_id,
+                                                &manifest.task_worktree_root,
+                                                &queued_task,
+                                                now,
+                                            )?,
+                                            "task_worktree_created",
+                                        )
+                                    };
                                 runner_state.current_worktree = Some(worktree.clone());
                                 write_runner_state(&dir, &runner_state)?;
                                 manifest
@@ -5178,7 +5217,7 @@ fn cmd_daemon(repo: PathBuf, run_id: Uuid, tick_sec: u64) -> Result<()> {
                                 write_json(&manifest_path, &manifest)?;
                                 append_event(
                                     &dir,
-                                    "task_worktree_created",
+                                    worktree_event,
                                     serde_json::json!({
                                         "task_id": queued_task.id,
                                         "path": worktree.path,
@@ -6842,11 +6881,11 @@ mod tests {
         parse_acpx_task_result, parse_openclaw_message_id, parse_task_checklist_entry,
         parse_waiting_contract, parse_waiting_dependency_contract, queue_main_feedback_summary,
         queue_notification, read_backlog_snapshot, read_json, read_jsonl,
-        retryable_waiting_merge_error, select_next_task_entry, select_next_task_with_backlog,
-        should_force_status_establish_retry, should_suppress_waiting_stuck, task_contract_line,
-        tasklist_approval_violation_reason, update_waiting_stuck_tracker,
-        validate_task_done_contract_with, waiting_merge_nonprogress_reason, write_json,
-        write_runner_state,
+        retryable_waiting_merge_error, reusable_auto_recovery_worktree, select_next_task_entry,
+        select_next_task_with_backlog, should_force_status_establish_retry,
+        should_suppress_waiting_stuck, task_contract_line, tasklist_approval_violation_reason,
+        update_waiting_stuck_tracker, validate_task_done_contract_with,
+        waiting_merge_nonprogress_reason, write_json, write_runner_state,
     };
     use crate::tasklist::write_task_approval;
     use chrono::{Duration, Utc};
@@ -6956,7 +6995,7 @@ Summary for humans.
             path: worktree_path.clone(),
             branch: "task-branch".into(),
             base_branch: "main".into(),
-            cleanup_policy: TaskWorktreeCleanupPolicy::RemoveAfterMergeIfClean,
+            cleanup_policy: TaskWorktreeCleanupPolicy::RemoveAfterMerge,
             state: TaskWorktreeState::Created,
             created_at: Utc::now(),
             cleanup_reason: None,
@@ -6973,7 +7012,7 @@ Summary for humans.
     }
 
     #[test]
-    fn cleanup_task_worktree_after_merge_retains_dirty_worktree() {
+    fn cleanup_task_worktree_after_merge_removes_dirty_worktree() {
         let temp = TestRunDir::new("cleanup-worktree-dirty");
         let repo = temp.path().join("repo");
         let worktree_path = temp.path().join("task-wt");
@@ -7004,7 +7043,7 @@ Summary for humans.
             path: worktree_path.clone(),
             branch: "task-branch".into(),
             base_branch: "main".into(),
-            cleanup_policy: TaskWorktreeCleanupPolicy::RemoveAfterMergeIfClean,
+            cleanup_policy: TaskWorktreeCleanupPolicy::RemoveAfterMerge,
             state: TaskWorktreeState::Created,
             created_at: Utc::now(),
             cleanup_reason: None,
@@ -7012,14 +7051,14 @@ Summary for humans.
 
         let cleaned = cleanup_task_worktree_after_merge(&repo, &record).expect("cleanup worktree");
 
-        assert_eq!(cleaned.state, TaskWorktreeState::Retained);
-        assert!(worktree_path.exists());
+        assert_eq!(cleaned.state, TaskWorktreeState::Removed);
+        assert!(!worktree_path.exists());
         assert!(
             cleaned
                 .cleanup_reason
                 .as_deref()
                 .expect("cleanup reason")
-                .contains("uncommitted changes")
+                .contains("dirty disposable worktree force-removed")
         );
     }
 
@@ -7054,7 +7093,7 @@ Summary for humans.
             path: worktree_path.clone(),
             branch: "task-branch".into(),
             base_branch: "main".into(),
-            cleanup_policy: TaskWorktreeCleanupPolicy::RemoveAfterMergeIfClean,
+            cleanup_policy: TaskWorktreeCleanupPolicy::RemoveAfterMerge,
             state: TaskWorktreeState::Created,
             created_at: Utc::now(),
             cleanup_reason: None,
@@ -7130,7 +7169,7 @@ Summary for humans.
             path: worktree_path.clone(),
             branch: "task-branch".into(),
             base_branch: "main".into(),
-            cleanup_policy: TaskWorktreeCleanupPolicy::RemoveAfterMergeIfClean,
+            cleanup_policy: TaskWorktreeCleanupPolicy::RemoveAfterMerge,
             state: TaskWorktreeState::Created,
             created_at: Utc::now(),
             cleanup_reason: None,
@@ -7160,6 +7199,54 @@ Summary for humans.
                 .expect("manifest record")
                 .state,
             TaskWorktreeState::Created
+        );
+    }
+
+    #[test]
+    fn auto_recovery_reuses_blocked_task_worktree() {
+        let temp = TestRunDir::new("auto-recovery-reuse-worktree");
+        let worktree_path = temp.path().join("blocked-task-wt");
+        fs::create_dir_all(&worktree_path).expect("create worktree path");
+        let now = Utc::now();
+        let blocked_record = TaskWorktreeRecord {
+            task_id: "T1".into(),
+            path: worktree_path.clone(),
+            branch: "ralph/run/t1".into(),
+            base_branch: "main".into(),
+            cleanup_policy: TaskWorktreeCleanupPolicy::RemoveAfterMerge,
+            state: TaskWorktreeState::Retained,
+            created_at: now - Duration::minutes(5),
+            cleanup_reason: Some("blocked".into()),
+        };
+        let runner_state = RunnerState {
+            auto_recover_last_task_id: Some("T1-RECOVER".into()),
+            last_worktree: Some(blocked_record.clone()),
+            ..RunnerState::default()
+        };
+        let recovery_task = TaskChecklistEntry {
+            line_no: 42,
+            done: false,
+            id: "T1-RECOVER".into(),
+            text: "resolve runner block for task T1".into(),
+        };
+
+        let reused = reusable_auto_recovery_worktree(&runner_state, &recovery_task, now)
+            .expect("reused worktree");
+
+        assert_eq!(reused.task_id, "T1-RECOVER");
+        assert_eq!(reused.path, blocked_record.path);
+        assert_eq!(reused.branch, blocked_record.branch);
+        assert_eq!(
+            reused.cleanup_policy,
+            TaskWorktreeCleanupPolicy::RemoveAfterMerge
+        );
+        assert_eq!(reused.state, TaskWorktreeState::Created);
+        assert!(
+            reused
+                .cleanup_reason
+                .as_deref()
+                .expect("cleanup reason")
+                .contains("reuses blocked task worktree")
         );
     }
 
